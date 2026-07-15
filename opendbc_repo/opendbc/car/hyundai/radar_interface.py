@@ -5,7 +5,7 @@ from opendbc import DBC_PATH
 from opendbc.can import CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.interfaces import RadarInterfaceBase
-from opendbc.car.hyundai.values import CAR, DBC, HyundaiFlags, HyundaiExtFlags
+from opendbc.car.hyundai.values import DBC, HyundaiFlags, HyundaiExtFlags
 from openpilot.common.params import Params
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from openpilot.common.filter_simple import MyMovingAverage
@@ -13,7 +13,8 @@ from openpilot.common.filter_simple import MyMovingAverage
 SCC_TID = 0
 RADAR_START_ADDR = 0x500
 RADAR_MSG_COUNT = 32
-RADAR_MSG_COUNT4 = 45
+RADAR_MSG_COUNT4 = 8
+RADAR_GROUP4_MAX_YREL = 4.5
 RADAR_START_ADDR_CANFD1 = 0x210
 RADAR_MSG_COUNT1 = 16
 RADAR_START_ADDR_CANFD2 = 0x3A5 # Group 2, Group 1: 0x210 2媛쒖뵫?덉뼱???쇰떒 蹂대쪟.
@@ -95,7 +96,7 @@ class RadarInterface(RadarInterfaceBase):
     self.canfd = True if CP.flags & HyundaiFlags.CANFD else False
     self.radar_group1 = False
     self.radar_group3 = False
-    self.radar_group4 = not self.canfd and CP.carFingerprint == CAR.KIA_SORENTO
+    self.radar_group4 = not self.canfd and bool(CP.extFlags & HyundaiExtFlags.RADAR_GROUP4.value)
     if self.canfd:
       if CP.extFlags & HyundaiExtFlags.RADAR_GROUP1.value:
         self.radar_start_addr = RADAR_START_ADDR_CANFD1
@@ -141,6 +142,7 @@ class RadarInterface(RadarInterfaceBase):
     print(
       "RadarInterface: "
       f"radarUnavailable={CP.radarUnavailable} radarTracks={self.radar_tracks} "
+      f"group4={self.radar_group4} "
       f"corner235={self.rcp_corner_objects is not None} corner180={self.rcp_corner_objects_180 is not None} "
       f"radarOffCan={self.radar_off_can}"
     )
@@ -275,8 +277,13 @@ class RadarInterface(RadarInterfaceBase):
         valid = msg['VALID_CNT'] > 10
       elif self.radar_group4:
         # DNMWR006 empty slots use the out-of-range raw distance 0xfff8
-        # (409.55 m). The useful detection range is about 205 m.
-        valid = 0.2 < msg['LONG_DIST'] < 205.0 and abs(msg['AZIMUTH']) <= 20.0
+        # (409.55 m). OBJECT_STATE 3 distinguishes tracked objects from the
+        # distance-sorted raw detections published at 0x508 and above. The
+        # signed 11-bit field is lateral distance, with positive raw values to
+        # the right (negative openpilot yRel). Limit output to the ego and
+        # adjacent lanes to suppress farther roadside reflections.
+        valid = (msg['OBJECT_STATE'] == 3 and 0.2 < msg['LONG_DIST'] < 205.0 and
+                 abs(msg['LAT_DIST']) <= RADAR_GROUP4_MAX_YREL)
       else:
         valid = msg['STATE'] in (3, 4)
 
@@ -307,9 +314,8 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[t_id].aRel = float('nan') if self.radar_group3 else msg['REL_ACCEL']
         self.pts[t_id].yvRel = 0.0 if self.radar_group3 else msg['LAT_SPEED']
       elif self.radar_group4:
-        azimuth = math.radians(msg['AZIMUTH'])
-        self.pts[t_id].dRel = math.cos(azimuth) * msg['LONG_DIST']
-        self.pts[t_id].yRel = -math.sin(azimuth) * msg['LONG_DIST']
+        self.pts[t_id].dRel = msg['LONG_DIST']
+        self.pts[t_id].yRel = -msg['LAT_DIST']
         self.pts[t_id].vRel = msg['REL_SPEED']
         self.pts[t_id].vLead = self.pts[t_id].vRel + self.v_ego
         self.pts[t_id].aRel = float('nan')

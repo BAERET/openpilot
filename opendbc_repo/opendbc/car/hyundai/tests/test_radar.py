@@ -23,15 +23,26 @@ class TestDensoRadar:
     track = self.parse(0x503, "bc047efcc1fe8b00")
 
     assert track["LONG_DIST"] == pytest.approx(7.1875)
-    assert track["AZIMUTH"] == pytest.approx(-6.5)
+    assert track["LAT_DIST"] == pytest.approx(-1.625)
     assert track["REL_SPEED"] == pytest.approx(-0.734375)
+    assert track["OBJECT_STATE"] == 3
 
   def test_empty_track(self):
-    track = self.parse(0x520, "53fff80000000081")
+    track = self.parse(0x507, "53fff80000000081")
 
     assert track["LONG_DIST"] == pytest.approx(409.55)
-    assert track["AZIMUTH"] == 0
+    assert track["LAT_DIST"] == 0
     assert track["REL_SPEED"] == 0
+    assert track["OBJECT_STATE"] == 0
+
+  def test_long_range_lateral_distance(self):
+    # Real driving sample: treating the signed field as -12 degrees would put
+    # this target about 34 m sideways at 161 m. It is instead -3.0 m lateral.
+    track = self.parse(0x506, "b664eafa00cd230b")
+
+    assert track["LONG_DIST"] == pytest.approx(161.4625)
+    assert track["LAT_DIST"] == pytest.approx(-3.0)
+    assert track["OBJECT_STATE"] == 3
 
   def test_parser_selection_and_point_conversion(self, monkeypatch):
     class FakeParams:
@@ -42,6 +53,7 @@ class TestDensoRadar:
     cp = structs.CarParams()
     cp.carFingerprint = CAR.KIA_SORENTO
     cp.flags = 0
+    cp.extFlags = HyundaiExtFlags.RADAR_GROUP4.value
     cp.radarUnavailable = False
     cp.safetyConfigs = [structs.CarParams.SafetyConfig()]
 
@@ -49,19 +61,43 @@ class TestDensoRadar:
 
     assert radar_interface.radar_group4
     assert radar_interface.radar_msg_count == RADAR_MSG_COUNT4
-    assert radar_interface.trigger_msg_tracks == 0x52C
+    assert radar_interface.trigger_msg_tracks == 0x507
 
     active_dat = bytes.fromhex("bc047efcc1fe8b00")
     empty_dat = bytes.fromhex("bcfff80000000081")
-    packets = [(addr, active_dat if addr == 0x503 else empty_dat, 1) for addr in range(0x500, 0x52D)]
+    packets = [(addr, active_dat if addr == 0x503 else empty_dat, 1) for addr in range(0x500, 0x508)]
     radar_data = radar_interface.update([0, packets])
     point = next(point for point in radar_data.points if point.trackId == 35)
 
     assert point.measured
-    assert point.dRel == pytest.approx(math.cos(math.radians(-6.5)) * 7.1875)
-    assert point.yRel == pytest.approx(-math.sin(math.radians(-6.5)) * 7.1875)
+    assert point.dRel == pytest.approx(7.1875)
+    assert point.yRel == pytest.approx(1.625)
     assert point.vRel == pytest.approx(-0.734375)
     assert math.isnan(point.aRel)
+
+    # Confirm the long-range sample survives the track filter and is converted
+    # from radar-left-negative to openpilot-left-positive coordinates.
+    long_range_dat = bytes.fromhex("b664eafa00cd230b")
+    packets = [(addr, long_range_dat if addr == 0x506 else empty_dat, 1) for addr in range(0x500, 0x508)]
+    radar_data = radar_interface.update([0, packets])
+    point = next(point for point in radar_data.points if point.trackId == 38)
+
+    assert point.dRel == pytest.approx(161.4625)
+    assert point.yRel == pytest.approx(3.0)
+
+    # 0x508 and above carry state 0 distance-sorted detections. Even if such a
+    # payload appears in a track slot, it must not become a RadarPoint.
+    raw_detection = bytes.fromhex("d702f4fc200000e4")
+    packets = [(addr, raw_detection if addr == 0x503 else empty_dat, 1) for addr in range(0x500, 0x508)]
+    radar_data = radar_interface.update([0, packets])
+    assert not radar_data.points
+
+    # Stable tracks well outside the ego/adjacent-lane envelope are roadside
+    # reflections and must not create clutter in liveTracks.
+    side_reflection = bytes.fromhex("d80b66f640000300")
+    packets = [(addr, side_reflection if addr == 0x503 else empty_dat, 1) for addr in range(0x500, 0x508)]
+    radar_data = radar_interface.update([0, packets])
+    assert not radar_data.points
 
 
 class TestRadarGroup3:
