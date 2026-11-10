@@ -2,6 +2,8 @@
 
 #include "imgui_internal.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <unordered_set>
@@ -13,6 +15,21 @@ constexpr float BROWSER_VALUE_WIDTH = 88.0f;
 bool path_matches_filter(const std::string &path, const std::string &lower_filter) {
   if (lower_filter.empty()) return true;
   return lowercase_copy(path).find(lower_filter) != std::string::npos;
+}
+
+bool numeric_label_less(const std::string &a, const std::string &b) {
+  const bool a_numeric = !a.empty() && std::all_of(a.begin(), a.end(), [](unsigned char c) { return std::isdigit(c); });
+  const bool b_numeric = !b.empty() && std::all_of(b.begin(), b.end(), [](unsigned char c) { return std::isdigit(c); });
+  if (a_numeric != b_numeric) return a_numeric;
+  if (!a_numeric) return a < b;
+
+  const size_t a_first = std::min(a.find_first_not_of('0'), a.size() - 1);
+  const size_t b_first = std::min(b.find_first_not_of('0'), b.size() - 1);
+  const std::string_view a_value(a.data() + a_first, a.size() - a_first);
+  const std::string_view b_value(b.data() + b_first, b.size() - b_first);
+  if (a_value.size() != b_value.size()) return a_value.size() < b_value.size();
+  if (a_value != b_value) return a_value < b_value;
+  return a < b;
 }
 
 void insert_browser_path(std::vector<BrowserNode> *nodes, const std::string &path) {
@@ -56,7 +73,7 @@ void sort_browser_nodes(std::vector<BrowserNode> *nodes) {
     if (a.children.empty() != b.children.empty()) {
       return !a.children.empty();
     }
-    return a.label < b.label;
+    return numeric_label_less(a.label, b.label);
   });
   for (BrowserNode &node : *nodes) {
     sort_browser_nodes(&node.children);
@@ -309,9 +326,11 @@ std::string format_display_value(double display_value,
   if (enum_info != nullptr) {
     const int idx = static_cast<int>(std::llround(display_value));
     if (idx >= 0 && std::abs(display_value - static_cast<double>(idx)) < 0.01
-        && static_cast<size_t>(idx) < enum_info->names.size()
-        && !enum_info->names[static_cast<size_t>(idx)].empty()) {
-      return enum_info->names[static_cast<size_t>(idx)];
+        && static_cast<size_t>(idx) < enum_info->names.size()) {
+      const std::string &name = enum_info->names[static_cast<size_t>(idx)];
+      if (enum_info->text_values || !name.empty()) {
+        return name.empty() ? "(empty)" : name;
+      }
     }
   }
   char buf[64] = {};
@@ -377,20 +396,16 @@ void draw_browser_node(AppSession *session,
   }
 
   if (node.children.empty()) {
-    const bool selected = browser_selection_contains(*state, node.full_path);
     const std::string value_text = browser_series_value_text(*session, *state, node.full_path);
     const ImGuiStyle &style = ImGui::GetStyle();
     const ImVec2 row_size(std::max(1.0f, ImGui::GetContentRegionAvail().x), ImGui::GetFrameHeight());
     ImGui::PushID(node.full_path.c_str());
     const bool clicked = ImGui::InvisibleButton("##browser_leaf", row_size);
     const bool hovered = ImGui::IsItemHovered();
-    const bool held = ImGui::IsItemActive();
     const ImRect rect(ImGui::GetItemRectMin(), ImGui::GetItemRectMax());
     ImDrawList *draw_list = ImGui::GetWindowDrawList();
-    if (selected || hovered) {
-      const ImU32 bg = ImGui::GetColorU32(selected
-        ? (held ? ImGuiCol_HeaderActive : ImGuiCol_Header)
-        : ImGuiCol_HeaderHovered);
+    if (hovered) {
+      const ImU32 bg = ImGui::GetColorU32(ImGuiCol_HeaderHovered);
       draw_list->AddRectFilled(rect.Min, rect.Max, bg, 0.0f);
     }
 
@@ -409,7 +424,7 @@ void draw_browser_node(AppSession *session,
                               nullptr);
     if (!value_text.empty()) {
       app_push_mono_font();
-      ImGui::PushStyleColor(ImGuiCol_Text, selected ? color_rgb(70, 77, 86) : color_rgb(116, 124, 133));
+      ImGui::PushStyleColor(ImGuiCol_Text, color_rgb(116, 124, 133));
       ImGui::RenderTextClipped(ImVec2(value_left, rect.Min.y + style.FramePadding.y),
                                ImVec2(value_right, rect.Max.y),
                                value_text.c_str(),
@@ -452,9 +467,6 @@ void draw_browser_node(AppSession *session,
   }
 
   ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_SpanAvailWidth;
-  if (!filter.empty()) {
-    flags |= ImGuiTreeNodeFlags_DefaultOpen;
-  }
   const bool open = ImGui::TreeNodeEx(node.label.c_str(), flags);
   if (open) {
     for (const BrowserNode &child : node.children) {

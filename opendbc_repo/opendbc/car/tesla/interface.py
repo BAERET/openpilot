@@ -4,12 +4,26 @@ from opendbc.car.tesla.carcontroller import CarController
 from opendbc.car.tesla.carstate import CarState
 from opendbc.car.tesla.values import TeslaSafetyFlags, TeslaFlags, CANBUS, CAR, DBC, FSD_14_FW, Ecu
 from opendbc.car.tesla.radar_interface import RadarInterface, RADAR_START_ADDR
+from openpilot.common.params import Params
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+  def update(self, can_packets):
+    # Keep the exact vehicle-bus idle frame as the only template for generated
+    # speed-wheel messages. Repacking the DBC fields would lose unknown bits.
+    for mono_time, frames in can_packets:
+      for address, data, source in frames:
+        if address == 0x3C2 and source == CANBUS.vehicle:
+          self.CS.observe_speed_wheel_frame(data, mono_time)
+        elif address == 0x249:
+          self.CS.observe_turn_stalk_frame(data, source, mono_time)
+        elif address == 0x25D and self.CS.traffic_control is not None:
+          self.CS.traffic_control.observe(data, source, mono_time)
+    return super().update(can_packets)
 
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
@@ -34,10 +48,24 @@ class CarInterface(CarInterfaceBase):
     # - Radar CAN lines must be tapped and connected to CAN bus 1 (normally not used for tesla vehicles)
     ret.radarUnavailable = RADAR_START_ADDR not in fingerprint[1] or Bus.radar not in DBC[candidate]
 
+    # The same extension-bus detection gates gestures, the speed wheel and automatic turn signals.
+    # Speed-wheel control additionally requires Tesla openpilot longitudinal control.
+    has_vehicle_bus = 0x3DF in fingerprint[CANBUS.vehicle]
+    if has_vehicle_bus:
+      ret.flags |= TeslaFlags.HAS_VEHICLE_BUS.value
+      if candidate in (CAR.TESLA_MODEL_3, CAR.TESLA_MODEL_Y) and Params().get_bool("TeslaAutoTurnSignals"):
+        ret.flags |= TeslaFlags.AUTO_TURN_SIGNALS.value
+        ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.AUTO_TURN_SIGNALS.value
+
     ret.alphaLongitudinalAvailable = True
     if alpha_long:
       ret.openpilotLongitudinalControl = True
       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.LONG_CONTROL.value
+      if candidate in (CAR.TESLA_MODEL_3, CAR.TESLA_MODEL_Y) and Params().get_bool("TeslaCanTrafficStop"):
+        ret.flags |= TeslaFlags.CAN_TRAFFIC_STOP.value
+      if has_vehicle_bus:
+        ret.flags |= TeslaFlags.AUTO_SPEED_LIMIT.value
+        ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.AUTO_SPEED_LIMIT.value
 
       ret.vEgoStopping = 0.1
       ret.vEgoStarting = 0.1
@@ -49,13 +77,5 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= TeslaSafetyFlags.FSD_14.value
 
     ret.dashcamOnly = candidate in (CAR.TESLA_MODEL_X,)  # dashcam only, pending find invalidLkasSetting signal
-
-    # Vehicle bus detection: 0x3DF (infotainment 3-finger press) on bus 1
-    if 0x3DF in fingerprint[CANBUS.vehicle]:
-      ret.flags |= TeslaFlags.HAS_VEHICLE_BUS.value
-
-    # DAS_bodyControls detection: 0x3E9 on bus 2 (autopilot party)
-    if 0x3E9 in fingerprint[CANBUS.autopilot_party]:
-      ret.flags |= TeslaFlags.HAS_DAS_BODY_CONTROLS.value
 
     return ret

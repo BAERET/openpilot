@@ -1,9 +1,16 @@
 #pragma once
 
 #include "safety_declarations.h"
+#include "safety_tesla_turn_signals.h"
 
 static bool tesla_longitudinal = false;
 static bool tesla_stock_aeb = false;
+static bool tesla_auto_speed_limit = false;
+static bool tesla_speed_button_rx_template_valid = false;
+static uint8_t tesla_speed_button_rx_template[8] = {0U};
+static uint32_t tesla_speed_button_rx_timestamp = 0U;
+static bool tesla_speed_button_last_tx_valid = false;
+static uint32_t tesla_speed_button_last_tx_timestamp = 0U;
 
 // FSD 14 support: flips ANGLE_CONTROL and LANE_KEEP_ASSIST control types
 static bool tesla_fsd_14 = false;
@@ -30,6 +37,7 @@ static int tesla_get_steer_ctrl_type(const int ctrl_type) {
 }
 
 static void tesla_rx_hook(const CANPacket_t *to_push) {
+  tesla_turn_rx(to_push);
   int bus = GET_BUS(to_push);
   int addr = GET_ADDR(to_push);
 
@@ -54,8 +62,8 @@ static void tesla_rx_hook(const CANPacket_t *to_push) {
     }
 
     // Brake pressed
-    if (addr == 0x39d) {
-      brake_pressed = (GET_BYTE(to_push, 2) & 0x03U) == 2U;
+    if (addr == 0x145) {
+      brake_pressed = ((GET_BYTE(to_push, 3) >> 5) & 0x03U) == 2U;
     }
 
     // Cruise state
@@ -111,6 +119,19 @@ static void tesla_rx_hook(const CANPacket_t *to_push) {
     }
   }
 
+  if (bus == 1) {
+    // Only a current, genuine idle right-wheel frame may be used as a TX
+    // template. This prevents synthesizing vehicle-bus controls.
+    if ((addr == 0x3C2U) && (GET_LEN(to_push) == 8U) &&
+        ((GET_BYTE(to_push, 0) & 0x03U) == 1U) && ((GET_BYTE(to_push, 3) & 0x3FU) == 0U)) {
+      for (int i = 0; i < 8; i++) {
+        tesla_speed_button_rx_template[i] = GET_BYTE(to_push, i);
+      }
+      tesla_speed_button_rx_template_valid = true;
+      tesla_speed_button_rx_timestamp = microsecond_timer_get();
+    }
+  }
+
   generic_rx_checks((addr == 0x488) && (bus == 0));  // DAS_steeringControl
   generic_rx_checks((addr == 0x27d) && (bus == 0));  // APS_eacMonitor
 
@@ -147,6 +168,12 @@ static bool tesla_tx_hook(const CANPacket_t *to_send) {
   // Don't send any messages when Summon is active
   if (tesla_summon) {
     violation = true;
+  }
+
+  if (addr == 0x3E9) {
+    if (violation || !tesla_turn_tx(to_send)) {
+      violation = true;
+    }
   }
 
   // Steering control: (0.1 * val) - 1638.35 in deg.
@@ -201,8 +228,11 @@ static bool tesla_tx_hook(const CANPacket_t *to_send) {
       }
 
       // Don't allow any acceleration limits above the safety limits
-      violation |= longitudinal_accel_checks(raw_accel_max, TESLA_LONG_LIMITS);
-      violation |= longitudinal_accel_checks(raw_accel_min, TESLA_LONG_LIMITS);
+      violation |= (raw_accel_max > TESLA_LONG_LIMITS.max_accel) || (raw_accel_max < TESLA_LONG_LIMITS.min_accel);
+      violation |= (raw_accel_min > TESLA_LONG_LIMITS.max_accel) || (raw_accel_min < TESLA_LONG_LIMITS.min_accel);
+      // Tesla's zero acceleration is encoded as 375, not 0. TX must never grant controls.
+      violation |= !get_longitudinal_allowed() && ((raw_accel_max != TESLA_LONG_LIMITS.inactive_accel) ||
+                                                  (raw_accel_min != TESLA_LONG_LIMITS.inactive_accel));
     } else {
       // does allowing cancel here disrupt stock AEB? TODO: find out and add safety or remove comment
       // Can only send cancel longitudinal messages when not controlling longitudinal
@@ -214,6 +244,29 @@ static bool tesla_tx_hook(const CANPacket_t *to_send) {
       if ((raw_accel_max != TESLA_LONG_LIMITS.inactive_accel) || (raw_accel_min != TESLA_LONG_LIMITS.inactive_accel)) {
         violation = true;
       }
+    }
+  }
+
+  if (addr == 0x3C2U) {
+    const uint8_t tick = GET_BYTE(to_send, 3) & 0x3FU;
+    const bool tick_allowed = (tick == 1U) || (tick == 0x3FU);
+    bool template_matches = tesla_speed_button_rx_template_valid;
+    for (int i = 0; i < 8; i++) {
+      if (i == 3) {
+        template_matches &= (GET_BYTE(to_send, i) & 0xC0U) == (tesla_speed_button_rx_template[i] & 0xC0U);
+      } else {
+        template_matches &= GET_BYTE(to_send, i) == tesla_speed_button_rx_template[i];
+      }
+    }
+    const uint32_t now = microsecond_timer_get();
+    const bool template_fresh = get_ts_elapsed(now, tesla_speed_button_rx_timestamp) <= 1500000U;
+    const bool rate_allowed = !tesla_speed_button_last_tx_valid ||
+                              (get_ts_elapsed(now, tesla_speed_button_last_tx_timestamp) >= 250000U);
+    if (!(tesla_auto_speed_limit && controls_allowed && tick_allowed && template_matches && template_fresh && rate_allowed)) {
+      violation = true;
+    } else {
+      tesla_speed_button_last_tx_valid = true;
+      tesla_speed_button_last_tx_timestamp = now;
     }
   }
 
@@ -269,11 +322,28 @@ static safety_config tesla_init(uint16_t param) {
     {0x488, 0, 4},  // DAS_steeringControl
     {0x2b9, 0, 8},  // DAS_control
     {0x27D, 0, 3},  // APS_eacMonitor
-    {0x3E9, 1, 8},  // DAS_bodyControls (blinker on vehicle bus)
+    {0x3E9, 1, 8},  // DAS_bodyControls, separately gated by AUTO_TURN_SIGNALS
+  };
+  static const CanMsg TESLA_M3_Y_AUTO_SPEED_TX_MSGS[] = {
+    {0x488, 0, 4},  // DAS_steeringControl
+    {0x2b9, 0, 8},  // DAS_control
+    {0x27D, 0, 3},  // APS_eacMonitor
+    {0x3C2, 1, 8},  // VCLEFT_switchStatus
+    {0x3E9, 1, 8},  // DAS_bodyControls, separately gated by AUTO_TURN_SIGNALS
   };
 
   const uint16_t TESLA_FLAG_FSD_14 = 2;
+  const uint16_t TESLA_FLAG_AUTO_SPEED_LIMIT = 4;
   tesla_fsd_14 = GET_FLAG(param, TESLA_FLAG_FSD_14);
+  tesla_auto_speed_limit = GET_FLAG(param, TESLA_FLAG_AUTO_SPEED_LIMIT);
+  tesla_auto_turn_signals = GET_FLAG(param, 8U);
+  tesla_turn_template_valid = false;
+  tesla_turn_direction = 0U;
+  tesla_turn_count = 0U;
+  tesla_turn_template_ts = 0U;
+  tesla_turn_started = 0U;
+  tesla_turn_cancel_count = 0U;
+  tesla_turn_cancel_started = 0U;
 
 #ifdef ALLOW_DEBUG
   const int TESLA_FLAG_LONGITUDINAL_CONTROL = 1;
@@ -283,6 +353,10 @@ static safety_config tesla_init(uint16_t param) {
   tesla_stock_aeb = false;
   tesla_stock_steering_control = false;
   tesla_stock_steering_control_prev = false;
+  tesla_speed_button_rx_template_valid = false;
+  tesla_speed_button_rx_timestamp = 0U;
+  tesla_speed_button_last_tx_valid = false;
+  tesla_speed_button_last_tx_timestamp = 0U;
   // we used to assume Summon on startup; instead we tolerate a short
   // window without TX (DI_state comes at 10 Hz). Panda safety will
   // reject TX until the first DI_state message clears tesla_summon.
@@ -294,11 +368,14 @@ static safety_config tesla_init(uint16_t param) {
     {.msg = {{0x257, 0, 8, .ignore_checksum = true, .ignore_counter = true,.frequency = 50U}, { 0 }, { 0 }}},   // DI_speed (speed in kph)
     {.msg = {{0x370, 0, 8, .ignore_checksum = true, .ignore_counter = true,.frequency = 100U}, { 0 }, { 0 }}},  // EPAS3S_internalSAS (steering angle)
     {.msg = {{0x118, 0, 8, .ignore_checksum = true, .ignore_counter = true,.frequency = 100U}, { 0 }, { 0 }}},  // DI_systemStatus (gas pedal)
-    {.msg = {{0x39d, 0, 5, .ignore_checksum = true, .ignore_counter = true,.frequency = 25U}, { 0 }, { 0 }}},   // IBST_status (brakes)
+    {.msg = {{0x145, 0, 8, .ignore_checksum = true, .ignore_counter = true,.frequency = 50U}, { 0 }, { 0 }}},   // ESP_status (brakes)
     {.msg = {{0x286, 0, 8, .ignore_checksum = true, .ignore_counter = true,.frequency = 10U}, { 0 }, { 0 }}},   // DI_state (acc state)
     {.msg = {{0x311, 0, 7, .ignore_checksum = true, .ignore_counter = true,.frequency = 10U}, { 0 }, { 0 }}},   // UI_warning (blinkers, buckle switch & doors)
   };
 
+  if (tesla_longitudinal && tesla_auto_speed_limit) {
+    return BUILD_SAFETY_CFG(tesla_model3_y_rx_checks, TESLA_M3_Y_AUTO_SPEED_TX_MSGS);
+  }
   return BUILD_SAFETY_CFG(tesla_model3_y_rx_checks, TESLA_M3_Y_TX_MSGS);
 }
 

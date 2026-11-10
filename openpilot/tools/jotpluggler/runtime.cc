@@ -1,7 +1,7 @@
 #include "tools/jotpluggler/app.h"
 #include "tools/jotpluggler/common.h"
 
-#include "cereal/services.h"
+#include "openpilot/cereal/services.h"
 #include "common/timing.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
@@ -71,7 +71,6 @@ bool should_subscribe_stream_service(const std::string &name) {
     "livestreamRoadEncodeIdx",
     "livestreamDriverEncodeIdx",
     "thumbnail",
-    "navThumbnail",
   }};
   if (name == "rawAudioData") return false;
   for (std::string_view skipped : kSkippedServices) {
@@ -514,6 +513,10 @@ struct StreamPoller::Impl {
                           std::unordered_map<CanMessageId, size_t, CanMessageIdHash> *can_slots,
                           StreamExtractBatch *src) {
     for (RouteSeries &series : src->series) {
+      auto info_it = src->enum_info.find(series.path);
+      if (info_it != src->enum_info.end() && info_it->second.text_values) {
+        remap_text_series(&series, info_it->second, &dst->enum_info[info_it->first]);
+      }
       auto [it, inserted] = series_slots->try_emplace(series.path, dst->series.size());
       if (inserted) {
         dst->series.push_back(RouteSeries{.path = series.path});
@@ -538,7 +541,9 @@ struct StreamPoller::Impl {
                            std::make_move_iterator(src->timeline.end()));
     }
     for (auto &[path, info] : src->enum_info) {
-      dst->enum_info[path] = std::move(info);
+      if (!info.text_values) {
+        dst->enum_info[path] = std::move(info);
+      }
     }
     if (!src->car_fingerprint.empty()) {
       dst->car_fingerprint = src->car_fingerprint;
@@ -598,9 +603,7 @@ struct StreamPoller::Impl {
           }
           kj::ArrayPtr<const capnp::word> data(reinterpret_cast<const capnp::word *>(msg->getData()),
                                                size / sizeof(capnp::word));
-          capnp::FlatArrayMessageReader event_reader(data);
-          const cereal::Event::Reader event = event_reader.getRoot<cereal::Event>();
-          accumulator->appendEvent(event.which(), data);
+          accumulator->appendEvent(data);
           received_messages.fetch_add(1);
         }
       }

@@ -5,14 +5,21 @@ import pyray as rl
 from dataclasses import dataclass
 from typing import Optional
 from openpilot.common.constants import CV
+from openpilot.selfdrive.carrot.deceleration_source import (
+  deceleration_source_presentation,
+  external_navigation_connected,
+  navigation_status_presentation,
+)
 # from openpilot.selfdrive.ui.mici.onroad.torque_bar import TorqueBar # 아이콘에 토크 적용: 토크바 미사용
 from openpilot.selfdrive.ui.mici.onroad import blend_colors
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.system.hardware.usbgpu import usbgpu_badge_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
 from openpilot.system.ui.widgets import Widget
+from openpilot.system.ui.lib.overlay_cache import OverlayLayer
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.cereal import log
 from openpilot.common.params import Params
@@ -28,13 +35,18 @@ CRUISE_DISABLED_CHAR = '–'
 
 SET_SPEED_PERSISTENCE = 2.5  # seconds
 DEFAULT_MAX_LAT_ACCEL = 3.0  # m/s^2
+CRUISE_SPEED_ANIMATION_START = 120
+CRUISE_SPEED_ANIMATION_MAX = 100
+CRUISE_SPEED_ANIMATION_STEP = 12
+CRUISE_SPEED_ANIMATION_START_SIZE = 96
+CRUISE_SPEED_ANIMATION_TARGET_SIZE = 40
 
 @dataclass(frozen=True)
 class SetSpeedOverrideState:
   active: bool
   speed_kph: float
   label: str
-  speed_color_mode: int # 0: white, 1: green, 2: orange
+  speed_color_mode: int # 0: white, 1: eco green, 2: orange, 3: vehicle-navigation blue, 4: external-navigation green
   force_persist: bool
 
 
@@ -68,13 +80,12 @@ class SetSpeedOverride:
       desired_source = ""
 
     if desired_speed is not None and 0 < desired_speed < 200 and desired_speed < set_speed_kph:
-      label = desired_source.strip() or "apply"
-      label = label[:8]  # 너무 길면 UI 깨짐 방지 (원하면 길이 조절)
+      label, speed_color_mode = deceleration_source_presentation(desired_source)
       return SetSpeedOverrideState(
         active=True,
         speed_kph=desired_speed,
         label=label,
-        speed_color_mode=2,
+        speed_color_mode=speed_color_mode,
         force_persist=True,   # 조건 유지되는 동안 계속 표시
       )
 
@@ -165,6 +176,10 @@ class TurnIntent(Widget):
 class HudRenderer(Widget):
   def __init__(self):
     super().__init__()
+    self._overlay = OverlayLayer(1)
+    self._overlay_state = None
+    self._traffic_light_info = None
+    self._cruise_speed_animation_started = 0.0
     """Initialize the HUD renderer."""
     self._debug_speed_panel = False
     self.is_cruise_set: bool = False
@@ -206,6 +221,10 @@ class HudRenderer(Widget):
     self._set_speed_override = SetSpeedOverride()
     self._debug_traffic_light = False
 
+    self._cruise_speed_text_last = ""
+    self._cruise_speed_animation_text = ""
+    self._cruise_speed_animation_time = -1
+
   def set_wheel_critical_icon(self, critical: bool):
     """Set the wheel icon to critical or normal state."""
     self._show_wheel_critical = critical
@@ -220,6 +239,10 @@ class HudRenderer(Widget):
 
   def _update_state(self) -> None:
     """Update HUD state based on car state and controls state."""
+    # Expiry/colour changes are evaluated on every UI frame, including reuse.
+    self._traffic_light_info = self._get_traffic_light_info()
+    self._wheel_alpha_filter.update(255 * 0.95)
+    self._wheel_y_filter.update(0)
     sm = ui_state.sm
     if sm.recv_frame["carState"] < ui_state.started_frame:
       self.is_cruise_set = False
@@ -241,6 +264,13 @@ class HudRenderer(Widget):
     self.set_speed = set_speed
     self.is_cruise_set = 0 < self.set_speed < SET_SPEED_NA
     self.is_cruise_available = self.set_speed != -1
+
+    if self._engaged and self.is_cruise_set:
+      display_set_speed = self.set_speed * (1.0 if ui_state.is_metric else KM_TO_MILE)
+      cruise_text = str(int(round(display_set_speed)))
+    else:
+      cruise_text = "--"
+    self._update_cruise_speed_animation(cruise_text)
 
     v_ego_cluster = car_state.vEgoCluster
     self.v_ego_cluster_seen = self.v_ego_cluster_seen or v_ego_cluster != 0.0
@@ -270,6 +300,17 @@ class HudRenderer(Widget):
 
   def _render(self, rect: rl.Rectangle) -> None:
     """Render HUD elements to the screen."""
+    state = self._overlay_state
+    key = (state.key if state else None, self._traffic_light_info, self._can_draw_top_icons, self._show_wheel_critical)
+    self._overlay.draw(rect, self._paint, key, enabled=state is not None and state.enabled,
+                       urgent=state is not None and state.urgent)
+    self._draw_cruise_speed_animation(rect)
+    from openpilot.common.indicator_display import draw as draw_indicator
+    badge_width = min(500, rect.width * .62)
+    draw_indicator(rect.x + (rect.width-badge_width)/2, rect.y+rect.height*.16,
+                   badge_width, self._font_display, 26 if rect.width > 1200 else 19)
+
+  def _paint(self, rect: rl.Rectangle) -> None:
 
     # self._torque_bar.render(rect) # 아이콘에 토크 적용: 토크바 미사용
 
@@ -278,12 +319,120 @@ class HudRenderer(Widget):
 
     self._draw_steering_wheel(rect)
 
+    self._draw_egpu_badge(rect)
+
+
+  def _draw_egpu_badge(self, rect: rl.Rectangle) -> None:
+    # Keep runtime state visible while the shared USB hub re-enumerates; a
+    # transient missing sysfs sample must not hide loading or failure details.
+    if not (getattr(ui_state, 'jetlink_badge', None) or getattr(ui_state, 'usbgpu_delivery_badge', None) or
+            ui_state.usbgpu_present or ui_state.usbgpu_active or
+            ui_state.usbgpu_loading or ui_state.usbgpu_startup_failed):
+      return
+
+    state = usbgpu_badge_state(ui_state.usbgpu_compiled, ui_state.usbgpu_loading,
+                               ui_state.usbgpu_active, ui_state.usbgpu_startup_failed,
+                               ui_state.usbgpu_compile_pending)
+    text = "eGPU REBOOT" if state == "compile_pending" else "eGPU ERROR" if state == "error" else "eGPU"
+    if (getattr(ui_state, "usbgpu_delivery_badge", None) and
+        not (ui_state.usbgpu_active or ui_state.usbgpu_loading or ui_state.usbgpu_startup_failed)):
+      text, state = ui_state.usbgpu_delivery_badge
+    if getattr(ui_state, 'jetlink_badge', None) and not ui_state.usbgpu_active:
+      text, state = ui_state.jetlink_badge
+    if getattr(ui_state, 'usbgpu_recovery_badge', None) and not ui_state.usbgpu_active:
+      text, state = ui_state.usbgpu_recovery_badge
+    font = gui_app.font(FontWeight.DISPLAY) if not text.isascii() else self._font_semi_bold
+    font_size = 22
+    text_size = measure_text_cached(font, text, font_size)
+    pad_x, pad_y = 10, 5
+    badge_w = text_size.x + pad_x * 2
+    badge = rl.Rectangle(
+      rect.x + rect.width - badge_w - 24,
+      rect.y + 12,
+      badge_w,
+      text_size.y + pad_y * 2,
+    )
+    color = {
+      "active": rl.Color(0, 255, 0, 230),
+      "loading": rl.Color(255, 255, 0, 230),
+      "error": rl.Color(255, 0, 0, 230),
+      "compile_pending": rl.Color(255, 165, 0, 230),
+      "not_compiled": rl.Color(255, 165, 0, 230),
+      "ready": rl.Color(255, 255, 255, 210),
+    }[state]
+    rl.draw_rectangle_rounded(badge, 0.35, 8, rl.Color(0, 0, 0, 150))
+    rl.draw_rectangle_rounded_lines_ex(badge, 0.35, 8, 2, color)
+    rl.draw_text_ex(
+      font,
+      text,
+      rl.Vector2(badge.x + pad_x, badge.y + pad_y),
+      font_size,
+      0,
+      color,
+    )
+
+  def _update_cruise_speed_animation(self, cruise_text: str) -> None:
+    if self._cruise_speed_text_last == cruise_text:
+      return
+
+    self._cruise_speed_text_last = cruise_text
+    if cruise_text == "--":
+      return
+
+    self._cruise_speed_animation_text = cruise_text
+    self._cruise_speed_animation_time = CRUISE_SPEED_ANIMATION_START
+    self._cruise_speed_animation_started = time.monotonic()
+
+  def _draw_cruise_speed_animation(self, rect: rl.Rectangle) -> None:
+    if self._cruise_speed_animation_time <= 0 or not self._cruise_speed_animation_text:
+      return
+
+    elapsed = time.monotonic() - self._cruise_speed_animation_started
+    self._cruise_speed_animation_time = max(0.0, CRUISE_SPEED_ANIMATION_START - CRUISE_SPEED_ANIMATION_STEP * (1.0 + elapsed * 20.0))
+    if elapsed >= 0.5:
+      return
+    animation_time = self._cruise_speed_animation_time
+    interpolation_time = min(animation_time, CRUISE_SPEED_ANIMATION_MAX)
+
+    panel_x = rect.x + 10.0
+    panel_y = rect.y + rect.height - self._txt_speed_bg.height - 10.0
+    start_x = rect.x + rect.width * 0.5
+    start_y = rect.y + rect.height * 0.45
+    target_x = panel_x + self._txt_speed_bg.width * 0.76
+    target_y = panel_y + self._txt_speed_bg.height * 0.33
+
+    x = int((start_x * interpolation_time + target_x * (CRUISE_SPEED_ANIMATION_MAX - interpolation_time)) /
+            CRUISE_SPEED_ANIMATION_MAX)
+    y = int((start_y * interpolation_time + target_y * (CRUISE_SPEED_ANIMATION_MAX - interpolation_time)) /
+            CRUISE_SPEED_ANIMATION_MAX)
+    font_size = int((CRUISE_SPEED_ANIMATION_START_SIZE * interpolation_time +
+                     CRUISE_SPEED_ANIMATION_TARGET_SIZE * (CRUISE_SPEED_ANIMATION_MAX - interpolation_time)) /
+                    CRUISE_SPEED_ANIMATION_MAX)
+
+    if animation_time >= CRUISE_SPEED_ANIMATION_MAX:
+      border_width = 3.0
+      shadow_offset = 3.0
+    else:
+      border_width = 1.0
+      shadow_offset = 0.0
+
+    draw_text_ui_style(
+      self._cruise_speed_animation_text,
+      x,
+      y,
+      font_size,
+      rl.Color(0, 255, 0, 230),
+      font=self._font_display,
+      border_width=border_width,
+      shadow_offset=shadow_offset,
+      align="center",
+      y_offset=0.0,
+    )
+
   def _draw_steering_wheel(self, rect: rl.Rectangle) -> None:
     wheel_txt = self._txt_wheel_critical if self._show_wheel_critical else self._txt_wheel
 
     # Always visible (no hide). We keep filters but drive them to stable values.
-    self._wheel_alpha_filter.update(255 * 0.95)
-    self._wheel_y_filter.update(0)
 
     # pos (TOP-left)
     margin_x = 18
@@ -292,7 +441,8 @@ class HudRenderer(Widget):
     pos_y = int(rect.y + margin_y + wheel_txt.height / 2 + self._wheel_y_filter.x)
 
     self._draw_steering_wheel_icon(wheel_txt, pos_x, pos_y)
-    self._draw_wheel_side_info(wheel_txt, pos_x, pos_y)
+    # Reserve the right status column (128px link badge plus an 8px gap).
+    self._draw_wheel_side_info(wheel_txt, pos_x, pos_y, info_right=rect.x + rect.width - 24 - 128 - 8)
 
 
   def _draw_steering_wheel_icon(self, wheel_txt, pos_x: int, pos_y: int) -> None:
@@ -358,7 +508,7 @@ class HudRenderer(Widget):
     return "CPU: --"
 
 
-  def _draw_wheel_side_info(self, wheel_txt, pos_x: int, pos_y: int) -> None:
+  def _draw_wheel_side_info(self, wheel_txt, pos_x: int, pos_y: int, info_right=None) -> None:
     now = datetime.now()
 
     try:
@@ -485,7 +635,7 @@ class HudRenderer(Widget):
     if show_debug_ui == 0:
       return
 
-    info_x = time_block_right + 25
+    info_x = time_block_right + 12
 
     cpu_text = self._get_cpu_temp_text()
 
@@ -502,9 +652,25 @@ class HudRenderer(Widget):
     except Exception:
       road_name = ""
 
-    cpu_size = measure_text_cached(self._font_medium, cpu_text, side_font)
-    sr_size = measure_text_cached(self._font_medium, sr_text, side_font)
-    road_size = measure_text_cached(self._font_medium, road_name, side_font) if road_name else rl.Vector2(0, 0)
+    if info_right is not None:
+      available = info_right - info_x
+      if available < 30:
+        return
+      while side_font > 12 and max(measure_text_cached(self._font_display, text, side_font).x for text in (cpu_text, sr_text)) > available:
+        side_font -= 1
+
+      def fit(text):
+        if measure_text_cached(self._font_display, text, side_font).x <= available:
+          return text
+        while text and measure_text_cached(self._font_display, text + '…', side_font).x > available:
+          text = text[:-1]
+        return text + '…' if text else ''
+
+      cpu_text, sr_text, road_name = (fit(text) for text in (cpu_text, sr_text, road_name))
+
+    cpu_size = measure_text_cached(self._font_display, cpu_text, side_font)
+    sr_size = measure_text_cached(self._font_display, sr_text, side_font)
+    road_size = measure_text_cached(self._font_display, road_name, side_font) if road_name else rl.Vector2(0, 0)
 
     line_gap = max(4, int(side_font * 0.15))
 
@@ -670,6 +836,10 @@ class HudRenderer(Widget):
           set_color = rl.Color(0, 255, 0, 230)
         elif ov.speed_color_mode == 2:    # apply
           set_color = rl.Color(255, 165, 0, 230)
+        elif ov.speed_color_mode == 3:    # vehicle navigation CAN
+          set_color = rl.Color(199, 125, 255, 230)
+        elif ov.speed_color_mode == 4:    # external navigation
+          set_color = rl.Color(244, 172, 54, 230)
         else:
           set_color = rl.Color(0, 255, 0, 230)   # your sample is green
 
@@ -700,13 +870,30 @@ class HudRenderer(Widget):
     gap_size = measure_text_cached(self._font_semi_bold, gap_text, gap_font)
     draw_text_ui_style(gap_text, gap_center_x, gap_center_y, gap_font, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=3.0, align="center", y_offset=0.0)
 
-    # active carrot
+    # Navigation availability is independent of speed-control state. Vehicle
+    # CAN candidates also change activeCarrot, so it cannot identify an
+    # external navigation connection.
     sm = ui_state.sm
-    active_carrot = sm['carrotMan'].activeCarrot
-    if active_carrot >= 2:
-      x = int(panel_x + panel_w * 0.60)
+    carrot_man = sm['carrotMan']
+    vehicle_navi_available = bool(getattr(carrot_man, "vehicleNaviAvailable", False))
+    try:
+      carrot_navi_connected = bool(
+        sm.alive['carrotNavi']
+        and sm.valid['carrotNavi']
+        and getattr(sm['carrotNavi'], "connected", False)
+      )
+    except Exception:
+      carrot_navi_connected = False
+    external_navi_connected = external_navigation_connected(
+      getattr(carrot_man, "remote", ""), carrot_navi_connected,
+    )
+    navi_status = navigation_status_presentation(vehicle_navi_available, external_navi_connected)
+    if navi_status is not None:
+      navi_label, navi_color_mode = navi_status
+      x = int(panel_x + panel_w * 0.60 - 26)
       y = int(panel_y + panel_h * 0.82)
-      draw_text_ui_style("NAV", x, y, 26, rl.GREEN, font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
+      navi_color = rl.Color(199, 125, 255, 230) if navi_color_mode == 3 else rl.Color(244, 172, 54, 230)
+      draw_text_ui_style(navi_label, x, y, 26, navi_color, font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
 
 
     # ----- gear (right side box with letter) -----
@@ -796,6 +983,9 @@ class HudRenderer(Widget):
 
 
   def _get_traffic_light_info(self):
+    from openpilot.selfdrive.ui.signal_status import signal_detection_paused
+    if signal_detection_paused(ui_state.sm):
+      return {"lamp": "paused", "remain": 0}
     # debug demo
     if self._debug_traffic_light:
       demo_list = [
@@ -863,9 +1053,14 @@ class HudRenderer(Widget):
     draw_text_ui_style(txt, cx, cy, font_size, color, font=self._font_display, border_width=1.0, shadow_offset=8.0, align="center", y_offset=0.0)
 
   def _draw_traffic_light_info(self, pos_x: int, pos_y: int) -> bool:
-    info = self._get_traffic_light_info()
+    info = self._traffic_light_info
     if not info:
       return False
+
+    if info["lamp"] == "paused":
+      from openpilot.selfdrive.ui.signal_status import draw_signal_pause
+      draw_signal_pause(pos_x + 24, pos_y, 24)
+      return True
 
     lamp = info["lamp"]
     remain = str(info["remain"])
@@ -887,4 +1082,3 @@ class HudRenderer(Widget):
     draw_text_ui_style(remain, text_x, text_y, remain_font, rl.Color(255, 255, 255, 235), font=self._font_display, border_width=1.0, shadow_offset=8.0, align="left_top", y_offset=0.0)
 
     return True
-

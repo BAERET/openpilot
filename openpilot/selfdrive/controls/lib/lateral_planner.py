@@ -1,5 +1,6 @@
 import time
 import numpy as np
+from opendbc.car.lateral_geometry import LateralGeometry
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.lateral_mpc_lib.lat_mpc import LateralMpc
@@ -12,6 +13,7 @@ from openpilot.cereal import log
 from openpilot.common.params import Params
 #from openpilot.selfdrive.controls.lib.lane_planner import LanePlanner
 from openpilot.selfdrive.controls.lib.lane_planner_2 import LanePlanner
+from openpilot.selfdrive.controls.lib.lane_model_speed import LaneModelSpeedGuard
 from collections import deque
 
 TRAJECTORY_SIZE = 33
@@ -33,6 +35,8 @@ class LateralPlanner:
   def __init__(self, CP, debug=False):
     #self.DH = DesireHelper()
 
+    self.geometry = LateralGeometry(CP)
+    self.mass = CP.mass
     # Vehicle model parameters used to calculate lateral movement of car
     self.factor1 = CP.wheelbase - CP.centerToFront
     self.factor2 = (CP.centerToFront * CP.mass) / (CP.wheelbase * CP.tireStiffnessRear)
@@ -71,7 +75,7 @@ class LateralPlanner:
     self.lat_mpc = LateralMpc()
     self.reset_mpc(np.zeros(4))
     self.curve_speed = 0
-    self.lanemode_possible_count = 0
+    self.lane_model_speed_guard = LaneModelSpeedGuard(recovery_frames=int(1 / DT_MDL))
     self.laneless_only = True
 
   def reset_mpc(self, x0=None):
@@ -82,6 +86,9 @@ class LateralPlanner:
 
   def update(self, sm, carrot):
     global LATERAL_ACCEL_COST, LATERAL_JERK_COST, STEERING_RATE_COST
+    if self.geometry.update(getattr(sm['liveParameters'], 'centerToFrontRatio', 0.0)):
+      self.factor1 = self.geometry.wheelbase - self.geometry.center_to_front
+      self.factor2 = self.geometry.center_to_front * self.mass / (self.geometry.wheelbase * self.geometry.stiffness_rear)
     self.readParams -= 1
     if self.readParams <= 0:
       self.readParams = 10
@@ -103,7 +110,8 @@ class LateralPlanner:
     # Parse model predictions
     md = sm['modelV2']
     model_active = False
-    if len(md.position.x) == TRAJECTORY_SIZE and len(md.orientation.x) == TRAJECTORY_SIZE:
+    if (len(md.position.x) == TRAJECTORY_SIZE and len(md.orientation.x) == TRAJECTORY_SIZE and
+        len(md.velocity.x) == TRAJECTORY_SIZE):
       model_active = True
       self.path_xyz = np.column_stack([md.position.x, md.position.y, md.position.z])
       self.t_idxs = np.array(md.position.t)
@@ -114,13 +122,10 @@ class LateralPlanner:
       self.v_plan = np.clip(car_speed, MIN_SPEED, np.inf)
       self.v_ego = self.v_plan[0]
       self.plan_a = np.array(md.acceleration.x)
-      if md.velocity.x[-1] < md.velocity.x[0] * 0.7:  # TODO: 모델이 감속을 요청하는 경우 속도테이블이 레인모드를 할수 없음. 속도테이블을 새로 만들어야함..
-        self.lanemode_possible_count = 0
-        self.laneless_only = True
-      else:
-        self.lanemode_possible_count += 1
-        if self.lanemode_possible_count > int(1/DT_MDL):
-          self.laneless_only = False
+      self.laneless_only = not self.lane_model_speed_guard.update(sm['carState'].vEgo, md.velocity.x[0], md.velocity.x[-1])
+    else:
+      self.lane_model_speed_guard.update(sm['carState'].vEgo, float('nan'), float('nan'))
+      self.laneless_only = True
 
     # Parse model predictions
     self.LP.parse_model(md)
@@ -240,8 +245,11 @@ class LateralPlanner:
 
     #lateralPlan.desire = self.DH.desire
     lateralPlan.useLaneLines = self.lanelines_active
-    #lateralPlan.laneChangeState = self.DH.lane_change_state
-    #lateralPlan.laneChangeDirection = self.DH.lane_change_direction
+    # DesireHelper runs in modeld in this branch. Mirror its published model
+    # metadata into lateralPlan so compact HUD clients receive the same manual
+    # and automatic lane-change state used by the on-road UI.
+    lateralPlan.laneChangeState = sm['modelV2'].meta.laneChangeState
+    lateralPlan.laneChangeDirection = sm['modelV2'].meta.laneChangeDirection
     lateralPlan.laneWidth = float(self.LP.lane_width)
 
     #plan_send.lateralPlan.dPathWLinesX = [float(x) for x in self.d_path_w_lines_xyz[:, 0]]

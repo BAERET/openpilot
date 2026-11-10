@@ -98,6 +98,22 @@ int cluster_h264_encoder_bridge_set_rate_control(ClusterH264EncoderBridge *bridg
   return 0;
 }
 
+int cluster_h264_encoder_bridge_set_qp_range(ClusterH264EncoderBridge *bridge, int min_qp, int max_qp) {
+  if (bridge == nullptr) return -1;
+  if (bridge->encoder != nullptr) {
+    bridge->last_error = "cannot change QP range after encoder open";
+    return -1;
+  }
+  if (min_qp < 0 || max_qp > 51 || min_qp > max_qp) {
+    bridge->last_error = "QP range must satisfy 0 <= min <= max <= 51";
+    return -1;
+  }
+  bridge->config.min_qp = min_qp;
+  bridge->config.max_qp = max_qp;
+  bridge->last_error.clear();
+  return 0;
+}
+
 int cluster_h264_encoder_bridge_set_realtime_priority(ClusterH264EncoderBridge *bridge, int realtime_priority) {
   if (bridge == nullptr) return -1;
   if (bridge->encoder != nullptr) {
@@ -173,6 +189,141 @@ int cluster_h264_encoder_bridge_encode_nv12_active(
             opaque);
       }
     });
+    bridge->last_error.clear();
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(bridge, e);
+    return -1;
+  }
+}
+
+int cluster_h264_encoder_bridge_acquire_nv12_input(
+    ClusterH264EncoderBridge *bridge,
+    uint8_t **data,
+    size_t *size,
+    unsigned int *index,
+    cluster_h264_packet_callback callback,
+    void *opaque) {
+  if (bridge == nullptr || bridge->encoder == nullptr || data == nullptr || size == nullptr || index == nullptr) return -1;
+  try {
+    ClusterH264InputBuffer input = bridge->encoder->acquire_nv12_input([callback, opaque](const ClusterH264PacketView &packet) {
+      if (callback != nullptr) {
+        callback(
+            packet.data,
+            packet.size,
+            packet.flags,
+            packet.timestamp_us,
+            packet.codec_config ? 1 : 0,
+            packet.keyframe ? 1 : 0,
+            opaque);
+      }
+    });
+    *data = input.data;
+    *size = input.size;
+    *index = input.index;
+    bridge->last_error.clear();
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(bridge, e);
+    return -1;
+  }
+}
+
+int cluster_h264_encoder_bridge_acquire_nv12_input_dmabuf(
+    ClusterH264EncoderBridge *bridge,
+    uint8_t **data,
+    size_t *size,
+    unsigned int *index,
+    int *dmabuf_fd,
+    cluster_h264_packet_callback callback,
+    void *opaque) {
+  if (bridge == nullptr || bridge->encoder == nullptr || data == nullptr || size == nullptr ||
+      index == nullptr || dmabuf_fd == nullptr) return -1;
+  try {
+    ClusterH264InputBuffer input = bridge->encoder->acquire_nv12_input([callback, opaque](const ClusterH264PacketView &packet) {
+      if (callback != nullptr) {
+        callback(
+            packet.data,
+            packet.size,
+            packet.flags,
+            packet.timestamp_us,
+            packet.codec_config ? 1 : 0,
+            packet.keyframe ? 1 : 0,
+            opaque);
+      }
+    });
+    *data = input.data;
+    *size = input.size;
+    *index = input.index;
+    *dmabuf_fd = input.dmabuf_fd;
+    bridge->last_error.clear();
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(bridge, e);
+    return -1;
+  }
+}
+
+int cluster_h264_encoder_bridge_submit_nv12_input(
+    ClusterH264EncoderBridge *bridge,
+    unsigned int index,
+    uint64_t timestamp_us,
+    cluster_h264_packet_callback callback,
+    void *opaque) {
+  if (bridge == nullptr || bridge->encoder == nullptr) return -1;
+  try {
+    bridge->encoder->submit_nv12_input(index, timestamp_us, [callback, opaque](const ClusterH264PacketView &packet) {
+      if (callback != nullptr) {
+        callback(
+            packet.data,
+            packet.size,
+            packet.flags,
+            packet.timestamp_us,
+            packet.codec_config ? 1 : 0,
+            packet.keyframe ? 1 : 0,
+            opaque);
+      }
+    });
+    bridge->last_error.clear();
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(bridge, e);
+    return -1;
+  }
+}
+
+int cluster_h264_encoder_bridge_submit_nv12_input_dmabuf(
+    ClusterH264EncoderBridge *bridge,
+    unsigned int index,
+    uint64_t timestamp_us,
+    cluster_h264_packet_callback callback,
+    void *opaque) {
+  if (bridge == nullptr || bridge->encoder == nullptr) return -1;
+  try {
+    bridge->encoder->submit_nv12_input_dmabuf(index, timestamp_us, [callback, opaque](const ClusterH264PacketView &packet) {
+      if (callback != nullptr) {
+        callback(
+            packet.data,
+            packet.size,
+            packet.flags,
+            packet.timestamp_us,
+            packet.codec_config ? 1 : 0,
+            packet.keyframe ? 1 : 0,
+            opaque);
+      }
+    });
+    bridge->last_error.clear();
+    return 0;
+  } catch (const std::exception &e) {
+    set_error(bridge, e);
+    return -1;
+  }
+}
+
+int cluster_h264_encoder_bridge_cancel_nv12_input(ClusterH264EncoderBridge *bridge, unsigned int index) {
+  if (bridge == nullptr || bridge->encoder == nullptr) return -1;
+  try {
+    bridge->encoder->cancel_nv12_input(index);
     bridge->last_error.clear();
     return 0;
   } catch (const std::exception &e) {

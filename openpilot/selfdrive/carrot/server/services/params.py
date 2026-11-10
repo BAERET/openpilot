@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import zlib
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,7 @@ except Exception:
 HAS_PARAMS = False
 Params = None
 ParamKeyType = None
+UnknownKeyName = None
 
 try:
   from openpilot.common.params import Params as _Params
@@ -36,6 +38,11 @@ if HAS_PARAMS:
     ParamKeyType = _ParamKeyType
   except Exception:
     ParamKeyType = None
+  try:
+    from openpilot.common.params import UnknownKeyName as _UnknownKeyName
+    UnknownKeyName = _UnknownKeyName
+  except Exception:
+    UnknownKeyName = None
 
 
 # In-memory fallback store when Params is unavailable
@@ -98,9 +105,23 @@ def clamp_numeric(value: float, p: Optional[Dict[str, Any]]) -> float:
       value = max(value, float(mn))
     if mx is not None:
       value = min(value, float(mx))
+    nonzero_min = p.get("nonzero_min")
+    if nonzero_min is not None and 0 < value < float(nonzero_min):
+      value = float(nonzero_min)
   except Exception:
     pass
   return value
+
+
+def _unregistered_param_paths(params: "Params", key: str) -> tuple[str, str]:
+  if not isinstance(key, str) or not key or not key.isascii() or any(not (char.isalnum() or char == "_") for char in key):
+    raise ValueError(f"invalid param name: {key}")
+
+  param_dir = os.path.abspath(params.get_param_path())
+  param_path = os.path.abspath(params.get_param_path(key))
+  if os.path.normcase(os.path.dirname(param_path)) != os.path.normcase(param_dir):
+    raise ValueError(f"invalid param path: {key}")
+  return param_dir, param_path
 
 
 def _read_param_value(params: "Params", name: str, default: Any) -> Any:
@@ -132,6 +153,25 @@ def _read_param_value(params: "Params", name: str, default: Any) -> Any:
     if v is None:
       return default if default is not None else ""
     return v.decode("utf-8", errors="replace")
+  except Exception:
+    pass
+
+  # During a source hot-update, the web assets and settings JSON can be newer
+  # than the already-loaded native Params key table. Reading the backing file
+  # keeps newly registered settings usable until params_pyx is rebuilt/reloaded.
+  try:
+    _, param_path = _unregistered_param_paths(params, name)
+    with open(param_path, "rb") as f:
+      raw = f.read().decode("utf-8", errors="replace")
+    if isinstance(default, bool):
+      return raw.strip().lower() in ("1", "true", "on", "yes")
+    if isinstance(default, int):
+      return _to_int(raw)
+    if isinstance(default, float):
+      return float(raw)
+    if isinstance(default, (dict, list)):
+      return json.loads(raw)
+    return raw
   except Exception:
     return default if default is not None else ""
 
@@ -177,7 +217,30 @@ def get_param_values(names: list[str], defaults: Optional[Dict[str, Any]] = None
       values[name] = custom_value
       continue
     values[name] = _read_param_value(params, name, defaults.get(name, 0))
+  if "CruiseGapLevels" in values:
+    from openpilot.selfdrive.carrot.cruise_gap import cruise_gap_levels
+    from .settings import current_max_gap_levels
+    try:
+      requested = int(values["CruiseGapLevels"])
+    except (TypeError, ValueError):
+      requested = 0
+    values["CruiseGapLevels"] = cruise_gap_levels(requested, current_max_gap_levels(params))
   return values
+
+
+def _to_int(value: Any) -> int:
+  """Round to the nearest integer instead of truncating toward zero.
+
+  int(float(v)) turns 14.999 into 14, so a value that is a hair under its
+  target lands one whole step below it. Nothing produces such a value today --
+  every parameter in carrot_settings.json is declared with integer bounds --
+  but the moment a fractional one is added, the symptom would be settings that
+  read one lower than what was saved. That is exactly the complaint this whole
+  effort started from, so it is not a difference worth leaving in place.
+
+  Matches the rounding features/params.py already applies when it clamps.
+  """
+  return int(round(float(value)))
 
 
 def _coerce_bool(value: Any) -> bool:
@@ -186,36 +249,90 @@ def _coerce_bool(value: Any) -> bool:
   return bool(value)
 
 
+def _coerce_inferred_value(value: Any, p: Optional[Dict[str, Any]]) -> tuple[str, Any]:
+  kind = infer_type_from_setting(p)
+  if kind == "bool":
+    return kind, _coerce_bool(value)
+  if kind == "int":
+    return kind, _to_int(value)
+  if kind == "float":
+    return kind, float(value)
+  if kind == "json":
+    return kind, json.loads(value) if isinstance(value, str) else value
+  return kind, str(value)
+
+
 def _put_inferred(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]]) -> None:
   """Write using a type inferred from the setting definition.
 
   Used when the runtime type system (get_type / ParamKeyType) is unavailable,
   so a missing ParamKeyType can no longer silently drop the write (the previous
   code promised this 'inference' fallback in a comment but never did it)."""
-  kind = infer_type_from_setting(p)
+  kind, coerced = _coerce_inferred_value(value, p)
   if kind == "bool":
-    v = _coerce_bool(value)
     if hasattr(params, "put_bool"):
-      params.put_bool(key, v)
+      params.put_bool(key, coerced)
     else:
-      params.put(key, "1" if v else "0")
+      params.put(key, "1" if coerced else "0")
   elif kind == "int":
-    iv = int(float(value))
     if hasattr(params, "put_int"):
-      params.put_int(key, iv)
+      params.put_int(key, coerced)
     else:
-      params.put(key, str(iv))
+      params.put(key, str(coerced))
   elif kind == "float":
-    fv = float(value)
     if hasattr(params, "put_float"):
-      params.put_float(key, fv)
+      params.put_float(key, coerced)
     else:
-      params.put(key, repr(fv))
+      params.put(key, repr(coerced))
   elif kind == "json":
-    obj = json.loads(value) if isinstance(value, str) else value
-    params.put(key, obj)
+    params.put(key, coerced)
   else:
-    params.put(key, str(value))
+    params.put(key, coerced)
+
+
+def _put_unregistered_setting(params: "Params", key: str, value: Any, p: Dict[str, Any]) -> None:
+  """Atomically persist a trusted setting while params_pyx still has an old key table."""
+  kind, coerced = _coerce_inferred_value(value, p)
+  if kind == "bool":
+    raw = "1" if coerced else "0"
+  elif kind == "float":
+    raw = repr(coerced)
+  elif kind == "json":
+    raw = json.dumps(coerced, ensure_ascii=False, separators=(",", ":"))
+  else:
+    raw = str(coerced)
+
+  param_dir, param_path = _unregistered_param_paths(params, key)
+
+  # Match the native Params writer: keep temporary files outside the `d`
+  # symlink so clear_all cannot remove one while it is being committed.
+  fd, temp_path = tempfile.mkstemp(prefix=".tmp_value_", dir=os.path.dirname(param_dir))
+  try:
+    with os.fdopen(fd, "wb") as f:
+      fd = -1
+      f.write(raw.encode("utf-8"))
+      f.flush()
+      os.fsync(f.fileno())
+    os.replace(temp_path, param_path)
+    temp_path = ""
+
+    try:
+      dir_fd = os.open(param_dir, os.O_RDONLY)
+    except OSError:
+      dir_fd = -1
+    if dir_fd >= 0:
+      try:
+        os.fsync(dir_fd)
+      finally:
+        os.close(dir_fd)
+  finally:
+    if fd >= 0:
+      os.close(fd)
+    if temp_path:
+      try:
+        os.unlink(temp_path)
+      except FileNotFoundError:
+        pass
 
 
 def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]] = None) -> None:
@@ -241,7 +358,7 @@ def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]
   if t == ParamKeyType.BOOL:
     params.put_bool(key, _coerce_bool(value))
   elif t == ParamKeyType.INT:
-    params.put_int(key, int(float(value)))
+    params.put_int(key, _to_int(value))
   elif t == ParamKeyType.FLOAT:
     params.put_float(key, float(value))
   elif t == ParamKeyType.TIME:
@@ -256,13 +373,42 @@ def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]
     params.put(key, str(value))
 
 
+INTERNAL_SESSION_PARAMS = frozenset({"DriverMonitoringSessionDisabled", "JetsonLegacyUpdatePending"})
+BACKUP_EXCLUDED_PARAMS = frozenset({"DriverMonitoringEnabled"})
+
+
+def filter_param_backup_values(values: dict[str, Any]) -> dict[str, Any]:
+  return {
+    str(key): value
+    for key, value in values.items()
+    if str(key) not in INTERNAL_SESSION_PARAMS and str(key) not in BACKUP_EXCLUDED_PARAMS
+  }
+
+
+def read_param_backup_values(path: str) -> dict[str, Any]:
+  with open(path, "r", encoding="utf-8") as f:
+    values = json.load(f)
+  if not isinstance(values, dict):
+    raise ValueError("bad json format (must be object)")
+  return filter_param_backup_values(values)
+
+
 def set_param_value(name: str, value: Any, p: Optional[Dict[str, Any]] = None) -> None:
+  if name in INTERNAL_SESSION_PARAMS:
+    raise ValueError(f"{name} is controlled internally")
   if not HAS_PARAMS:
     _mem_store[name] = str(value)
     return
   params = Params()
-  put_typed(params, name, value, p)
+  try:
+    put_typed(params, name, value, p)
+  except Exception as exc:
+    if p is None or UnknownKeyName is None or not isinstance(exc, UnknownKeyName):
+      raise
+    _put_unregistered_setting(params, name, value, p)
 
+  if name == "DriverMonitoringEnabled" and not _coerce_bool(value) and not params.get_bool("IsOnroad"):
+    params.remove("Offroad_DriverMonitoringUncertain")
 
 # -----------------------
 # Bulk backup / restore
@@ -282,6 +428,9 @@ def get_all_param_values_for_backup() -> Dict[str, str]:
         continue
     else:
       key = str(k)
+
+    if key in INTERNAL_SESSION_PARAMS or key in BACKUP_EXCLUDED_PARAMS:
+      continue
 
     try:
       t = params.get_type(key)
@@ -365,40 +514,48 @@ def _backup_param_type_map(names: Optional[List[str]] = None) -> Dict[str, Any]:
   return type_map
 
 
-def restore_param_values_from_backup(values: Dict[str, Any]) -> Dict[str, Any]:
+def restore_param_values_from_backup(values: Dict[str, Any], source: str = "restore") -> Dict[str, Any]:
   if not HAS_PARAMS or ParamKeyType is None:
     raise RuntimeError("Params/ParamKeyType not available")
 
+  # Imported lazily: services.param_changes is a leaf module and importing it
+  # at module load would tangle the import order of the params services.
+  from .param_changes import append_param_change
+
   params = Params()
+  definitions = _catalog_definitions()
   ok_cnt = 0
   fail_cnt = 0
   fails = []
 
   for key, value in values.items():
+    if key in INTERNAL_SESSION_PARAMS:
+      continue
+    if source != "reset_defaults" and key in BACKUP_EXCLUDED_PARAMS:
+      continue
     try:
-      t = params.get_type(key)
-
-      if t == ParamKeyType.BOOL:
-        v = value in ("1", "true", "True", "on", "yes") if isinstance(value, str) else bool(value)
-        params.put_bool(key, v)
-
-      elif t == ParamKeyType.INT:
-        params.put_int(key, int(float(value)))
-
-      elif t == ParamKeyType.FLOAT:
-        params.put_float(key, float(value))
-
-      elif t == ParamKeyType.TIME:
-        params.put(key, str(value))
-
-      elif t == ParamKeyType.STRING:
-        params.put(key, str(value))
-
-      else:
-        # JSON/BYTES는 백업에서 제외했지만, 혹시 들어오면 skip
+      definition = definitions.get(key)
+      t = resolve_param_type(params, key, definition)
+      if t is None or _is_unsupported_param_type(t):
+        # JSON/BYTES are excluded from backups; an unknown key with no
+        # definition to infer from is left untouched rather than failed.
         continue
 
+      previous = _read_param_value(params, key, None)
+      # The single write path: same clamping, inference and unregistered-key
+      # fallback the settings screen uses, so a profile cannot fail on a key a
+      # single write would have saved.
+      set_param_value(key, value, definition)
       ok_cnt += 1
+
+      # Recording each write individually — bulk writes are the hardest changes
+      # to explain after the fact. A read-back failure must not undo the write.
+      try:
+        after = _read_param_value(params, key, None)
+        if previous != after:
+          append_param_change(key, previous, after, source=source)
+      except Exception:
+        pass
 
     except Exception as e:
       fail_cnt += 1
@@ -698,7 +855,7 @@ def _encode_qr_value(value: Any, param_type: Any = None) -> bytes:
 
   if ParamKeyType is not None and param_type == ParamKeyType.INT:
     try:
-      return b"\x03" + _write_varint(_zigzag_encode(int(float(value))))
+      return b"\x03" + _write_varint(_zigzag_encode(_to_int(value)))
     except Exception:
       pass
 
@@ -847,6 +1004,7 @@ def _build_params_qr_payload_v4(values: Dict[str, Any]) -> Dict[str, Any]:
 def build_params_qr_payload(values: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
   if values is None:
     values = get_all_param_values_for_backup()
+  values = filter_param_backup_values(values)
 
   try:
     return _build_params_qr_payload_v3(values)
@@ -1032,6 +1190,46 @@ def parse_params_qr_payload(data: Any) -> Dict[str, Any]:
   return _parse_params_qr_payload_v2(compressed, parts[2])
 
 
+def _inferred_param_key_type(definition: Optional[Dict[str, Any]]) -> Any:
+  """Map a catalog-inferred kind onto a ParamKeyType, or None if impossible."""
+  if ParamKeyType is None or not definition:
+    return None
+  mapping = {
+    "bool": ParamKeyType.BOOL,
+    "int": ParamKeyType.INT,
+    "float": ParamKeyType.FLOAT,
+    "string": ParamKeyType.STRING,
+    "json": ParamKeyType.JSON,
+  }
+  return mapping.get(infer_type_from_setting(definition))
+
+
+def resolve_param_type(params: "Params", key: str, definition: Optional[Dict[str, Any]] = None) -> Any:
+  """The key's type, preferring the native table and falling back to the catalog.
+
+  A parameter added to carrot_settings.json is usable from the web (single
+  writes and reads already fall back) before params_pyx is rebuilt, but the
+  profile preview and apply used to call params.get_type() directly and mark
+  such a key as an error. This resolves the type the same way the write path
+  does, so all four paths agree on what a parameter is.
+  """
+  try:
+    return params.get_type(key)
+  except Exception:
+    return _inferred_param_key_type(definition)
+
+
+def _catalog_definitions() -> Dict[str, Any]:
+  # Lazy: services.settings imports this module, so importing it at load time
+  # would form a cycle.
+  try:
+    from .settings import get_settings_cached
+    _data, _groups, by_name, _groups_list = get_settings_cached()
+    return by_name or {}
+  except Exception:
+    return {}
+
+
 def _param_type_name(t: Any) -> str:
   name = getattr(t, "name", None)
   return str(name or t)
@@ -1054,7 +1252,7 @@ def _normalize_param_value(t: Any, value: Any) -> Any:
     return bool(value)
 
   if ParamKeyType is not None and t == ParamKeyType.INT:
-    return int(float(value))
+    return _to_int(value)
 
   if ParamKeyType is not None and t == ParamKeyType.FLOAT:
     return float(value)
@@ -1073,12 +1271,14 @@ def _values_equal(t: Any, left: Any, right: Any) -> bool:
     return str(left) == str(right)
 
 
-def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional[List[str]] = None) -> Dict[str, Any]:
+def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional[List[str]] = None,
+                                 source: str = "restore") -> Dict[str, Any]:
   if not HAS_PARAMS or ParamKeyType is None:
     raise RuntimeError("Params/ParamKeyType not available")
 
   selected = set(selected_keys or [])
   params = Params()
+  definitions = _catalog_definitions()
   current_values = get_param_values(list(values.keys()), {})
   entries = []
   summary = {"changed": 0, "same": 0, "skipped": 0, "invalid": 0, "selected": 0}
@@ -1091,24 +1291,40 @@ def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional
     type_name = "unknown"
     normalized_value: Any = raw_value
 
-    try:
-      t = params.get_type(key)
-      type_name = _param_type_name(t)
-      if _is_unsupported_param_type(t):
-        status = "skipped"
-        reason = "unsupported type"
-        can_apply = False
-      else:
-        normalized_value = _normalize_param_value(t, raw_value)
-        current_value = current_values.get(key, "")
-        if _values_equal(t, current_value, normalized_value):
-          status = "same"
-          can_apply = False
-    except Exception as e:
-      current_value = current_values.get(key, "")
+    if key in INTERNAL_SESSION_PARAMS:
       status = "invalid"
-      reason = str(e)
+      reason = "controlled internally"
       can_apply = False
+    elif source != "reset_defaults" and key in BACKUP_EXCLUDED_PARAMS:
+      status = "skipped"
+      reason = "excluded from backup restore"
+      can_apply = False
+    else:
+      try:
+        # Same type resolution as the write path: a not-yet-registered key is
+        # typed from its catalog definition instead of being marked invalid.
+        t = resolve_param_type(params, key, definitions.get(key))
+        if t is None:
+          status = "invalid"
+          reason = "unknown parameter"
+          can_apply = False
+        else:
+          type_name = _param_type_name(t)
+          if _is_unsupported_param_type(t):
+            status = "skipped"
+            reason = "unsupported type"
+            can_apply = False
+          else:
+            normalized_value = _normalize_param_value(t, raw_value)
+            current_value = current_values.get(key, "")
+            if _values_equal(t, current_value, normalized_value):
+              status = "same"
+              can_apply = False
+      except Exception as e:
+        current_value = current_values.get(key, "")
+        status = "invalid"
+        reason = str(e)
+        can_apply = False
 
     is_selected = can_apply and (not selected or key in selected)
     if is_selected:
@@ -1131,14 +1347,15 @@ def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional
   }
 
 
-def restore_param_values_validated(values: Dict[str, Any], selected_keys: Optional[List[str]] = None) -> Dict[str, Any]:
-  preview = preview_param_restore_values(values, selected_keys)
+def restore_param_values_validated(values: Dict[str, Any], selected_keys: Optional[List[str]] = None,
+                                   source: str = "restore") -> Dict[str, Any]:
+  preview = preview_param_restore_values(values, selected_keys, source=source)
   apply_values = {
     entry["key"]: entry["value"]
     for entry in preview["entries"]
     if entry.get("apply")
   }
-  result = restore_param_values_from_backup(apply_values) if apply_values else {
+  result = restore_param_values_from_backup(apply_values, source=source) if apply_values else {
     "ok_cnt": 0,
     "fail_cnt": 0,
     "fails": [],

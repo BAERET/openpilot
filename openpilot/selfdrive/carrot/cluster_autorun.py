@@ -20,27 +20,22 @@ OPENPILOT_ROOT = CARROT_DIR.parents[1]
 HUD_PARAM = "ClusterHud"
 HUD_DEBUG_PARAM = "ClusterHudDebug"
 HUD_ENCODER_PARAM = "ClusterHudEncoder"
-HUD_LIVE_FPS_PARAM = "ClusterHudLiveFps"
-HUD_CORE_MODE_PARAM = "ClusterHudCoreMode"
-HUD_PRIORITY_PARAM = "ClusterHudPriority"
+HUD_ORIENTATION_PARAM = "ClusterHudOrientation"
 IS_ONROAD_PARAM = "IsOnroad"
 RETRY_INTERVAL_S = 5.0
-HUD_CHECK_INTERVAL_S = 5.0
+HUD_CHECK_INTERVAL_S = 0.1
 USB_FALLBACK_SCAN_INTERVAL_S = 5.0
 USB_OFF_DIM_INTERVAL_S = 30.0
+USBGPU_DISCOVERY_GRACE_S = 3.0
+USBGPU_STARTUP_TIMEOUT_S = 60.0
+USBGPU_STARTUP_POLL_S = 0.1
+USBGPU_DISPLAY_STABILIZE_S = 10.0
+USBGPU_DISPLAY_FPS = 5
+USBGPU_HARDWARE_SEEN_PARAM = "UsbGpuHardwareSeen"
+USBGPU_LOADING_PARAM = "UsbGpuLoading"
+USBGPU_ACTIVE_PARAM = "UsbGpuActive"
+USBGPU_STARTUP_FAILED_PARAM = "UsbGpuStartupFailed"
 NETLINK_KOBJECT_UEVENT = 15
-AUTORUN_FPS_ENV = "CLUSTER_AUTORUN_FPS"
-REALTIME_CORES_ENV = "CLUSTER_REALTIME_CORES"
-REALTIME_PRIORITY_ENV = "CLUSTER_REALTIME_PRIORITY"
-AUTORUN_DEFAULT_ENV = {
-    "CLUSTER_REALTIME": "1",
-}
-DEFAULT_REALTIME_CORES = [1, 2, 3, 4]
-DEFAULT_REALTIME_PRIORITY = 10
-CORE_MODE_DEDICATED = 0
-CORE_MODE_ALL = 1
-EXPLICIT_REALTIME_CORES_ENV = REALTIME_CORES_ENV in os.environ
-EXPLICIT_REALTIME_PRIORITY_ENV = REALTIME_PRIORITY_ENV in os.environ
 ENCODER_AUTO = 0
 ENCODER_JPEG = 1
 ENCODER_HARDWARE = 2
@@ -51,11 +46,7 @@ ENCODER_NAMES = {
     ENCODER_HARDWARE: "hardware",
     ENCODER_SOFTWARE: "software",
 }
-INITIAL_ALLOWED_CORES = (
-    sorted(os.sched_getaffinity(0))
-    if sys.platform == "linux" and hasattr(os, "sched_getaffinity")
-    else list(range(os.cpu_count() or 1))
-)
+USB_DISCONNECT_TEXT = ("usb display disconnected", "no such device", "device has been disconnected")
 
 
 def _configure_autorun_locale() -> None:
@@ -77,98 +68,25 @@ def _ensure_cluster_paths() -> None:
             sys.path.insert(0, path_text)
 
 
-def _apply_autorun_defaults() -> None:
-    for key, value in AUTORUN_DEFAULT_ENV.items():
-        os.environ.setdefault(key, value)
+def _is_usb_disconnect_error(exc: BaseException) -> bool:
+    """Recognize an expected hot-unplug through the wrapped pipeline errors."""
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        message = str(current).lower()
+        if any(marker in message for marker in USB_DISCONNECT_TEXT):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
-def _cluster_realtime_enabled() -> bool:
-    return os.environ.get("CLUSTER_REALTIME", "0").strip().lower() in ("1", "true", "yes", "on")
-
-
-def _normalize_core_mode(value: object) -> int:
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in ("all", "all-cores", "all_cores"):
-            return CORE_MODE_ALL
-        if normalized in ("dedicated", "default", "cluster", "1,2,3,4"):
-            return CORE_MODE_DEDICATED
-        try:
-            value = int(normalized)
-        except ValueError:
-            return CORE_MODE_DEDICATED
-    try:
-        mode = int(value)
-    except (TypeError, ValueError):
-        return CORE_MODE_DEDICATED
-    if mode == CORE_MODE_ALL:
-        return CORE_MODE_ALL
-    return CORE_MODE_DEDICATED
-
-
-def _normalize_priority(value: object) -> int:
-    if isinstance(value, str):
-        normalized = value.strip()
-        try:
-            value = int(normalized)
-        except ValueError:
-            return DEFAULT_REALTIME_PRIORITY
-    try:
-        priority = int(value)
-    except (TypeError, ValueError):
-        return DEFAULT_REALTIME_PRIORITY
-    if priority < 1:
-        return DEFAULT_REALTIME_PRIORITY
-    return min(99, priority)
-
-
-def _all_realtime_cores() -> list[int]:
-    return INITIAL_ALLOWED_CORES[:] or list(range(os.cpu_count() or 1))
-
-
-def _cores_for_core_mode(core_mode: int) -> list[int]:
-    if core_mode == CORE_MODE_ALL:
-        return _all_realtime_cores()
-    return DEFAULT_REALTIME_CORES[:]
-
-
-def _parse_realtime_cores(text: str) -> list[int]:
-    normalized = text.strip().lower()
-    if normalized in ("all", "*"):
-        return _all_realtime_cores()
-    return [int(core.strip()) for core in text.split(",") if core.strip()]
-
-
-def _apply_realtime_setting_env(core_mode: int, priority: int) -> None:
-    if not EXPLICIT_REALTIME_CORES_ENV:
-        os.environ[REALTIME_CORES_ENV] = ",".join(str(core) for core in _cores_for_core_mode(core_mode))
-    if not EXPLICIT_REALTIME_PRIORITY_ENV:
-        os.environ[REALTIME_PRIORITY_ENV] = str(priority)
-
-
-def _cluster_realtime_cores() -> list[int]:
-    cores_text = os.environ.get(REALTIME_CORES_ENV)
-    if cores_text:
-        return _parse_realtime_cores(cores_text)
-    return DEFAULT_REALTIME_CORES[:]
-
-
-def _set_current_process_affinity(cores: list[int]) -> list[int]:
-    if sys.platform != "linux" or not hasattr(os, "sched_setaffinity"):
-        return []
-    os.sched_setaffinity(0, cores)
-    return sorted(os.sched_getaffinity(0))
-
-
-def _configure_autorun_affinity() -> None:
-    if not _cluster_realtime_enabled():
-        return
-    try:
-        cores = _cluster_realtime_cores()
-        allowed_cores = _set_current_process_affinity(cores)
-        print(f"[cluster_autorun] affinity enabled cores={allowed_cores or cores}", flush=True)
-    except Exception as exc:
-        print(f"[cluster_autorun] failed to set core affinity: {exc}", flush=True)
+def _report_cluster_failure(exc: BaseException) -> None:
+    if _is_usb_disconnect_error(exc):
+        print(f"[cluster_autorun] USB display disconnected; retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
+    else:
+        print(f"[cluster_autorun] cluster HUD failed: {exc}; retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
+        traceback.print_exc()
 
 
 def _read_hud_mode(params: Params) -> int:
@@ -214,28 +132,13 @@ def _read_encoder_mode(params: Params) -> int:
     return encoder_mode
 
 
-def _read_live_fps_mode(params: Params) -> int:
+def _read_orientation(params: Params) -> int | None:
     try:
-        return int(params.get_int(HUD_LIVE_FPS_PARAM))
+        orientation = int(params.get_int(HUD_ORIENTATION_PARAM))
     except Exception as exc:
-        print(f"[cluster_autorun] failed to read {HUD_LIVE_FPS_PARAM}: {exc}", flush=True)
-        return 0
-
-
-def _read_core_mode(params: Params) -> int:
-    try:
-        return _normalize_core_mode(params.get_int(HUD_CORE_MODE_PARAM))
-    except Exception as exc:
-        print(f"[cluster_autorun] failed to read {HUD_CORE_MODE_PARAM}: {exc}", flush=True)
-        return CORE_MODE_DEDICATED
-
-
-def _read_priority(params: Params) -> int:
-    try:
-        return _normalize_priority(params.get_int(HUD_PRIORITY_PARAM))
-    except Exception as exc:
-        print(f"[cluster_autorun] failed to read {HUD_PRIORITY_PARAM}: {exc}", flush=True)
-        return DEFAULT_REALTIME_PRIORITY
+        print(f"[cluster_autorun] failed to read {HUD_ORIENTATION_PARAM}: {exc}", flush=True)
+        return None
+    return orientation if orientation in (0, 2) else None
 
 
 def _encoder_sequence(encoder_mode: int) -> list[int]:
@@ -263,9 +166,8 @@ def _cluster_args(
     hud_mode: int,
     configured_encoder_mode: int,
     active_encoder_mode: int,
-    core_mode: int,
-    priority: int,
     output_mode: str = "usb",
+    usbgpu_active: bool = False,
 ) -> list[str]:
     args = [
         "--input",
@@ -276,27 +178,25 @@ def _cluster_args(
         str(hud_mode),
         "--cluster-hud-encoder",
         str(configured_encoder_mode),
-        "--cluster-hud-core-mode",
-        str(core_mode),
-        "--cluster-hud-priority",
-        str(priority),
     ]
+    fps = USBGPU_DISPLAY_FPS if usbgpu_active else 10
+    args.extend(["--fps", str(fps)])
     if output_mode in ("usb", "both"):
         args[4:4] = _encoder_args(active_encoder_mode)
-    fps = os.environ.get(AUTORUN_FPS_ENV, "").strip()
-    if fps:
-        args.extend(["--fps", fps])
+        args.extend(["--usb-display-fps", str(fps)])
     return args
 
 
 def _run_cluster_once(
     hud_mode: int,
     encoder_mode: int,
-    core_mode: int,
-    priority: int,
     output_mode: str = "usb",
+    usbgpu_active: bool = False,
 ) -> None:
     from selfdrive.carrot import cluster_run
+    # Install before renderer/encoder dependencies can bind graphics symbols.
+    cluster_run.configure_cluster_graphics()
+    from cluster_h264_pipeline import H264PipelineInitializationError
 
     def run_cluster_entry() -> None:
         try:
@@ -326,14 +226,13 @@ def _run_cluster_once(
                         hud_mode,
                         encoder_mode,
                         active_encoder_mode,
-                        core_mode,
-                        priority,
                         output_mode,
+                        usbgpu_active,
                     ),
                 ]
                 run_cluster_entry()
                 return
-            except Exception:
+            except H264PipelineInitializationError:
                 if output_mode not in ("usb", "both") or encoder_mode != ENCODER_AUTO or index == len(sequence) - 1:
                     raise
                 next_encoder_mode = sequence[index + 1]
@@ -517,10 +416,8 @@ def _turn_off_supported_usb_device(expected_product_id: int, reason: str) -> boo
     _configure_autorun_locale()
 
     from cluster_usb_display import TuringUsbDisplay, find_supported_usb_product, product_label
-
     if find_supported_usb_product(expected_product_id) is None:
         return False
-
     display = TuringUsbDisplay(brightness=0, display_fps=0, expected_product_id=expected_product_id)
     try:
         display.open()
@@ -570,22 +467,95 @@ def _wait_for_hud_output_allowed(params: Params, expected_product_id: int) -> in
         time.sleep(max(0.1, min(next_hud_check, next_off_dim) - time.monotonic()))
 
 
+def _usbgpu_startup_expected() -> bool:
+    try:
+        from openpilot.selfdrive.modeld.helpers import usbgpu_compiled, usbgpu_present
+
+        return usbgpu_present() and usbgpu_compiled()
+    except Exception as exc:
+        print(f"[cluster_autorun] could not inspect eGPU startup state: {exc}", flush=True)
+        return False
+
+
+def _wait_for_usbgpu_startup(params: Params) -> None:
+    """Keep the shared USB display idle until initial eGPU transfers finish."""
+    remembered = params.get_bool(USBGPU_HARDWARE_SEEN_PARAM)
+    expected = _usbgpu_startup_expected()
+    discovery_deadline = time.monotonic() + USBGPU_DISCOVERY_GRACE_S
+    while remembered and not expected and time.monotonic() < discovery_deadline:
+        if (
+            params.get_bool(USBGPU_LOADING_PARAM)
+            or params.get_bool(USBGPU_ACTIVE_PARAM)
+            or params.get_bool(USBGPU_STARTUP_FAILED_PARAM)
+        ):
+            expected = True
+            break
+        time.sleep(USBGPU_STARTUP_POLL_S)
+        expected = _usbgpu_startup_expected()
+
+    if not expected:
+        return
+
+    print("[cluster_autorun] waiting for eGPU startup before opening USB display", flush=True)
+    startup_deadline = time.monotonic() + USBGPU_STARTUP_TIMEOUT_S
+    while time.monotonic() < startup_deadline:
+        loading = params.get_bool(USBGPU_LOADING_PARAM)
+        active = params.get_bool(USBGPU_ACTIVE_PARAM)
+        failed = params.get_bool(USBGPU_STARTUP_FAILED_PARAM)
+        if not loading and active:
+            print(
+                f"[cluster_autorun] eGPU startup complete; keeping USB display idle for "
+                f"{USBGPU_DISPLAY_STABILIZE_S:.0f}s",
+                flush=True,
+            )
+            stabilize_deadline = time.monotonic() + USBGPU_DISPLAY_STABILIZE_S
+            while time.monotonic() < stabilize_deadline:
+                if not params.get_bool(USBGPU_ACTIVE_PARAM):
+                    print(
+                        "[cluster_autorun] eGPU became inactive during stabilization; "
+                        "starting USB display",
+                        flush=True,
+                    )
+                    return
+                time.sleep(min(USBGPU_STARTUP_POLL_S, stabilize_deadline - time.monotonic()))
+            print(
+                f"[cluster_autorun] eGPU stable; starting USB display at {USBGPU_DISPLAY_FPS} fps",
+                flush=True,
+            )
+            return
+        if not loading and failed:
+            print("[cluster_autorun] eGPU startup failed; starting USB display after fallback", flush=True)
+            return
+        time.sleep(USBGPU_STARTUP_POLL_S)
+
+    print(
+        f"[cluster_autorun] eGPU startup wait timed out after {USBGPU_STARTUP_TIMEOUT_S:.0f}s; "
+        "starting USB display",
+        flush=True,
+    )
+
+
 def main() -> None:
+    from openpilot.common.realtime import drop_realtime
+    from openpilot.common.display_scheduling import DisplayScheduler
+
+    drop_realtime()
     _configure_autorun_locale()
     _ensure_cluster_paths()
-    _apply_autorun_defaults()
+    from cluster_graphics_cleanup import ensure_clean_autorun_process
+    ensure_clean_autorun_process()
+    from cluster_profile import release_finished_session_memory
     from cluster_usb_display import find_supported_usb_product, product_id_for_hud_mode, product_label
 
+    scheduler = DisplayScheduler(4, enabled=TICI)
+    scheduler.update(False, force=True)
     params = Params()
     params.put_bool_nonblocking("ClusterHudConnected", False)
     while True:
-        core_mode = _read_core_mode(params)
-        priority = _read_priority(params)
-        _apply_realtime_setting_env(core_mode, priority)
-        _configure_autorun_affinity()
+        scheduler.update(False, force=True)
         hud_mode = _read_hud_mode(params)
         encoder_mode = _read_encoder_mode(params)
-        live_fps_mode = _read_live_fps_mode(params)
+        orientation = _read_orientation(params)
         expected_product_id = product_id_for_hud_mode(hud_mode)
         if expected_product_id is None:
             print(f"[cluster_autorun] {HUD_PARAM}={hud_mode}; stopping cluster HUD", flush=True)
@@ -597,6 +567,8 @@ def main() -> None:
                 return
             continue
 
+        _wait_for_usbgpu_startup(params)
+
         if find_supported_usb_product(expected_product_id) is None:
             if not TICI:
                 print(
@@ -605,7 +577,7 @@ def main() -> None:
                     flush=True,
                 )
                 try:
-                    _run_cluster_once(hud_mode, encoder_mode, core_mode, priority, output_mode="window")
+                    _run_cluster_once(hud_mode, encoder_mode, output_mode="window")
                     continue
                 except Exception as exc:
                     print(
@@ -614,8 +586,10 @@ def main() -> None:
                         flush=True,
                     )
                     traceback.print_exc()
-                    time.sleep(RETRY_INTERVAL_S)
-                    continue
+                finally:
+                    release_finished_session_memory()
+                time.sleep(RETRY_INTERVAL_S)
+                continue
             found_product_id = _wait_for_supported_usb_device(
                 params,
                 expected_product_id,
@@ -628,26 +602,24 @@ def main() -> None:
             print(f"[cluster_autorun] found {product_label(expected_product_id)}; starting cluster HUD", flush=True)
 
         try:
-            _run_cluster_once(hud_mode, encoder_mode, core_mode, priority)
+            _run_cluster_once(
+                hud_mode,
+                encoder_mode,
+                usbgpu_active=params.get_bool(USBGPU_ACTIVE_PARAM),
+            )
             next_hud_mode = _read_hud_mode(params)
             next_encoder_mode = _read_encoder_mode(params)
-            next_live_fps_mode = _read_live_fps_mode(params)
-            next_core_mode = _read_core_mode(params)
-            next_priority = _read_priority(params)
+            next_orientation = _read_orientation(params)
             if (
                 next_hud_mode != hud_mode
                 or next_encoder_mode != encoder_mode
-                or next_live_fps_mode != live_fps_mode
-                or next_core_mode != core_mode
-                or next_priority != priority
+                or (next_orientation is not None and next_orientation != orientation)
             ):
                 print(
                     f"[cluster_autorun] HUD setting changed "
                     f"mode {hud_mode}->{next_hud_mode}, "
                     f"encoder {encoder_mode}->{next_encoder_mode}, "
-                    f"live_fps {live_fps_mode}->{next_live_fps_mode}, "
-                    f"core_mode {core_mode}->{next_core_mode}, "
-                    f"priority {priority}->{next_priority}; rechecking",
+                    f"orientation {orientation}->{next_orientation}; rechecking",
                     flush=True,
                 )
                 continue
@@ -656,11 +628,13 @@ def main() -> None:
                 flush=True,
             )
         except Exception as exc:
-            print(
-                f"[cluster_autorun] cluster HUD failed: {exc}; retrying in {RETRY_INTERVAL_S:.0f}s",
-                flush=True,
-            )
-            traceback.print_exc()
+            _report_cluster_failure(exc)
+        finally:
+            # run_demo unfreezes on exit. Collect only after its stack and the
+            # handled exception are gone, before another renderer allocates.
+            # Otherwise failed pipeline traceback cycles survive the retry wait
+            # and overlap the next session until its late initialization GC.
+            release_finished_session_memory()
         time.sleep(RETRY_INTERVAL_S)
 
 

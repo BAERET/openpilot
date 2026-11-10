@@ -1,11 +1,27 @@
 import pytest
+import ast
 import datetime
 import os
 import threading
 import time
 import uuid
+from pathlib import Path
 
 from openpilot.common.params import Params, ParamKeyFlag, UnknownKeyName
+
+
+@pytest.mark.parametrize("saved", [None, 0, 1])
+def test_always_lateral_manager_preserves_existing_default_and_saved_choice(tmp_path, saved):
+  params = Params(str(tmp_path / "params"))
+  if saved is not None:
+    params.put("AlwaysLateral", saved)
+  manager = Path(__file__).resolve().parents[2] / "system/manager/manager.py"
+  tree = ast.parse(manager.read_text())
+  init = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "manager_init")
+  defaults = next(node for node in init.body if isinstance(node, ast.For) and ast.unparse(node.iter) == "params.all_keys()")
+  exec(compile(ast.Module(body=[defaults], type_ignores=[]), str(manager), "exec"), {"params": params})
+  assert params.get("AlwaysLateral") == (1 if saved is None else saved)
+
 
 class TestParams:
   def setup_method(self):
@@ -40,6 +56,15 @@ class TestParams:
     self.params.put("AthenadPid", 123)
     assert self.params.get("DongleId") == "bob"
     assert self.params.get("AthenadPid") == 123
+
+  @pytest.mark.parametrize("flag", [ParamKeyFlag.CLEAR_ON_MANAGER_START, ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION])
+  def test_temporary_navigation_destination_lifecycle(self, tmp_path, flag):
+    memory = Params(str(tmp_path / 'memory'))
+    memory.put('NavDestinationTemporary', '{"latitude":37,"longitude":127}')
+    assert Params(str(tmp_path / 'memory')).get('NavDestinationTemporary')
+    assert self.params.get('NavDestinationTemporary') is None
+    memory.clear_all(flag)
+    assert memory.get('NavDestinationTemporary') is None
 
   def test_params_get_block(self):
     def _delayed_writer():
@@ -82,6 +107,13 @@ class TestParams:
 
     self.params.put("IsMetric", False)
     assert not self.params.get_bool("IsMetric")
+
+  @pytest.mark.parametrize("flag", [ParamKeyFlag.CLEAR_ON_MANAGER_START, ParamKeyFlag.CLEAR_ON_IGNITION_ON])
+  def test_driver_monitoring_session_disable_clears_at_lifecycle_boundary(self, flag):
+    self.params.put_bool("DriverMonitoringSessionDisabled", True)
+    assert self.params.get_bool("DriverMonitoringSessionDisabled")
+    self.params.clear_all(flag)
+    assert not self.params.get_bool("DriverMonitoringSessionDisabled")
 
   def test_put_non_blocking_with_get_block(self):
     q = Params()

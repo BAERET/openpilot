@@ -34,6 +34,110 @@ class TestManager:
   def test_duplicate_procs(self):
     assert len(procs) == len(managed_processes), "Duplicate process names"
 
+  def test_driver_monitoring_setting_and_session_disable_stop_only_model(self):
+    CP = car.CarParams.new_message()
+    params = Params()
+    params.put_bool("IsDriverViewEnabled", False)
+    params.put_bool("DriverMonitoringEnabled", True)
+
+    params.remove("DriverMonitoringSessionDisabled")
+    assert managed_processes["dmonitoringmodeld"].should_run(True, params, CP)
+    assert managed_processes["dmonitoringd"].should_run(True, params, CP)
+
+    params.put_bool("DriverMonitoringSessionDisabled", True)
+    assert not managed_processes["dmonitoringmodeld"].should_run(True, params, CP)
+    assert managed_processes["dmonitoringd"].should_run(True, params, CP)
+    assert not managed_processes["dmonitoringmodeld"].should_run(False, params, CP)
+    assert not managed_processes["dmonitoringd"].should_run(False, params, CP)
+
+    params.remove("DriverMonitoringSessionDisabled")
+    params.put_bool("DriverMonitoringEnabled", False)
+    assert not managed_processes["dmonitoringmodeld"].should_run(True, params, CP)
+    assert managed_processes["dmonitoringd"].should_run(True, params, CP)
+
+    params.put_bool("IsDriverViewEnabled", True)
+    assert managed_processes["dmonitoringmodeld"].should_run(False, params, CP)
+    assert managed_processes["dmonitoringd"].should_run(False, params, CP)
+
+  def test_ignition_reset_stops_dm_writer_before_clearing_session_params(self, monkeypatch):
+    events = []
+
+    class FakeDmProcess:
+      def stop(self, block=True):
+        events.append(("stop", block))
+
+    class FakeParams:
+      def clear_all(self, flag):
+        events.append(("clear", flag))
+
+    monkeypatch.setitem(manager.managed_processes, "dmonitoringd", FakeDmProcess())
+    manager.clear_ignition_on_params(FakeParams())
+
+    assert events == [
+      ("stop", True),
+      ("clear", manager.ParamKeyFlag.CLEAR_ON_IGNITION_ON),
+    ]
+
+
+  def test_radard_is_always_carrot_radar(self):
+    CP = car.CarParams.new_message()
+    params = Params()
+    process = managed_processes["radard"]
+
+    assert "radard_dpath" not in managed_processes
+    assert process.module == "openpilot.selfdrive.carrot.radar.radard_dpath"
+    assert not process.should_run(False, params, CP)
+    assert process.should_run(True, params, CP)
+
+  def test_carrot_navi_is_permanent_7714_owner(self):
+    process = managed_processes["carrot_navi"]
+    CP = car.CarParams.new_message()
+    params = Params()
+
+    params.put("ClusterHud", "0")
+    assert process.should_run(False, params, CP)
+    params.put("ClusterHud", "1")
+    assert process.should_run(False, params, CP)
+
+  def test_cluster_hud_allows_carrot_vision_processes(self):
+    CP = car.CarParams.new_message()
+    CP.notCar = False
+    params = Params()
+    params.put_bool("CarrotVisionEnabled", True)
+    params.put_bool("CarrotVisionActive", False)
+
+    params.put("ClusterHud", "0")
+    assert not managed_processes["carrot_vision_encoderd"].should_run(False, params, CP)
+    assert managed_processes["carrot_webrtcd"].should_run(True, params, CP)
+    assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+    params.put_bool("CarrotVisionActive", True)
+    assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+
+    params.put("ClusterHud", "1")
+    assert managed_processes["carrot_cluster"].should_run(True, params, CP)
+    assert managed_processes["carrot_webrtcd"].should_run(True, params, CP)
+    assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+    assert not managed_processes["carrot_vision_encoderd"].should_run(False, params, CP)
+
+    params.put_bool("CarrotVisionActive", False)
+    assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+    params.put_bool("CarrotVisionEnabled", False)
+    assert managed_processes["carrot_cluster"].should_run(True, params, CP)
+    assert not managed_processes["carrot_webrtcd"].should_run(True, params, CP)
+    assert not managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+
+  def test_removed_cluster_hud_mode_is_inactive(self):
+    CP = car.CarParams.new_message()
+    CP.notCar = False
+    params = Params()
+    params.put_bool("CarrotVisionEnabled", True)
+    params.put_bool("CarrotVisionActive", True)
+    params.put("ClusterHud", "2")
+
+    assert not managed_processes["carrot_cluster"].should_run(True, params, CP)
+    assert managed_processes["carrot_webrtcd"].should_run(True, params, CP)
+    assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+
   def test_blacklisted_procs(self):
     # TODO: ensure there are blacklisted procs until we have a dedicated test
     assert len(BLACKLIST_PROCS), "No blacklisted procs to test not_run"

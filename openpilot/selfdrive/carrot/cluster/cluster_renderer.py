@@ -6,9 +6,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import base64
+import json  # EV6 HUD patch v17
 import math
+import threading  # EV6 HUD patch v17
 import os
 import time
+import zlib
 from pathlib import Path
 
 import numpy as np
@@ -16,12 +19,28 @@ import pyray as rl
 
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
+from openpilot.selfdrive.carrot.deceleration_source import navigation_status_presentation
+from openpilot.selfdrive.carrot.signal_display import SignalDisplayReader, project_box
+from openpilot.selfdrive.carrot.lead_brake_lights import BrakeDisplayReader
 
+from cluster_gles_dmabuf import DirectNv12DmabufError, create_tici_nv12_dmabuf_pool
+from cluster_gles_readback import DirectNv12ReadbackError, create_tici_direct_readback
+from cluster_display import (
+    CLUSTER_LANGUAGE_KO,
+    cluster_text,
+    display_speed,
+    format_navi_distance,
+    format_radar_distance,
+    format_trip_distance,
+    normalize_cluster_language,
+    speed_unit,
+)
 from cluster_config import (
     AMBER,
     BLUE,
     BLUE_SOFT,
-    CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+    CLUSTER_PANEL_LAYOUT_DRIVING_LEFT,
+    CLUSTER_PANEL_LAYOUT_DRIVING_RIGHT,
     CLUSTER_RADAR_INFO_ALL_SPEED,
     CLUSTER_RADAR_INFO_ALL_SPEED_DISTANCE,
     CLUSTER_RADAR_INFO_NONE,
@@ -31,7 +50,11 @@ from cluster_config import (
     CLUSTER_SCREEN_MODE_DEBUG,
     CLUSTER_SCREEN_MODE_DEBUG_GRAPH,
     CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
-    CLUSTER_SCREEN_MODE_NAVI_DEBUG,
+    CLUSTER_SCREEN_MODE_FULLSCREEN_3D,
+    CLUSTER_SCREEN_MODE_NAVI,
+    CLUSTER_SCREEN_MODE_NAV_MODEL,
+    CLUSTER_SCREEN_MODE_TRIP_REPORT,
+    CLUSTER_SCREEN_MODE_DEFAULT,
     CLUSTER_SCREEN_MODE_DEBUG_SYSTEM,
     ClusterTheme,
     DESIGN_HEIGHT,
@@ -43,22 +66,31 @@ from cluster_config import (
     RADAR_TO_CAMERA_M,
     RED,
     TEXT,
+    VEHICLE_NAVI,
     VEHICLE_LENGTH_M,
     WHITE,
+    cluster_camera_view_is_road_camera,
+    cluster_camera_view_prefers_wide,
+    cluster_wide_camera_zoom_factor,
     current_cluster_theme,
     normalize_cluster_screen_mode,
+    normalize_cluster_panel_layout,
     normalize_cluster_theme_mode,
 )
 from cluster_models import (
+    ClusterAlert,
     ClusterUiState,
     DebugPlotSnapshot,
     GitBranchStatus,
-    LiveDebugInfo,
     NaviDebugInfo,
+    NaviDashboardState,
     NaviGuidanceImage,
+    NaviMediaFrame,
+    NaviLaneInfo,
+    NaviLiveState,
     NaviTrafficLightInfo,
     RouteOverlay,
-    TpmsInfo,
+    TripReportState,
 )
 from cluster_scene import (
     ClusterScene,
@@ -68,8 +100,11 @@ from cluster_scene import (
     Vec3,
     VehicleBox,
     build_cluster_scene,
+    clean_ui_enabled,
+    cluster_scene_state_key,
 )
 from cluster_system_monitor import SystemStats, SystemStatsSampler
+from cluster_vehicle_models import ego_model_name
 from cluster_utils import blink_visible, clamp
 
 
@@ -80,9 +115,16 @@ OPENPILOT_ADDON_FONT_DIR = SELFDRIVE_DIR / "assets" / "addon" / "font"
 KAIGEN_GOTHIC_KR_BOLD_FONT_PATH = OPENPILOT_FONT_DIR / "KaiGenGothicKR-Bold.ttf"
 JETBRAINS_MONO_FONT_PATH = OPENPILOT_FONT_DIR / "JetBrainsMono-Medium.ttf"
 VEHICLE_MODEL_PATH = CLUSTER_DIR / "assets" / "models" / "cybertruck" / "cybertruck_cluster.obj"
+PARK_VEHICLE_MODEL_PATH = CLUSTER_DIR / "assets" / "models" / "ev6" / "ev6_cluster.obj"
+OTHER_VEHICLE_MODELS_DIR = CLUSTER_DIR / "assets" / "models" / "others"
+OTHER_VEHICLE_MODEL_PATH = CLUSTER_DIR / "assets" / "models" / "generic" / "generic_car_cluster.obj"
+TPMS_CAR_ICON_PATH = CLUSTER_DIR / "assets" / "images" / "tpms_toy_car.png"
 SPEED_BG_PATH = SELFDRIVE_DIR / "assets" / "images" / "speed_bg.png"
+TRAFFIC_RED_ICON_PATH = SELFDRIVE_DIR / "assets" / "images" / "traffic_red.png"
+TRAFFIC_GREEN_ICON_PATH = SELFDRIVE_DIR / "assets" / "images" / "traffic_green.png"
 FOLLOW_VEHICLE_ICON_PATH = SELFDRIVE_DIR / "assets" / "icons_mici" / "carrot_cruse_gap_trimmed.png"
 LFA_ICON_PATH = SELFDRIVE_DIR / "assets" / "icons_mici" / "carrot_wheel_org.png"
+LFA_LANE_ICON_PATH = SELFDRIVE_DIR / "assets" / "icons_mici" / "carrot_wheel_lane.png"
 WIFI_ICON_PATH = SELFDRIVE_DIR / "assets" / "icons_mici" / "settings" / "network" / "wifi_strength_full.png"
 ROUTE_CONTROL_PANEL_X = 340.0
 ROUTE_CONTROL_PANEL_Y = DESIGN_HEIGHT - 74.0
@@ -91,14 +133,47 @@ ROUTE_CONTROL_PANEL_H = 34.0
 ROUTE_CONTROL_SEEK_Y = ROUTE_CONTROL_PANEL_Y + 18.0
 ROUTE_CONTROL_BAR_X = ROUTE_CONTROL_PANEL_X + 142.0
 ROUTE_CONTROL_BAR_W = ROUTE_CONTROL_PANEL_W - 284.0
-CAMERA_BACKGROUND_X = 390.0
+# Keep the road camera strictly left of the navigation panel. These constants are
+# shared so future panel layout changes cannot reintroduce an overlap.
+NAVI_LIVE_PANEL_RIGHT = DESIGN_WIDTH - 4
+NAVI_LIVE_PANEL_W = 792
+NAVI_LIVE_PANEL_X = NAVI_LIVE_PANEL_RIGHT - NAVI_LIVE_PANEL_W
+TRIP_REPORT_PANEL_X = NAVI_LIVE_PANEL_X
+TRIP_REPORT_PANEL_Y = 1.0
+TRIP_REPORT_PANEL_W = NAVI_LIVE_PANEL_W
+TRIP_REPORT_PANEL_H = DESIGN_HEIGHT - 2.0
+TRIP_REPORT_CACHE_REFRESH_SECONDS = 1.0
+CAMERA_BACKGROUND_X = 0.0
 CAMERA_BACKGROUND_Y = 0.0
-CAMERA_BACKGROUND_W = 1140.0
+CAMERA_BACKGROUND_W = NAVI_LIVE_PANEL_X
 CAMERA_BACKGROUND_H = DESIGN_HEIGHT
 CAMERA_BACKGROUND_ALPHA = 220
 CAMERA_BACKGROUND_VIGNETTE_ALPHA = 32
-CAMERA_BACKGROUND_VERTICAL_BIAS = 0.5
+CLUSTER_ALERT_SIZE_SMALL = 1
+CLUSTER_ALERT_SIZE_MID = 2
+CLUSTER_ALERT_SIZE_FULL = 3
+CLUSTER_ALERT_TEXT_COLORS = {
+    0: (255, 255, 255, 255),
+    1: (255, 174, 82, 255),
+    2: (255, 82, 96, 255),
+}
+CLUSTER_ALERT_TEXT_STROKE = (0, 0, 0, 255)
+CLUSTER_SYNTHETIC_ALERT_TEXT_KEYS = {
+    "clusterSelfdriveStartup": ("openpilot_unavailable", "waiting_to_start"),
+    "clusterSelfdriveTimeout": ("take_control_immediately", "system_unresponsive"),
+    "clusterSelfdriveReboot": ("system_unresponsive", "reboot_device"),
+}
+# 0.5 is a centered cover crop; values toward 1.0 retain more of the road
+# camera's lower edge. Keep this shared with the projected overlay transform.
+CAMERA_BACKGROUND_VERTICAL_BIAS = 0.75
+CAMERA_OVERLAY_VEHICLE_ROAD_HEIGHT_M = 0.025
 CAMERA_OVERLAY_MIN_DEPTH_M = 0.5
+CAMERA_OVERLAY_FRAME_MIN_SIZE_PX = 24.0
+CAMERA_OVERLAY_FRAME_MAX_WIDTH_RATIO = 0.22
+CAMERA_OVERLAY_FRAME_MAX_HEIGHT_RATIO = 0.45
+CAMERA_OVERLAY_FRAME_MAX_ASPECT = 2.4
+CAMERA_OVERLAY_FRAME_EDGE_PAD_PX = 3.0
+CAMERA_OVERLAY_FRAME_ROUND_SEGMENTS = 4
 CAMERA_OVERLAY_DEFAULT_CAMERA = DEVICE_CAMERAS["tici", "ar0231"].fcam
 CAMERA_OVERLAY_DEFAULT_HEIGHT_M = 1.22
 CAMERA_OVERLAY_Z_OFFSET_DEFAULT_M = 0.00
@@ -111,7 +186,6 @@ CAMERA_OVERLAY_PITCH_OFFSET_MIN_DEG = -3.0
 CAMERA_OVERLAY_PITCH_OFFSET_MAX_DEG = 3.0
 CAMERA_OVERLAY_PITCH_OFFSET_STEP_DEG = 0.2
 CAMERA_OVERLAY_PITCH_TUNE_PANEL_Y = ROUTE_CONTROL_PANEL_Y - 72.0
-CORNER_RADAR_COIN_RADIUS_M = 0.82
 CORNER_RADAR_COIN_HEIGHT_M = 0.10
 CORNER_RADAR_COIN_SLICES = 28
 CORNER_RADAR_COIN_FILL = (52, 210, 230)
@@ -134,9 +208,6 @@ CORNER_RADAR_COIN_STOPPED_SIDE = (68, 74, 80)
 CORNER_RADAR_COIN_STOPPED_RING = (205, 212, 218)
 CORNER_RADAR_COIN_STOPPED_MAX_SPEED_KPH = 3.0
 TPMS_LOW_PRESSURE_PSI = 31.0
-TPMS_BADGE_WIDTH = 46.0
-TPMS_BADGE_HEIGHT = 37.5
-TPMS_BADGE_FONT_SIZE = 25.5
 TURN_SIGNAL_LEFT_CENTER_X = 610
 TURN_SIGNAL_RIGHT_CENTER_X = 1310
 TURN_SIGNAL_CENTER_Y = 72
@@ -148,12 +219,12 @@ LANE_TURN_SIGNAL_CENTER_Y = 350
 DRIVE_STATUS_BASE_BOX_SIZE = 46.0
 DRIVE_STATUS_ROW_HEIGHT = TURN_SIGNAL_HEAD_HALF_HEIGHT * 2.0
 DRIVE_STATUS_SCALE = DRIVE_STATUS_ROW_HEIGHT / DRIVE_STATUS_BASE_BOX_SIZE
-GEAR_STATUS_CENTER_X = TURN_SIGNAL_LEFT_CENTER_X + 102
+GEAR_STATUS_CENTER_X = 900
 GEAR_STATUS_CENTER_Y = TURN_SIGNAL_CENTER_Y
 GEAR_STATUS_BOX_SIZE = DRIVE_STATUS_ROW_HEIGHT * 0.82
 GEAR_STATUS_FONT_SIZE = 34.0 * DRIVE_STATUS_SCALE * 0.82
 GEAR_STATUS_OUTLINE_WIDTH = 2.0 * DRIVE_STATUS_SCALE
-FOLLOW_STATUS_CENTER_X = GEAR_STATUS_CENTER_X + 132
+FOLLOW_STATUS_CENTER_X = 1020
 FOLLOW_STATUS_W = 160
 FOLLOW_STATUS_H = 42.0 * DRIVE_STATUS_SCALE
 FOLLOW_STATUS_GAP_BARS = 4
@@ -170,53 +241,128 @@ FOLLOW_GAP_ICON_W = FOLLOW_GAP_ICON_H * FOLLOW_GAP_ICON_ASPECT
 TOP_CRUISE_CENTER_X = FOLLOW_STATUS_CENTER_X + 202
 TOP_CRUISE_FONT_SIZE = 27.0 * DRIVE_STATUS_SCALE
 TOP_CRUISE_UNIT_FONT_SIZE = TOP_CRUISE_FONT_SIZE
-LFA_STATUS_CENTER_X = TOP_CRUISE_CENTER_X + 142
-LFA_STATUS_ICON_SIZE = 28.0 * DRIVE_STATUS_SCALE
-WIFI_STATUS_CENTER_X = GEAR_STATUS_CENTER_X - 102
-WIFI_STATUS_ICON_SIZE = 34.0 * DRIVE_STATUS_SCALE
+WIFI_STATUS_CENTER_X = 160
+WIFI_STATUS_ICON_SIZE = 48.0
+# Keep the badge to the right of the clock, clear of its text and stroke.
+EGPU_STATUS_CENTER_X = 474.0
+EGPU_STATUS_W = 76.0
+EGPU_STATUS_H = 34.0
+EGPU_STATUS_FONT_SIZE = 19.0
+NAV_STATUS_CENTER_X = WIFI_STATUS_CENTER_X - 22.0
+NAV_STATUS_CENTER_Y = 99.0
+NAV_STATUS_FONT_SIZE = 22.0
+LFA_STATUS_CENTER_X = 70
+LFA_STATUS_ICON_SIZE = 34.0 * DRIVE_STATUS_SCALE
+LFA_LANE_ICON_WIDTH_SCALE = 2.0
+LFA_LANE_ICON_TOP_OFFSET = 3.0
+TOP_STATUS_CENTER_Y = 55.0
+TOP_CLOCK_CENTER_X = 315.0
 TOP_ICON_SIZE = 34.0 * DRIVE_STATUS_SCALE
 DRIVE_STATUS_BOX_RADIUS = 8.0 * DRIVE_STATUS_SCALE
-SPEED_PANEL_X = 210
-SPEED_PANEL_Y = 151
-SPEED_PANEL_W = 380
-SPEED_PANEL_H = 142
-SPEED_VALUE_CENTER_X = SPEED_PANEL_X + 84
-SPEED_VALUE_CENTER_Y = SPEED_PANEL_Y + 70
-SPEED_VALUE_FONT_SIZE = 112
-CRUISE_SPEED_CENTER_Y = SPEED_PANEL_Y + 55
-CRUISE_SET_SPEED_CENTER_X = SPEED_PANEL_X + 289
-CRUISE_OVERRIDE_SPEED_CENTER_X = SPEED_PANEL_X + 392
-CRUISE_OVERRIDE_SPEED_CENTER_Y = SPEED_PANEL_Y + 30
-CRUISE_OVERRIDE_LABEL_CENTER_Y = SPEED_PANEL_Y - 4
-SIDE_GAUGE_TOP = 54
-SIDE_GAUGE_BOTTOM = 180
-SIDE_GAUGE_LOWER_TOP = 243
-SIDE_GAUGE_LOWER_BOTTOM = 377
-SIDE_GAUGE_WIDTH = 62
-SIDE_GAUGE_VALUE_Y = 27
-SIDE_GAUGE_LABEL_OFFSET = 15
-SIDE_GAUGE_LEFT_CENTER_X = 76
-SIDE_GAUGE_COLUMN_GAP = 88
-SPEED_LIMIT_SIGN_CENTER_X = 460
-SPEED_LIMIT_SIGN_CENTER_Y = TURN_SIGNAL_CENTER_Y
-SPEED_LIMIT_SIGN_RADIUS = 56.0
-CRUISE_OVERRIDE_APPLY_COLOR = (184, 112, 24)
-SPEED_LIMIT_SOURCE_LABELS = {
-    "vehicle": "v",
-    "car": "v",
-    "v": "v",
-    "nav": "n",
-    "navigation": "n",
-    "n": "n",
-    "model": "m",
-    "m": "m",
-    "vision": "vis",
-    "vis": "vis",
-    "sim": "sim",
+SPEED_HUD_SCALE = 0.8
+SPEED_PANEL_X = 18
+SPEED_PANEL_Y = 295
+SPEED_PANEL_W = 380 * SPEED_HUD_SCALE
+SPEED_PANEL_H = 142 * SPEED_HUD_SCALE
+SPEED_VALUE_CENTER_X = SPEED_PANEL_X + 84 * SPEED_HUD_SCALE
+SPEED_VALUE_CENTER_Y = SPEED_PANEL_Y + 70 * SPEED_HUD_SCALE
+SPEED_VALUE_FONT_SIZE = 112 * SPEED_HUD_SCALE
+CRUISE_SPEED_CENTER_Y = SPEED_PANEL_Y + 55 * SPEED_HUD_SCALE
+CRUISE_SET_SPEED_CENTER_X = SPEED_PANEL_X + 289 * SPEED_HUD_SCALE
+CRUISE_SET_SPEED_FONT_SIZE = 58 * SPEED_HUD_SCALE
+CRUISE_OVERRIDE_SPEED_CENTER_X = SPEED_PANEL_X + 392 * SPEED_HUD_SCALE
+CRUISE_OVERRIDE_SPEED_CENTER_Y = SPEED_PANEL_Y + 30 * SPEED_HUD_SCALE
+CRUISE_OVERRIDE_LABEL_CENTER_Y = SPEED_PANEL_Y - 4 * SPEED_HUD_SCALE
+CRUISE_OVERRIDE_LABEL_FONT_SIZE = 25 * SPEED_HUD_SCALE
+CRUISE_OVERRIDE_SPEED_FONT_SIZE = 52 * SPEED_HUD_SCALE
+# Center the gap number in the hollow of speed_bg.png's right curl.
+SPEED_GAP_CENTER_X = SPEED_PANEL_X + SPEED_PANEL_W * 0.92
+SPEED_GAP_CENTER_Y = SPEED_PANEL_Y + SPEED_PANEL_H * 0.835
+SPEED_GAP_FONT_SIZE = 28.0
+SPEED_GEAR_CENTER_X = SPEED_PANEL_X + SPEED_PANEL_W + 34.0
+SPEED_GEAR_W = 45.0
+SPEED_GEAR_H = 58.0
+SPEED_GEAR_CENTER_Y = SPEED_PANEL_Y + SPEED_PANEL_H - SPEED_GEAR_H * 0.5
+SPEED_GEAR_FONT_SIZE = 48.0
+# A compact EV telltale fits between three-digit vehicle and cruise-set speeds.
+SPEED_EV_CENTER_X = 181.0
+SPEED_EV_CENTER_Y = SPEED_VALUE_CENTER_Y
+SPEED_EV_FONT_SIZE = 28.0
+SPEED_MODEL_TRAFFIC_CENTER_X = SPEED_VALUE_CENTER_X - 38.0
+SPEED_MODEL_TRAFFIC_CENTER_Y = SPEED_PANEL_Y - 9.0
+SPEED_MODEL_TRAFFIC_ICON_SIZE = 34.0
+SPEED_DRIVING_MODE_GAP = 5.0
+SPEED_DRIVING_MODE_BASE_CENTER_OFFSET_X = SPEED_DRIVING_MODE_GAP + 36.0
+SPEED_DRIVING_MODE_CENTER_X = (
+    SPEED_MODEL_TRAFFIC_CENTER_X
+    + SPEED_MODEL_TRAFFIC_ICON_SIZE * 0.5
+    + SPEED_DRIVING_MODE_BASE_CENTER_OFFSET_X
+)
+SPEED_DRIVING_MODE_CENTER_Y = SPEED_MODEL_TRAFFIC_CENTER_Y
+SPEED_DRIVING_MODE_FONT_SIZE = 27.0
+SPEED_DRIVING_MODE_STYLES = {
+    1: ("driving_mode_eco", (0, 255, 0, 200)),
+    2: ("driving_mode_safe", (255, 165, 0, 200)),
+    3: ("driving_mode_normal", (255, 255, 255, 200)),
+    4: ("driving_mode_sport", (255, 0, 0, 200)),
 }
+SIDE_GAUGE_TOP = 88
+SIDE_GAUGE_BOTTOM = 186
+SIDE_GAUGE_LOWER_TOP = 248
+SIDE_GAUGE_LOWER_BOTTOM = 346
+SIDE_GAUGE_WIDTH = 62
+SIDE_GAUGE_VALUE_Y = 64
+SIDE_GAUGE_LABEL_OFFSET = 15
+SIDE_GAUGE_LEFT_CENTER_X = 968
+SIDE_GAUGE_COLUMN_GAP = 78
+SIDE_GAUGE_OUTLINE = (240, 244, 248, 190)
+SPEED_LIMIT_SIGN_CENTER_X = 80
+SPEED_LIMIT_SIGN_CENTER_Y = 160
+SPEED_LIMIT_SIGN_RADIUS = 42.0
+SPEED_LIMIT_SIGN_RING_WIDTH = 6.0
+CRUISE_OVERRIDE_APPLY_COLOR = (184, 112, 24)
 SYSTEM_PANEL_X = 1416
 SYSTEM_PANEL_Y = 118
 SYSTEM_PANEL_W = 476
+NAVI_LIVE_PANEL_Y = 1
+NAVI_LIVE_PANEL_H = DESIGN_HEIGHT - 2
+NAVI_WORLD_VIEW_SHIFT_X = (DESIGN_WIDTH - NAVI_LIVE_PANEL_X) * 0.5
+# Preserve each right-side widget's distance from the driving-view edge when
+# expanding the 1124 px driving region to the full 1920 px display.
+FULLSCREEN_3D_SIDE_WIDGET_OFFSET_X = DESIGN_WIDTH - CAMERA_BACKGROUND_W
+FULLSCREEN_3D_CLOCK_CENTER_X = DESIGN_WIDTH * 0.5
+FULLSCREEN_3D_TRAFFIC_PANEL_RIGHT = DESIGN_WIDTH - 28.0
+NAVI_MAP_BACKGROUND = (0, 0, 0, 255)
+TPMS_STATUS_CENTER_X = NAVI_LIVE_PANEL_X - 62.0
+TPMS_STATUS_VALUE_CENTER_Y = 429.5
+TPMS_STATUS_CAR_CENTER_Y = 429.5
+TPMS_STATUS_COLUMN_OFFSET = 29.5
+TPMS_STATUS_ROW_OFFSET = 24.0
+TPMS_STATUS_CAR_W = 38.0
+TPMS_STATUS_CAR_H = 72.0
+TPMS_STATUS_WHEEL_W = 32.0
+TPMS_STATUS_WHEEL_H = 30.0
+TPMS_STATUS_ICON_W = 104.0
+TPMS_STATUS_ICON_H = 78.0
+FULLSCREEN_3D_CORE_USAGE_RIGHT_X = (
+    TPMS_STATUS_CENTER_X
+    + FULLSCREEN_3D_SIDE_WIDGET_OFFSET_X
+    - TPMS_STATUS_ICON_W * 0.5
+    - 18.0
+)
+TPMS_STATUS_FONT_SIZE = 21.0
+NAVI_LIVE_ICON_X = NAVI_LIVE_PANEL_X + 72
+NAVI_LIVE_ICON_Y = NAVI_LIVE_PANEL_Y + 99
+NAVI_LIVE_ICON_SIZE = 78.0
+NAVI_LIVE_CONTENT_X = NAVI_LIVE_PANEL_X + 136
+NAVI_LIVE_CONTENT_W = NAVI_LIVE_PANEL_W - 158
+NAVI_LIVE_NEXT_Y = NAVI_LIVE_PANEL_Y + 184
+NAVI_LIVE_LANE_Y = NAVI_LIVE_PANEL_Y + 258
+NAVI_LIVE_FOOTER_Y = NAVI_LIVE_PANEL_Y + 328
+NAVI_LIVE_GUIDANCE_MEDIA_SCALE = 1.2
+NAVI_TURN_LEFT_TYPES = frozenset((7, 12, 16, 17, 44, 75, 76, 102, 105, 112, 115, 118, 1000, 1002, 1006))
+NAVI_TURN_RIGHT_TYPES = frozenset((6, 13, 19, 43, 73, 74, 101, 104, 111, 114, 117, 123, 124, 1001, 1003, 1007))
+NAVI_TURN_ROUNDABOUT_TYPES = frozenset(range(131, 143))
 NAVI_TRAFFIC_PANEL_RIGHT = TURN_SIGNAL_RIGHT_CENTER_X + 96
 NAVI_TRAFFIC_PANEL_H = 90
 NAVI_TRAFFIC_PANEL_Y = TURN_SIGNAL_CENTER_Y + TURN_SIGNAL_HEAD_HALF_HEIGHT + 10
@@ -236,8 +382,16 @@ NAVI_GUIDANCE_IMAGE_X = SYSTEM_PANEL_X + 24
 NAVI_GUIDANCE_IMAGE_Y = SYSTEM_PANEL_Y + 210
 NAVI_GUIDANCE_IMAGE_W = SYSTEM_PANEL_W - 48
 NAVI_GUIDANCE_IMAGE_H = 270
+NAVI_MODE_LEFT_W = 520.0
+NAVI_MODE_MAP_X = NAVI_MODE_LEFT_W
+NAVI_MODE_MAP_W = 880.0
+NAVI_MODE_RIGHT_X = NAVI_MODE_MAP_X + NAVI_MODE_MAP_W
+NAVI_MODE_RIGHT_W = DESIGN_WIDTH - NAVI_MODE_RIGHT_X
+KOREAN_FONT_BASE_SIZE = 32
 SYSTEM_STATS_REFRESH_SECONDS = 1.0
 TEXT_MEASURE_CACHE_LIMIT = 1024
+STROKED_TEXT_TEXTURE_CACHE_LIMIT = 384
+STROKED_TEXT_TEXTURE_PADDING_PX = 2
 TRIANGLE_STRIP_POINT_CACHE_LIMIT = 256
 DEBUG_PLOT_MAX_SAMPLES = 360
 DEBUG_PLOT_SAMPLE_SECONDS = 0.05
@@ -246,11 +400,12 @@ DEBUG_PLOT_FULL_X = 500.0
 DEBUG_PLOT_FULL_Y = DEBUG_PLOT_MARGIN
 DEBUG_PLOT_FULL_W = 1392.0
 DEBUG_PLOT_FULL_H = DESIGN_HEIGHT - DEBUG_PLOT_MARGIN * 2.0
-DEBUG_PLOT_RIGHT_X = SYSTEM_PANEL_X
-DEBUG_PLOT_RIGHT_Y = DEBUG_PLOT_MARGIN
-DEBUG_PLOT_RIGHT_W = SYSTEM_PANEL_W
-DEBUG_PLOT_RIGHT_H = DESIGN_HEIGHT - DEBUG_PLOT_MARGIN * 2.0
+DEBUG_PLOT_RIGHT_X = NAVI_LIVE_PANEL_X
+DEBUG_PLOT_RIGHT_Y = NAVI_LIVE_PANEL_Y
+DEBUG_PLOT_RIGHT_W = NAVI_LIVE_PANEL_W
+DEBUG_PLOT_RIGHT_H = NAVI_LIVE_PANEL_H
 GIT_STATUS_MARGIN = 2
+GIT_STATUS_BOTTOM_MARGIN = 12
 GIT_STATUS_DOT_RADIUS = 7
 GIT_STATUS_DOT_TEXT_GAP = 6
 GIT_STATUS_MAX_TEXT_W = 610
@@ -264,6 +419,8 @@ RADAR_LABEL_DISTANCE_FONT_SIZE = 16
 RADAR_LABEL_SPEED_FONT_SIZE = 14
 VEHICLE_BADGE_DISTANCE_FONT_SIZE = 17
 VEHICLE_BADGE_SPEED_FONT_SIZE = 15
+LEAD_ONE_DISTANCE_FONT_SIZE = 24
+LEAD_ONE_SPEED_FONT_SIZE = 22
 RADAR_LABEL_ANCHOR_Z_OFFSET_M = 0.30
 VEHICLE_BADGE_ANCHOR_Z_OFFSET_M = 0.32
 WORLD_LABEL_NEAR_M = 18.0
@@ -285,8 +442,122 @@ VEHICLE_MATERIAL_COLORS: dict[str, tuple[int, int, int, int]] = {
     "Material.004": (18, 20, 22, 255),
     "Material.005": (18, 20, 22, 255),
     "Material.006": (18, 20, 22, 255),
+    "other_body": (128, 136, 146, 255),  # EV6 HUD patch v4: generic fallback car (gunmetal)
+    "cabin": (24, 27, 31, 255),
 }
 DEFAULT_VEHICLE_MATERIAL_COLOR = (142, 150, 156, 255)
+VEHICLE_OTHER_TINT = (172, 178, 184)  # EV6 HUD patch v3: fallback grey
+CLEAN_SPEED_OVER_RED_KPH = 10.0  # EV6 HUD patch v6: speed turns amber above the limit, red 10+ above
+CLEAN_GHOST_TINT = (112, 118, 126)  # EV6 HUD patch v6: low-confidence side vehicles (dimmed)
+CLEAN_CUTIN_HOLD_S = 1.5  # EV6 HUD patch v6: keep a cut-in car orange this long after the flag drops
+CLEAN_CUTIN_MODEL_HOLD_S = 6.0  # ...and keep showing it with the same car model this long
+CLEAN_TTC_AMBER_S = 4.0  # EV6 HUD patch v6: lead label turns amber / red while closing in
+CLEAN_TTC_RED_S = 2.5
+# EV6 HUD patch v8: clean planned path, see cluster_scene.clean_planned_path_strips
+# The imported driving layout stays dormant; device-display sleep is not selected.
+# EV6 HUD patch v10: upstream H.264 bitrate, no navigation turn card
+# EV6 HUD patch v13: parked screen, see ClusterUiRenderer._ev6_draw_park_screen
+# EV6 HUD patch v14: ego EV6 at real size, see cluster_scene.EV6_EGO_LENGTH_M
+# EV6 HUD patch v16: parked screen polish (dark shadow, top-view car for the tyre pressures)
+# EV6 HUD patch v17: parked-screen weather, see Ev6Weather
+# EV6 HUD patch v19: weather falls back to the last known position
+# EV6 HUD patch v21: v12 freeze watchdog removed
+# EV6 HUD patch v22: signal assist chip, see ClusterUiRenderer._ev6_draw_signal_assist_chip
+CLEAN_CAMERA_SHOW_M = 1000  # speed camera chip appears this far before the camera
+CLEAN_SLOWDOWN_LABELS_KO = {
+    "turn": "커브", "vturn": "커브", "atc": "커브", "atc2": "커브", "cam": "카메라", "section": "구간단속",
+    "bump": "방지턱", "school": "어린이", "police": "경찰", "road": "도로제한", "route": "경로",
+    "model": "모델", "gas": "가속", "eco": "에코", "apply": "감속", "waze": "waze",
+}
+VEHICLE_CUTIN_TINT = (255, 150, 30)  # EV6 HUD patch v4: cut-in vehicle paint
+GROUND_DARK_RGB = (40, 43, 48)  # EV6 HUD patch v5: charcoal grey road (dark theme)
+GROUND_LIGHT_RGB = (200, 205, 211)  # EV6 HUD patch v5: silver grey road (light theme)
+GROUND_HALF_WIDTH_M = 160.0
+GROUND_Z_M = -0.03
+GROUND_ROWS_M = (-60.0, 0.0, 20.0, 40.0, 55.0, 70.0, 82.0, 92.0)
+GROUND_FADE = (0.0, 0.0, 0.0, 0.18, 0.42, 0.70, 0.90, 1.0)
+OTHER_VEHICLE_PAINT_RGB = (128, 136, 146)  # EV6 HUD patch v4: gunmetal grey body (assets/models/others)
+SIDE_VEHICLE_MODEL_SOURCES = ("liveTracks", "cornerRadar")
+SIDE_VEHICLE_MODEL_MIN_CONFIDENCE = 0.80  # below this the original small marker box is kept
+SIDE_VEHICLE_MODEL_SCALE = 0.94
+
+
+def vehicle_material_color(name: str) -> tuple[int, int, int, int]:
+    if name == "body":
+        return (238, 239, 235, 255)  # P/R EV6: Snow White Pearl
+    color = VEHICLE_MATERIAL_COLORS.get(name)
+    if color is not None:
+        return color
+    if name.startswith("rgb_") and len(name) == 10:
+        try:
+            return int(name[4:6], 16), int(name[6:8], 16), int(name[8:10], 16), 255
+        except ValueError:
+            pass
+    return DEFAULT_VEHICLE_MATERIAL_COLOR
+# EV6 HUD patch: simple Lambert + Blinn-Phong + fresnel shading for the 3D vehicle model.
+VEHICLE_LIGHT_DIR = (-0.35, -0.45, 0.82)  # towards the light (x=right, y=forward, z=up)
+VEHICLE_SHADER_VS_BODY = """
+IN vec3 vertexPosition;
+IN vec3 vertexNormal;
+IN vec4 vertexColor;
+uniform mat4 mvp;
+uniform mat4 matModel;
+uniform mat4 matNormal;
+OUT vec3 fragPos;
+OUT vec3 fragNormal;
+OUT vec4 fragColor;
+void main() {
+    fragPos = vec3(matModel * vec4(vertexPosition, 1.0));
+    fragNormal = vec3(matNormal * vec4(vertexNormal, 0.0));
+    fragColor = vertexColor;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+"""
+VEHICLE_SHADER_FS_BODY = """
+IN vec3 fragPos;
+IN vec3 fragNormal;
+IN vec4 fragColor;
+uniform vec4 colDiffuse;
+uniform vec3 lightDir;
+uniform vec3 viewPos;
+uniform vec4 paintKey;
+uniform vec4 paintOverride;
+void main() {
+    vec4 src = fragColor;
+    if (paintOverride.a > 0.5 && all(lessThan(abs(src.rgb - paintKey.rgb), vec3(0.012)))) {
+        src.rgb = paintOverride.rgb;  // warning colour replaces the body paint only
+    }
+    vec4 base = src * colDiffuse;
+    vec3 n = normalize(fragNormal);
+    vec3 v = normalize(viewPos - fragPos);
+    if (dot(n, v) < 0.0) n = -n;
+    vec3 l = normalize(lightDir);
+    float diff = max(dot(n, l), 0.0);
+    float fill = max(dot(n, normalize(vec3(0.6, 0.2, 0.4))), 0.0);
+    vec3 h = normalize(l + v);
+    float spec = pow(max(dot(n, h), 0.0), 40.0);
+    float fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+    float lum = dot(base.rgb, vec3(0.299, 0.587, 0.114));
+    vec3 col = base.rgb * (0.46 + 0.50 * diff + 0.12 * fill);
+    col += vec3(1.0, 0.99, 0.97) * spec * (0.10 + 0.30 * lum);
+    col += vec3(0.96, 0.97, 1.0) * fres * 0.10 * lum;
+    OUTCOLOR = vec4(min(col, vec3(1.0)), base.a);
+}
+"""
+
+
+def vehicle_shader_sources(gl_version: int) -> tuple[str, str]:
+    if gl_version in (getattr(rl, "RL_OPENGL_33", 3), getattr(rl, "RL_OPENGL_43", 4)):
+        vs = "#version 330\n#define IN in\n#define OUT out\n" + VEHICLE_SHADER_VS_BODY
+        fs = ("#version 330\n#define IN in\nout vec4 finalColor;\n#define OUTCOLOR finalColor\n"
+              + VEHICLE_SHADER_FS_BODY)
+    else:
+        vs = "#define IN attribute\n#define OUT varying\n" + VEHICLE_SHADER_VS_BODY
+        fs = ("#ifdef GL_ES\nprecision mediump float;\n#endif\n#define IN varying\n#define OUTCOLOR gl_FragColor\n"
+              + VEHICLE_SHADER_FS_BODY)
+    return vs, fs
+
+
 NV12_PACK_VERTEX_SHADER = """
 attribute vec3 vertexPosition;
 attribute vec2 vertexTexCoord;
@@ -384,6 +655,56 @@ void main() {
     }
 }
 """
+NAVI_YUV420_FRAGMENT_SHADER = """
+#ifdef GL_ES
+precision mediump float;
+#endif
+
+varying vec2 fragTexCoord;
+
+uniform sampler2D texture0;
+uniform sampler2D texture1;
+uniform sampler2D texture2;
+uniform vec2 uvScaleU;
+uniform vec2 uvScaleV;
+
+void main() {
+    float y = 1.164383 * (texture2D(texture0, fragTexCoord).r - 0.062745);
+    float u = texture2D(texture1, fragTexCoord * uvScaleU).r - 0.501961;
+    float v = texture2D(texture2, fragTexCoord * uvScaleV).r - 0.501961;
+    vec3 rgb = vec3(
+        y + 1.596027 * v,
+        y - 0.391762 * u - 0.812968 * v,
+        y + 2.017232 * u
+    );
+    gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
+}
+"""
+NAVI_EXTERNAL_VERTEX_SHADER = """
+#version 300 es
+precision mediump float;
+in vec3 vertexPosition;
+in vec2 vertexTexCoord;
+in vec4 vertexColor;
+uniform mat4 mvp;
+out vec2 fragTexCoord;
+void main() {
+    fragTexCoord = vertexTexCoord;
+    gl_Position = mvp * vec4(vertexPosition, 1.0);
+}
+"""
+NAVI_EXTERNAL_FRAGMENT_SHADER = """
+#version 300 es
+#extension GL_OES_EGL_image_external_essl3 : enable
+precision mediump float;
+in vec2 fragTexCoord;
+uniform samplerExternalOES texture0;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(texture0, fragTexCoord);
+}
+"""
+NAVI_EGL_IMAGE_CACHE_LIMIT = 10
 
 
 @dataclass(slots=True)
@@ -394,6 +715,41 @@ class CachedTextTexture:
     texture_width: int
     texture_height: int
     padding_px: float
+
+
+StrokedTextTextureCacheKey = tuple[
+    int,
+    str,
+    float,
+    float,
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    int,
+]
+
+
+@dataclass(frozen=True, slots=True)
+class PendingStrokedTextTexture:
+    font: object
+    text: str
+    render_size: float
+    spacing: float
+    fill_color: tuple[int, int, int, int]
+    stroke_color: tuple[int, int, int, int]
+    stroke_width: int
+
+
+@dataclass(slots=True)
+class CachedNaviMediaTexture:
+    sequence: int
+    size: tuple[int, int]
+    mime: str
+    texture: object
+    u_texture: object | None = None
+    v_texture: object | None = None
+    uv_scale_u: object | None = None
+    uv_scale_v: object | None = None
+    hardware_token: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +765,23 @@ class CameraOverlayProjection:
     video_ty: float
     view_from_road: tuple[tuple[float, float, float], ...]
     camera_height_m: float
+    wide_camera: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VehicleMetricLine:
+    text: str
+    x: float
+    y: float
+    size: float
+
+
+@dataclass(frozen=True, slots=True)
+class VehicleMetricLabel:
+    vehicle: VehicleBox
+    lines: tuple[VehicleMetricLine, ...]
+    color: tuple[int, ...]
+    shadow_offset: float = 0.0
 
 
 @lru_cache(maxsize=256)
@@ -432,21 +805,21 @@ def rl_color(color: tuple[int, int, int] | tuple[int, int, int, int], alpha: int
     return _cached_rl_color(int(r), int(g), int(b), int(a))
 
 
-def radar_point_distance_label(point: RadarPointMarker) -> str:
+def radar_point_distance_label(point: RadarPointMarker, is_metric: bool = True) -> str:
     if point.absolute_speed_kph is not None and abs(point.absolute_speed_kph) <= RADAR_STATIC_OBJECT_SPEED_KPH:
         return ""
-    return f"{point.longitudinal_m:.0f} m"
+    return format_radar_distance(point.longitudinal_m, is_metric)
 
 
-def radar_point_speed_label(point: RadarPointMarker) -> str:
+def radar_point_speed_label(point: RadarPointMarker, is_metric: bool = True) -> str:
     if point.absolute_speed_kph is None:
         return ""
     if abs(point.absolute_speed_kph) <= RADAR_STATIC_OBJECT_SPEED_KPH:
         return ""
-    return f"{point.absolute_speed_kph:.0f} km/h"
+    return f"{display_speed(point.absolute_speed_kph, is_metric):.0f} {speed_unit(is_metric)}"
 
 
-def vehicle_distance_label(vehicle: VehicleBox) -> str:
+def vehicle_distance_label(vehicle: VehicleBox, is_metric: bool = True) -> str:
     if (
         vehicle.absolute_speed_kph is not None
         and abs(vehicle.absolute_speed_kph) <= RADAR_STATIC_OBJECT_SPEED_KPH
@@ -454,7 +827,7 @@ def vehicle_distance_label(vehicle: VehicleBox) -> str:
         and not vehicle.cut_in
     ):
         return ""
-    distance = f"{vehicle_distance_m(vehicle):.0f} m"
+    distance = format_radar_distance(vehicle_distance_m(vehicle), is_metric)
     if vehicle.cut_in:
         return f"CUT-IN {distance}"
     if (vehicle.primary or vehicle.cut_in) and vehicle.label:
@@ -471,12 +844,18 @@ def vehicle_distance_m(vehicle: VehicleBox) -> float:
     return vehicle.center.y - EGO_FORWARD_M
 
 
-def vehicle_speed_label(vehicle: VehicleBox) -> str:
+def vehicle_has_lead_one_metrics(vehicle: VehicleBox) -> bool:
+    # primary also marks L2 and CUT-IN. Only the existing leadOne gets large
+    # metrics; never infer a new lead from proximity or a raw radar point.
+    return vehicle.primary and vehicle.label.upper() == "L1" and vehicle_distance_m(vehicle) > 0.0
+
+
+def vehicle_speed_label(vehicle: VehicleBox, is_metric: bool = True) -> str:
     if vehicle.absolute_speed_kph is None:
         return ""
     if abs(vehicle.absolute_speed_kph) <= RADAR_STATIC_OBJECT_SPEED_KPH:
         return ""
-    return f"{vehicle.absolute_speed_kph:.0f} km/h"
+    return f"{display_speed(vehicle.absolute_speed_kph, is_metric):.0f} {speed_unit(is_metric)}"
 
 
 def radar_info_shows_vehicle(mode: int) -> bool:
@@ -574,15 +953,6 @@ def vehicle_source_is_radar_track(source: str) -> bool:
     return source in ("radarPoint", "liveTracks", "cornerRadar") or "+radar:" in source
 
 
-def speed_limit_source_label(source: str | None) -> str:
-    if source is None:
-        return ""
-    normalized = source.strip().lower()
-    if not normalized:
-        return ""
-    return SPEED_LIMIT_SOURCE_LABELS.get(normalized, normalized[:3])
-
-
 def world_label_scale(distance_m: float) -> float:
     far_amount = clamp((abs(distance_m) - WORLD_LABEL_NEAR_M) / (WORLD_LABEL_FAR_M - WORLD_LABEL_NEAR_M), 0.0, 1.0)
     return 1.0 - far_amount * (1.0 - WORLD_LABEL_MIN_SCALE)
@@ -646,7 +1016,200 @@ def label_rect_inside_bounds(
     return x >= left and y >= top and x + width <= right and y + height <= bottom
 
 
+# EV6 HUD patch v13: parked screen (gear P). The car photo stays on the device, it is not part of the patch.
+EV6_PARK_CAR_IMAGE = "/data/ev6_park_car.png"
+EV6_PARK_SCREEN_OFF_FLAG = "/data/ev6_park_screen_off"
+EV6_PARK_IMAGE_RETRY_S = 5.0
+EV6_PARK_DARK_SHADOW_FROM = 0.72  # dark theme: drop translucent pixels below this share of the photo height (ground shadow)
+EV6_PARK_WEEKDAYS_KO = ("월", "화", "수", "목", "금", "토", "일")
+EV6_PARK_COLORS_LIGHT = {"bg_top": (246, 247, 249), "bg_bot": (222, 225, 230), "text": (28, 31, 36), "muted": (118, 124, 133),
+                         "card": (255, 255, 255), "line": (214, 218, 224), "accent": (0, 122, 255)}
+EV6_PARK_COLORS_DARK = {"bg_top": (30, 33, 38), "bg_bot": (10, 11, 13), "text": (236, 238, 241), "muted": (140, 146, 155),
+                        "card": (30, 33, 38), "line": (54, 58, 65), "accent": (80, 160, 255)}
+
+# EV6 HUD patch v15: reverse screen (gear R). Kia EV6: wheelbase 2.90 m, steer ratio 16 (opendbc CarSpecs),
+# rear axle 1.44 m and rear bumper 2.34 m behind the body centre.
+EV6_REVERSE_SCREEN_OFF_FLAG = "/data/ev6_reverse_screen_off"
+EV6_REVERSE_CAR_IMAGE = "/data/ev6_reverse_car.png"  # optional replacement for the generated car image (same angle)
+EV6_REVERSE_SPRITE_SUPERSAMPLE = 2
+EV6_REVERSE_STEER_RATIO = 16.0
+EV6_REVERSE_WHEELBASE_M = 2.90
+EV6_REVERSE_REAR_AXLE_Y_M = -1.44
+EV6_REVERSE_REAR_BUMPER_Y_M = -2.34
+EV6_REVERSE_HALF_WIDTH_M = 0.95
+EV6_REVERSE_PATH_LENGTH_M = 5.0
+EV6_REVERSE_PATH_STEPS = 60
+EV6_REVERSE_MARKS = ((1.0, (255, 59, 48)), (2.0, (255, 159, 10)), (3.0, (52, 199, 89)))
+EV6_REVERSE_WARN = (255, 149, 0)
+
+# EV6 HUD patch v17: weather on the parked screen from Open-Meteo (free, no API key). A daemon thread fetches while the
+# parked screen is in use (at most every 10 min), never in the render loop; the last result is cached in /data so it
+# survives restarts and garages without signal. Location: openpilot's LastGPSPosition, rounded to ~1 km.
+EV6_WEATHER_OFF_FLAG = "/data/ev6_weather_off"
+EV6_WEATHER_CACHE = "/data/ev6_weather_cache.json"
+EV6_WEATHER_REFRESH_S = 600.0
+EV6_WEATHER_RETRY_S = 120.0
+EV6_WEATHER_MAX_AGE_S = 3600.0
+EV6_WEATHER_IDLE_S = 900.0  # stop fetching this long after the parked screen was last shown
+EV6_DUST_GRADES = (("좋음", (38, 166, 91)), ("보통", (255, 159, 10)), ("나쁨", (255, 59, 48)), ("매우나쁨", (175, 82, 222)))
+
+
+def ev6_weather_kind(code: int) -> tuple[str, str]:
+    # WMO weather codes -> (icon, Korean label)
+    if code == 0:
+        return "clear", "맑음"
+    if code in (1, 2):
+        return "partly", "구름조금"
+    if code in (45, 48):
+        return "cloudy", "안개"
+    if code in (71, 73, 75, 77, 85, 86):
+        return "snow", "눈"
+    if 51 <= code <= 67 or 80 <= code <= 82:
+        return "rain", "비"
+    if code >= 95:
+        return "rain", "뇌우"
+    return "cloudy", "흐림"
+
+
+def ev6_dust_grade(pm10: float | None, pm25: float | None) -> int | None:
+    # Korean grades (Ministry of Environment): the worse of PM10 and PM2.5
+    grades = []
+    if pm10 is not None:
+        grades.append(0 if pm10 <= 30 else 1 if pm10 <= 80 else 2 if pm10 <= 150 else 3)
+    if pm25 is not None:
+        grades.append(0 if pm25 <= 15 else 1 if pm25 <= 35 else 2 if pm25 <= 75 else 3)
+    return max(grades) if grades else None
+
+
+def ev6_weather_from_response(forecast: dict, air: dict | None) -> dict:
+    current, daily = forecast.get("current", {}), forecast.get("daily", {})
+    kind, label = ev6_weather_kind(int(current.get("weather_code", 3)))
+    first = lambda key: (daily.get(key) or [None])[0]  # noqa: E731
+    day_kind, day_label = ev6_weather_kind(int(first("weather_code") or 0))
+    chance = first("precipitation_probability_max")
+    # rain / snow chance only when it is raining or snowing, or forecast for today
+    if kind in ("rain", "snow") and chance is not None:
+        label = f"{label} {chance:.0f}%"
+    elif day_kind in ("rain", "snow") and chance is not None and chance >= 30:
+        label = f"오늘 {day_label} {chance:.0f}%"  # the icon still shows the current sky
+    air_now = (air or {}).get("current", {})
+    return {"kind": kind, "label": label, "temp": float(current.get("temperature_2m", 0.0)), "max": first("temperature_2m_max"),
+            "min": first("temperature_2m_min"), "dust": ev6_dust_grade(air_now.get("pm10"), air_now.get("pm2_5"))}
+
+
+class Ev6Weather:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: dict | None = None
+        self._data_time = 0.0  # unix time of the last successful fetch
+        self._wanted_until = 0.0
+        self._thread = None
+        self._loaded_cache = False
+
+    def snapshot(self) -> dict | None:
+        if os.path.exists(EV6_WEATHER_OFF_FLAG):
+            return None
+        self._wanted_until = time.monotonic() + EV6_WEATHER_IDLE_S
+        if not self._loaded_cache:
+            self._loaded_cache = True
+            self._load_cache()
+        if self._thread is None and not os.environ.get("EV6_WEATHER_NO_FETCH"):
+            self._thread = threading.Thread(target=self._run, name="ev6-weather", daemon=True)
+            self._thread.start()
+        with self._lock:
+            if self._data is None or time.time() - self._data_time > EV6_WEATHER_MAX_AGE_S:  # noqa: TID251 - persisted cache spans reboots
+                return None
+            return self._data
+
+    def set(self, data: dict, data_time: float | None = None) -> None:
+        with self._lock:
+            self._data, self._data_time = data, time.time() if data_time is None else data_time  # noqa: TID251 - persisted UTC time
+
+    def _load_cache(self) -> None:
+        try:
+            with open(EV6_WEATHER_CACHE, encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached.get("pos"):
+                self._last_pos = tuple(cached["pos"])  # EV6 HUD patch v19
+            self.set(cached["data"], float(cached["time"]))
+        except Exception:
+            pass
+
+    def _position(self) -> tuple[float, float] | None:
+        # LastGPSPosition lives in /dev/shm: it is cleared at boot and only set once GPS has a fix, so in a garage
+        # right after starting the car there is none. The car has not moved since the last fix, so fall back to the
+        # last known position (kept in the weather cache across restarts). EV6 HUD patch v19
+        try:
+            from openpilot.common.params import Params
+            for params in (Params("/dev/shm/params"), Params()):
+                raw = params.get("LastGPSPosition")
+                if raw:
+                    pos = json.loads(raw)
+                    self._last_pos = (round(float(pos["latitude"]), 2), round(float(pos["longitude"]), 2))
+                    break
+        except Exception:
+            pass
+        return getattr(self, "_last_pos", None)
+
+    @staticmethod
+    def _get_json(url: str) -> dict:
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _run(self) -> None:
+        next_fetch = 0.0
+        while True:
+            time.sleep(5.0)
+            now = time.monotonic()
+            if now > self._wanted_until or now < next_fetch or os.path.exists(EV6_WEATHER_OFF_FLAG):
+                continue
+            position = self._position()
+            if position is None:
+                if now >= getattr(self, "_no_pos_log_t", 0.0):
+                    self._no_pos_log_t = now + 600.0
+                    print("EV6 weather: no GPS position yet", flush=True)
+                next_fetch = now + 30.0
+                continue
+            lat, lon = position
+            try:
+                forecast = self._get_json(
+                    "https://api.open-meteo.com/v1/forecast" +
+                    f"?latitude={lat}&longitude={lon}&timezone=auto&forecast_days=1" +
+                    "&current=temperature_2m,weather_code" +
+                    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max")
+                try:
+                    air = self._get_json("https://air-quality-api.open-meteo.com/v1/air-quality" +
+                                         f"?latitude={lat}&longitude={lon}&current=pm10,pm2_5")
+                except Exception:
+                    air = None
+                data = ev6_weather_from_response(forecast, air)
+                self.set(data)
+                try:
+                    with open(EV6_WEATHER_CACHE, "w", encoding="utf-8") as f:
+                        json.dump({"time": time.time(), "pos": [lat, lon], "data": data}, f)  # noqa: TID251 - persisted UTC time
+                except OSError:
+                    pass
+                next_fetch = now + EV6_WEATHER_REFRESH_S
+            except Exception as exc:
+                print(f"EV6 weather: fetch failed: {exc}", flush=True)
+                next_fetch = now + EV6_WEATHER_RETRY_S
+
+
+EV6_WEATHER = Ev6Weather()
+
 class ClusterUiRenderer:
+    # Class defaults also keep lightweight object.__new__ render probes on the
+    # original Korean/metric presentation without running the GPU-heavy init.
+    language = CLUSTER_LANGUAGE_KO
+    is_metric = True
+    _other_vehicle_models = ()
+    _other_vehicle_names = ()
+    _other_vehicle_paint = ()
+    _vehicle_shaders = ()
+    _cutin_hold = None
+    panel_layout = CLUSTER_PANEL_LAYOUT_DRIVING_LEFT
+
     def __init__(
         self,
         width: int = DESIGN_WIDTH,
@@ -655,6 +1218,9 @@ class ClusterUiRenderer:
         target_fps: int = 0,
         theme_mode: str = "auto",
         screen_mode: int = 0,
+        panel_layout: int = CLUSTER_PANEL_LAYOUT_DRIVING_LEFT,
+        language: str = CLUSTER_LANGUAGE_KO,
+        is_metric: bool = True,
     ) -> None:
         self.width = width
         self.height = height
@@ -662,12 +1228,26 @@ class ClusterUiRenderer:
         self.target_fps = target_fps
         self.theme_mode = normalize_cluster_theme_mode(theme_mode)
         self.screen_mode = normalize_cluster_screen_mode(screen_mode)
+        self.panel_layout = normalize_cluster_panel_layout(panel_layout)
+        self.language = normalize_cluster_language(language, default=CLUSTER_LANGUAGE_KO)
+        self.is_metric = bool(is_metric)
         self._theme = current_cluster_theme(self.theme_mode)
         self.hidden = False
+        self._nav_model_texture = None
+        self._nav_model_checked = 0.
+        self._nav_model_mtime = 0
+        self._nav_model_fresh = False
         self._window_open = False
         self._font = None
         self._owns_font = False
+        self._korean_font = None
+        self._owns_korean_font = False
         self._capture_target = None
+        self._trip_report_target = None
+        self._trip_report_cache_key: tuple[object, ...] | None = None
+        self._trip_report_cache_valid = False
+        self._trip_report_cache_visible = False
+        self._trip_report_cache_next_refresh = 0.0
         self._portrait_upload_target = None
         self._portrait_upload_target_size: tuple[int, int] | None = None
         self._nv12_pack_y_target = None
@@ -678,33 +1258,83 @@ class ClusterUiRenderer:
         self._nv12_pack_full_size: tuple[int, int] | None = None
         self._nv12_pack_shader = None
         self._nv12_pack_shader_locations: dict[str, int] = {}
+        self._direct_nv12_readback = None
+        self._direct_nv12_readback_checked = False
+        self._direct_nv12_readback_disabled = False
+        self._nv12_dmabuf_pool = None
+        self._nv12_dmabuf_pool_checked = False
+        self._nv12_dmabuf_pool_disabled = False
         self._vehicle_model = None
         self._vehicle_model_load_attempted = False
+        self._park_vehicle_model = None
+        self._park_vehicle_models_loaded = False
+        self._other_vehicle_models: list[object] = []
+        self._other_vehicle_names: list[str] = []
+        self._park_model_texture = None
+        self._park_model_key = None
+        self._ev6_reverse_sprite = None
+        self._ev6_reverse_sprite_key = None
+        self._ev6_park_textures = None
+        self._ev6_park_retry_t = 0.0
+        self._cutin_hold: list[float] | None = None  # EV6 HUD patch v6: [colour until, x, long_m, model idx, model until]
+        self._other_vehicle_paint: list[tuple[object, int] | None] = []
+        self._vehicle_shaders: list[tuple[object, int]] = []
+        self._scene_cache_key: tuple[object, ...] | None = None
+        self._scene_cache: ClusterScene | None = None
         self._speed_bg_texture = None
+        self._traffic_red_texture = None
+        self._traffic_green_texture = None
         self._follow_vehicle_texture = None
         self._lfa_texture = None
         self._lfa_active_texture = None
+        self._lfa_lane_texture = None
         self._wifi_texture = None
+        self._tpms_car_texture = None
         self._navi_guidance_texture = None
         self._navi_guidance_hash = ""
         self._navi_guidance_size: tuple[int, int] | None = None
+        self._navi_media_textures: dict[str, CachedNaviMediaTexture] = {}
+        self._navi_yuv_shader = None
+        self._navi_yuv_shader_locations: dict[str, int] = {}
+        self._navi_external_shader = None
+        self._navi_egl_images: OrderedDict[tuple[int, int], object] = OrderedDict()
         self._route_video_texture = None
         self._route_video_size: tuple[int, int] | None = None
         self._route_video_frame_id: str | None = None
         self._live_road_camera = None
         self._live_road_camera_failed = False
+        self._signal_display_reader = SignalDisplayReader()
+        self._brake_display_reader = BrakeDisplayReader()
+        self._camera_overlay_wide = False
         self._left_turn_signal_started_at: float | None = None
         self._right_turn_signal_started_at: float | None = None
         self._hazard_signal_started_at: float | None = None
+        self._lane_highlight_side: str | None = None
+        self._lane_highlight_started_at: float | None = None
         self._triangle_strip_point_cache: OrderedDict[
             tuple[int, int],
             tuple[tuple[Vec3, ...], tuple[Vec3, ...], object, int],
         ] = OrderedDict()
+        self._camera_overlay_strip_points = None
+        self._camera_overlay_strip_point_capacity = 0
+        self._camera_overlay_strip_pair_visibility = bytearray()
+        self._raw_draw_triangle_strip_2d = getattr(getattr(rl, "rl", None), "DrawTriangleStrip", None)
         self._world_label_texture_cache: OrderedDict[
             tuple[int, str, float, float, tuple[int, int, int, int]],
             CachedTextTexture,
         ] = OrderedDict()
         self._world_label_texture_cache_enabled = os.environ.get("CLUSTER_WORLD_LABEL_TEXTURE_CACHE", "0") == "1"
+        self._stroked_text_texture_cache: OrderedDict[StrokedTextTextureCacheKey, CachedTextTexture] = OrderedDict()
+        self._pending_stroked_text_textures: OrderedDict[
+            StrokedTextTextureCacheKey,
+            PendingStrokedTextTexture,
+        ] = OrderedDict()
+        self._stroked_text_texture_cache_enabled = os.environ.get("CLUSTER_STROKED_TEXT_TEXTURE_CACHE", "1") != "0"
+        self._raw_draw_text_ex = getattr(getattr(rl, "rl", None), "DrawTextEx", None)
+        self._raw_stroked_text_enabled = (
+            os.environ.get("CLUSTER_RAW_STROKED_TEXT", "1") != "0"
+            and self._raw_draw_text_ex is not None
+        )
         self._text_measure_cache: dict[tuple[int, str, float, float], tuple[float, float]] = {}
         self._system_stats = SystemStatsSampler(SYSTEM_STATS_REFRESH_SECONDS)
         self._debug_plot_mode_prev = -1
@@ -726,9 +1356,76 @@ class ClusterUiRenderer:
     def set_theme_mode(self, theme_mode: str) -> None:
         self.theme_mode = normalize_cluster_theme_mode(theme_mode)
         self._theme = current_cluster_theme(self.theme_mode)
+        self._invalidate_trip_report_cache()
 
     def set_screen_mode(self, screen_mode: int) -> None:
         self.screen_mode = normalize_cluster_screen_mode(screen_mode)
+        self._invalidate_trip_report_cache()
+
+    def set_panel_layout(self, panel_layout: int) -> None:
+        self.panel_layout = normalize_cluster_panel_layout(panel_layout)
+        self._invalidate_trip_report_cache()
+
+    def set_display_preferences(self, language: str, is_metric: bool) -> None:
+        self.language = normalize_cluster_language(language, default=CLUSTER_LANGUAGE_KO)
+        self.is_metric = bool(is_metric)
+        self._invalidate_trip_report_cache()
+
+    def _invalidate_trip_report_cache(self) -> None:
+        self._trip_report_cache_valid = False
+        self._trip_report_cache_next_refresh = 0.0
+
+    def _text(self, key: str) -> str:
+        return cluster_text(self.language, key)
+
+    def _panel_swap_active(self) -> bool:
+        if self.panel_layout != CLUSTER_PANEL_LAYOUT_DRIVING_RIGHT:
+            return False
+        return getattr(self, "screen_mode", CLUSTER_SCREEN_MODE_DEFAULT) not in (
+            CLUSTER_SCREEN_MODE_DEBUG_GRAPH,
+            CLUSTER_SCREEN_MODE_NAVI,
+            CLUSTER_SCREEN_MODE_NAV_MODEL,
+        )
+
+    def _driving_panel_offset_design_x(self) -> float:
+        return NAVI_LIVE_PANEL_W if self._panel_swap_active() else 0.0
+
+    def _information_panel_offset_design_x(self) -> float:
+        return -NAVI_LIVE_PANEL_X if self._panel_swap_active() else 0.0
+
+    def _information_panel_x(self, x: float) -> float:
+        return x + self._information_panel_offset_design_x()
+
+    def _driving_hud_offset_design_x(self, screen_mode: int) -> float:
+        if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
+            return 0.0
+        return self._driving_panel_offset_design_x()
+
+    @staticmethod
+    def _tpms_offset_design_x(screen_mode: int) -> float:
+        return FULLSCREEN_3D_SIDE_WIDGET_OFFSET_X if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D else 0.0
+
+    def _side_gauge_offset_design_x(self, screen_mode: int) -> float:
+        if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
+            return FULLSCREEN_3D_SIDE_WIDGET_OFFSET_X
+        return 0.0
+
+    @staticmethod
+    def _center_clock_x(screen_mode: int) -> float:
+        return FULLSCREEN_3D_CLOCK_CENTER_X if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D else TOP_CLOCK_CENTER_X
+
+    def _traffic_panel_right(self, screen_mode: int) -> float:
+        if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
+            return FULLSCREEN_3D_TRAFFIC_PANEL_RIGHT
+        right = NAVI_TRAFFIC_PANEL_RIGHT
+        if self._panel_swap_active():
+            right -= NAVI_WORLD_VIEW_SHIFT_X
+        return right
+
+    def _core_usage_right_x(self, screen_mode: int) -> float:
+        if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
+            return FULLSCREEN_3D_CORE_USAGE_RIGHT_X
+        return DESIGN_WIDTH + self._information_panel_offset_design_x()
 
     def set_target_fps(self, target_fps: int) -> None:
         self.target_fps = max(0, int(target_fps))
@@ -743,6 +1440,70 @@ class ClusterUiRenderer:
 
     def clear_profile_samples(self) -> None:
         self._profile_samples.clear()
+
+    def direct_nv12_readback_available(self) -> bool:
+        if self._direct_nv12_readback_disabled:
+            return False
+        if not self._direct_nv12_readback_checked:
+            self._direct_nv12_readback_checked = True
+            try:
+                self._direct_nv12_readback = create_tici_direct_readback()
+            except DirectNv12ReadbackError:
+                self._direct_nv12_readback_disabled = True
+        return self._direct_nv12_readback is not None
+
+    def nv12_dmabuf_output_available(self) -> bool:
+        if self._nv12_dmabuf_pool_disabled:
+            return False
+        if not self._nv12_dmabuf_pool_checked:
+            self._nv12_dmabuf_pool_checked = True
+            try:
+                self._nv12_dmabuf_pool = create_tici_nv12_dmabuf_pool()
+            except DirectNv12DmabufError:
+                self._nv12_dmabuf_pool_disabled = True
+        return self._nv12_dmabuf_pool is not None
+
+    def async_nv12_readback_available(self) -> bool:
+        if not self.direct_nv12_readback_available():
+            return False
+        return bool(self._direct_nv12_readback.async_supported)
+
+    def async_nv12_readback_can_enqueue(self) -> bool:
+        readback = self._direct_nv12_readback
+        return readback is not None and readback.async_can_enqueue()
+
+    def async_nv12_readback_ready(self) -> bool:
+        readback = self._direct_nv12_readback
+        return readback is not None and readback.async_ready()
+
+    def copy_async_nv12_readback(self, destination_address: int, destination_size: int) -> bool:
+        readback = self._direct_nv12_readback
+        if readback is None:
+            raise DirectNv12ReadbackError("TICI GLES asynchronous NV12 readback is not available")
+        profile_stage = self._profile_start()
+        copied = readback.copy_ready(destination_address, destination_size)
+        self._profile_add("render_to_nv12.readback_pbo_copy", profile_stage)
+        return copied
+
+    def disable_async_nv12_readback(self) -> None:
+        if self._direct_nv12_readback is not None:
+            self._direct_nv12_readback.disable_async()
+
+    def disable_direct_nv12_readback(self) -> None:
+        if self._direct_nv12_readback is not None:
+            self._direct_nv12_readback.close()
+        self._direct_nv12_readback = None
+        self._direct_nv12_readback_disabled = True
+
+    def disable_nv12_dmabuf_output(self) -> None:
+        self.release_nv12_dmabuf_output()
+        self._nv12_dmabuf_pool_disabled = True
+
+    def release_nv12_dmabuf_output(self) -> None:
+        if self._nv12_dmabuf_pool is not None:
+            self._nv12_dmabuf_pool.close()
+        self._nv12_dmabuf_pool = None
+        self._nv12_dmabuf_pool_checked = False
 
     def profile_samples(self) -> list[tuple[str, float]]:
         return self._profile_samples
@@ -771,6 +1532,10 @@ class ClusterUiRenderer:
             rl.set_config_flags(flags)
         profile_stage = self._profile_start()
         rl.init_window(self.width, self.height, self.title)
+        # Own the context before font/model setup can fail or be interrupted.
+        self._window_open = rl.is_window_ready()
+        if not self._window_open:
+            raise RuntimeError("HUD graphics window initialization failed")
         self._profile_add("renderer.open.init_window", profile_stage)
         if self.target_fps > 0:
             profile_stage = self._profile_start()
@@ -778,6 +1543,7 @@ class ClusterUiRenderer:
             self._profile_add("renderer.open.set_target_fps", profile_stage)
         profile_stage = self._profile_start()
         self._font = self._load_font()
+        self._korean_font = self._load_korean_font()
         self._profile_add("renderer.open.load_font", profile_stage)
         profile_stage = self._profile_start()
         self._load_vehicle_model()
@@ -792,11 +1558,38 @@ class ClusterUiRenderer:
         self._profile_add("renderer.open.total", profile_total)
 
     def close(self) -> None:
+        try:
+            self._close_resources()
+        finally:
+            if self._window_open:
+                try:
+                    rl.close_window()
+                finally:
+                    self._window_open = False
+
+    def _close_resources(self) -> None:
+        if self._nav_model_texture is not None:
+            rl.unload_texture(self._nav_model_texture)
+            self._nav_model_texture = None
+        self._system_stats.close()
         if not self._window_open:
             return
+        self._close_park_textures()
+        if self._direct_nv12_readback is not None:
+            self._direct_nv12_readback.close()
+            self._direct_nv12_readback = None
+            self._direct_nv12_readback_checked = False
+        self.release_nv12_dmabuf_output()
         if self._capture_target is not None:
             rl.unload_render_texture(self._capture_target)
             self._capture_target = None
+        if self._trip_report_target is not None:
+            rl.unload_render_texture(self._trip_report_target)
+            self._trip_report_target = None
+            self._trip_report_cache_key = None
+            self._trip_report_cache_valid = False
+            self._trip_report_cache_visible = False
+            self._trip_report_cache_next_refresh = 0.0
         if self._portrait_upload_target is not None:
             rl.unload_render_texture(self._portrait_upload_target)
             self._portrait_upload_target = None
@@ -820,6 +1613,10 @@ class ClusterUiRenderer:
         for cached_text in self._world_label_texture_cache.values():
             rl.unload_texture(cached_text.texture)
         self._world_label_texture_cache.clear()
+        for cached_text in self._stroked_text_texture_cache.values():
+            rl.unload_texture(cached_text.texture)
+        self._stroked_text_texture_cache.clear()
+        self._pending_stroked_text_textures.clear()
         if self._route_video_texture is not None:
             rl.unload_texture(self._route_video_texture)
             self._route_video_texture = None
@@ -827,6 +1624,12 @@ class ClusterUiRenderer:
         if self._speed_bg_texture is not None:
             rl.unload_texture(self._speed_bg_texture)
             self._speed_bg_texture = None
+        if self._traffic_red_texture is not None:
+            rl.unload_texture(self._traffic_red_texture)
+            self._traffic_red_texture = None
+        if self._traffic_green_texture is not None:
+            rl.unload_texture(self._traffic_green_texture)
+            self._traffic_green_texture = None
         if self._follow_vehicle_texture is not None:
             rl.unload_texture(self._follow_vehicle_texture)
             self._follow_vehicle_texture = None
@@ -836,32 +1639,73 @@ class ClusterUiRenderer:
         if self._lfa_active_texture is not None:
             rl.unload_texture(self._lfa_active_texture)
             self._lfa_active_texture = None
+        if self._lfa_lane_texture is not None:
+            rl.unload_texture(self._lfa_lane_texture)
+            self._lfa_lane_texture = None
         if self._wifi_texture is not None:
             rl.unload_texture(self._wifi_texture)
             self._wifi_texture = None
+        if self._tpms_car_texture is not None:
+            rl.unload_texture(self._tpms_car_texture)
+            self._tpms_car_texture = None
         if self._navi_guidance_texture is not None:
             rl.unload_texture(self._navi_guidance_texture)
             self._navi_guidance_texture = None
             self._navi_guidance_hash = ""
             self._navi_guidance_size = None
+        for cached_media in self._navi_media_textures.values():
+            self._unload_navi_media_texture(cached_media)
+        self._navi_media_textures.clear()
+        if self._navi_egl_images:
+            from openpilot.system.ui.lib.egl import destroy_egl_image
+
+            for egl_image in self._navi_egl_images.values():
+                destroy_egl_image(egl_image)
+            self._navi_egl_images.clear()
+        if self._navi_external_shader is not None:
+            rl.unload_shader(self._navi_external_shader)
+            self._navi_external_shader = None
+        if self._navi_yuv_shader is not None:
+            rl.unload_shader(self._navi_yuv_shader)
+            self._navi_yuv_shader = None
+            self._navi_yuv_shader_locations = {}
         if self._owns_font and self._font is not None:
             rl.unload_font(self._font)
+        if self._owns_korean_font and self._korean_font is not None:
+            rl.unload_font(self._korean_font)
         self._font = None
         self._owns_font = False
+        self._korean_font = None
+        self._owns_korean_font = False
         if self._vehicle_model is not None:
             rl.unload_model(self._vehicle_model)
             self._vehicle_model = None
+        if self._park_vehicle_model is not None:
+            rl.unload_model(self._park_vehicle_model)
+            self._park_vehicle_model = None
+        self._park_vehicle_models_loaded = False
+        for other_model in self._other_vehicle_models:
+            rl.unload_model(other_model)
+        self._other_vehicle_models = []
+        self._other_vehicle_names = []
+        self._other_vehicle_paint = []
+        self._vehicle_shaders = []
+        self._cutin_hold = None
         self._vehicle_model_load_attempted = False
+        self._scene_cache_key = None
+        self._scene_cache = None
+        self._camera_overlay_strip_points = None
+        self._camera_overlay_strip_point_capacity = 0
+        self._camera_overlay_strip_pair_visibility = bytearray()
         self._route_video_size = None
         self._route_video_frame_id = None
-        rl.close_window()
-        self._window_open = False
 
     def should_close(self) -> bool:
         return bool(self._window_open and rl.window_should_close())
 
     def render_frame(self, state: ClusterUiState) -> None:
         self.open()
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         rl.begin_drawing()
         self._profile_add("render_frame.begin_drawing", profile_stage)
@@ -871,6 +1715,7 @@ class ClusterUiRenderer:
         profile_stage = self._profile_start()
         rl.end_drawing()
         self._profile_add("render_frame.end_drawing", profile_stage)
+        self._flush_pending_stroked_text_textures()
 
     def render_route_replay_frame(
         self,
@@ -881,6 +1726,7 @@ class ClusterUiRenderer:
         paused: bool = False,
     ) -> None:
         self.open()
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         rl.begin_drawing()
         self._profile_add("render_route_frame.begin_drawing", profile_stage)
@@ -895,13 +1741,14 @@ class ClusterUiRenderer:
                 corner_lateral_offset_m,
                 paused,
                 self.route_camera_tuning_visible
-                and state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
+                and cluster_camera_view_is_road_camera(state.camera_view_mode),
             )
             self._profile_add("render_route_frame.controls", profile_stage)
         finally:
             profile_stage = self._profile_start()
             rl.end_drawing()
             self._profile_add("render_route_frame.end_drawing", profile_stage)
+            self._flush_pending_stroked_text_textures()
 
     def route_replay_control_input(
         self,
@@ -994,17 +1841,669 @@ class ClusterUiRenderer:
 
     def render(self, state: ClusterUiState, signal_lights: tuple[bool, bool] | None = None) -> None:
         """Draw one frame into the currently active raylib render target."""
-        if signal_lights is None:
-            signal_lights = self._turn_signal_lights(state)
-        profile_stage = self._profile_start()
-        if self.screen_mode == CLUSTER_SCREEN_MODE_DEBUG_GRAPH:
-            self._clear_world()
+        if self._ev6_park_screen_active(state):  # EV6 HUD patch v13: parked screen replaces the road view in P
+            self._ev6_draw_park_screen(state)
+        elif self._ev6_reverse_screen_active(state):
+            self._ev6_draw_reverse_screen(state)
         else:
-            self._render_world(state, signal_lights)
-        self._profile_add("render.world", profile_stage)
+            if signal_lights is None:
+                signal_lights = self._turn_signal_lights(state)
+            profile_stage = self._profile_start()
+            if self.screen_mode in (CLUSTER_SCREEN_MODE_DEBUG_GRAPH, CLUSTER_SCREEN_MODE_NAVI):
+                self._clear_world()
+            else:
+                self._render_world(state, signal_lights)
+            self._profile_add("render.world", profile_stage)
+            profile_stage = self._profile_start()
+            self._draw_hud(state, signal_lights)
+            self._profile_add("render.hud", profile_stage)
         profile_stage = self._profile_start()
-        self._draw_hud(state, signal_lights)
-        self._profile_add("render.hud", profile_stage)
+        from openpilot.common.indicator_display import draw as draw_indicator
+        draw_indicator(530, 78, 460, self._korean_font or self._font, 24)
+        self._draw_alert_overlay(getattr(state, "alert", None))
+        self._profile_add("render.alert", profile_stage)
+
+    def _draw_nav_model_map(self):
+        from openpilot.selfdrive.navigation.preview import PREVIEW_PATH, preview_fresh
+        # Mode 7 keeps the normal driving view/HUD on the left. The map uses
+        # only the existing right information panel, including in 3D views.
+        rl.draw_rectangle(NAVI_LIVE_PANEL_X, 0, NAVI_LIVE_PANEL_W, DESIGN_HEIGHT, rl.BLACK)
+        center_x = NAVI_LIVE_PANEL_X + NAVI_LIVE_PANEL_W / 2
+        now = time.monotonic()
+        if now >= self._nav_model_checked:
+            self._nav_model_checked = now + .5
+            self._nav_model_fresh = preview_fresh()
+            if self._nav_model_fresh:
+                try:
+                    mtime = PREVIEW_PATH.stat().st_mtime_ns
+                    if mtime != self._nav_model_mtime:
+                        texture = rl.load_texture(str(PREVIEW_PATH))
+                        if texture.id:
+                            if self._nav_model_texture is not None:
+                                rl.unload_texture(self._nav_model_texture)
+                            self._nav_model_texture = texture
+                            self._nav_model_mtime = mtime
+                        else:
+                            self._nav_model_fresh = False
+                except OSError:
+                    self._nav_model_fresh = False
+        if self._nav_model_fresh and self._nav_model_texture is not None:
+            size = min(DESIGN_HEIGHT - 80, NAVI_LIVE_PANEL_W - 32)
+            rl.draw_texture_pro(self._nav_model_texture, rl.Rectangle(0, 0, 256, 256),
+                                rl.Rectangle(center_x - size / 2, 20, size, size),
+                                rl.Vector2(0, 0), 0, rl.WHITE)
+            self._draw_text("Mapbox / Protomaps | (c) OpenStreetMap", center_x,
+                            DESIGN_HEIGHT - 40, 14, (180, 180, 180), "center")
+        else:
+            self._draw_text("NAV MAP: waiting for route / GPS / tiles", center_x,
+                            DESIGN_HEIGHT / 2, 24, (255, 255, 255), "center")
+
+    def _ego_model(self, name: str):
+        names = getattr(self, "_other_vehicle_names", ())
+        if name in names:
+            index = names.index(name)
+            self._set_other_paint(index, None)
+            return self._other_vehicle_models[index], name
+        return self._park_vehicle_model, "ev6"
+
+    def _close_park_textures(self) -> None:
+        textures = list(self._ev6_park_textures or ())
+        if self._park_model_texture is not None:
+            textures.append(self._park_model_texture)
+        if self._ev6_reverse_sprite:
+            textures.append(self._ev6_reverse_sprite[0])
+        self._ev6_reverse_sprite = None
+        self._ev6_reverse_sprite_key = None
+        # Detach handles first: close is idempotent, including after an interrupted unload.
+        self._ev6_park_textures = None
+        self._ev6_park_retry_t = 0.0
+        self._park_model_texture = None
+        self._park_model_key = None
+        self._park_model_retry_t = 0.0
+        failure = None
+        for texture in textures:
+            try:
+                rl.unload_texture(texture)
+            except BaseException as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def _prepare_park_model_texture(self, state: ClusterUiState) -> None:
+        """Cache the selected car before binding the main frame's render target."""
+        if not self._ev6_park_screen_active(state):
+            return
+        model, key = self._ego_model(ego_model_name(state.car_fingerprint))
+        if model is None or key == self._park_model_key:
+            return
+        now = time.monotonic()
+        if now < getattr(self, "_park_model_retry_t", 0.0):
+            return
+        self._park_model_retry_t = now + EV6_PARK_IMAGE_RETRY_S
+        if self._park_model_texture is not None:
+            rl.unload_texture(self._park_model_texture)
+            self._park_model_texture = None
+        self._park_model_key = None
+        target = image = texture = None
+        try:
+            from cluster_scene import EV6_EGO_HEIGHT_M, EV6_EGO_LENGTH_M, EV6_EGO_WIDTH_M
+
+            camera = rl.Camera3D(rl.Vector3(-6.5, 7.5, 4.0), rl.Vector3(0.0, 0.0, 0.75),
+                                 rl.Vector3(0.0, 0.0, 1.0), 32.0, rl.CameraProjection.CAMERA_PERSPECTIVE)
+            view = rl.ffi.new("float[]", [camera.position.x, camera.position.y, camera.position.z])
+            for shader, loc in self._vehicle_shaders:
+                if loc >= 0:
+                    rl.set_shader_value(shader, loc, view, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
+            scale = ((EV6_EGO_WIDTH_M, EV6_EGO_LENGTH_M, EV6_EGO_HEIGHT_M) if key == "ev6"
+                     else (1.82, 4.35, 1.35))
+            target = rl.load_render_texture(800, 480)
+            rl.begin_texture_mode(target)
+            try:
+                rl.clear_background(rl.BLANK)
+                rl.begin_mode_3d(camera)
+                try:
+                    rl.rl_disable_backface_culling()
+                    rl.draw_model_ex(model, rl.Vector3(0.0, 0.0, 0.0), rl.Vector3(0.0, 0.0, 1.0),
+                                     0.0, rl.Vector3(*scale), rl.WHITE)
+                finally:
+                    rl.rl_enable_backface_culling()
+                    rl.end_mode_3d()
+            finally:
+                rl.end_texture_mode()
+            image = rl.load_image_from_texture(target.texture)
+            rl.image_flip_vertical(image)
+            if not self._crop_car_image(image):
+                return
+            texture = rl.load_texture_from_image(image)
+            rl.gen_texture_mipmaps(texture)
+            rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+            self._park_model_texture, texture = texture, None
+            self._park_model_key = key
+            self._park_model_retry_t = 0.0
+        except Exception as exc:
+            print(f"Parked car preview unavailable: {exc}", flush=True)
+        finally:
+            if texture is not None:
+                rl.unload_texture(texture)
+            if image is not None:
+                rl.unload_image(image)
+            if target is not None:
+                rl.unload_render_texture(target)
+
+    @staticmethod
+    def _crop_car_image(image) -> bool:
+        rl.image_format(image, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+        alpha = np.frombuffer(rl.ffi.buffer(image.data, image.width * image.height * 4),
+                              dtype=np.uint8).reshape(image.height, image.width, 4)[..., 3]
+        rows, cols = np.nonzero(alpha.max(axis=1))[0], np.nonzero(alpha.max(axis=0))[0]
+        if not len(rows):
+            return False
+        rl.image_crop(image, rl.Rectangle(int(cols[0]), int(rows[0]),
+                                         int(cols[-1] - cols[0] + 1), int(rows[-1] - rows[0] + 1)))
+        return True
+
+    # ---- EV6 HUD patch v13: parked screen ----
+    def _ev6_park_screen_active(self, state: ClusterUiState) -> bool:
+        if not getattr(state, "onroad", False):
+            return False
+        if str(getattr(state, "gear_text", "") or "").strip().upper() != "P":
+            return False
+        now = time.monotonic()
+        if now >= getattr(self, "_ev6_park_flag_check_t", 0.0):
+            self._ev6_park_flag_check_t = now + 1.0
+            self._ev6_park_off = os.path.exists(EV6_PARK_SCREEN_OFF_FLAG)
+        return not self._ev6_park_off
+
+    def _ev6_park_car_texture(self, dark: bool):
+        # Loaded lazily from the device; a missing file is retried every few seconds so a copied photo shows up
+        # without restarting the HUD. Dark theme drops the photo's grey ground shadow (it reads as a haze on black).
+        textures = getattr(self, "_ev6_park_textures", None)
+        if textures is None:
+            now = time.monotonic()
+            if now < getattr(self, "_ev6_park_retry_t", 0.0):
+                return None
+            self._ev6_park_retry_t = now + EV6_PARK_IMAGE_RETRY_S
+            path = os.environ.get("EV6_PARK_CAR_IMAGE", EV6_PARK_CAR_IMAGE)
+            if not os.path.isfile(path):
+                return None
+            image = dark_image = None
+            textures = []
+            try:
+                image = rl.load_image(path)
+                if image.width <= 0 or image.height <= 0:
+                    return None
+                rl.image_format(image, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+                dark_image = rl.image_copy(image)
+                pixels = np.frombuffer(rl.ffi.buffer(dark_image.data, dark_image.width * dark_image.height * 4),
+                                       dtype=np.uint8).reshape(dark_image.height, dark_image.width, 4)
+                # EV6 HUD patch v16: keep the photo's ground shadow but make it black (grey reads as haze on black)
+                floor = pixels[int(dark_image.height * EV6_PARK_DARK_SHADOW_FROM):]
+                shadow = floor[..., 3] < 250
+                floor[shadow, :3] = 0
+                floor[shadow, 3] = (floor[shadow, 3] * 0.85).astype(np.uint8)
+                for img in (image, dark_image):
+                    texture = rl.load_texture_from_image(img)
+                    textures.append(texture)
+                    rl.gen_texture_mipmaps(texture)
+                    rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+                self._ev6_park_textures = textures
+            except Exception as exc:
+                print(f"EV6 parked screen: could not load {path}: {exc}", flush=True)
+                return None
+            finally:
+                if image is not None:
+                    rl.unload_image(image)
+                if dark_image is not None:
+                    rl.unload_image(dark_image)
+                if self._ev6_park_textures is None:
+                    for texture in textures:
+                        rl.unload_texture(texture)
+        return textures[1 if dark else 0]
+
+    def _ev6_draw_top_view_car(self, cx: float, cy: float, dark: bool, colors: dict) -> None:
+        # EV6 HUD patch v16: small top-view car (front up) for the tyre pressures, instead of a plain box
+        tyre = rl_color((88, 92, 100) if dark else (70, 74, 82))
+        glass = rl_color((70, 76, 86) if dark else (92, 100, 112))
+        body = rl_color(colors["card"])
+        for sx in (-1, 1):
+            for sy in (-1, 1):  # wheels peek out at the four corners, next to their pressure value
+                rl.draw_rectangle_rounded(rl.Rectangle(cx + sx * 25 - 5, cy + sy * 31 - 11, 10, 22), 0.6, 6, tyre)
+            rl.draw_ellipse(int(cx + sx * 27), int(cy - 15), 5, 3, body)  # mirrors
+        self._rounded_rect(cx - 24, cy - 54, 48, 108, 22, colors["card"], colors["line"], 2)
+        # windscreen, roof and rear window
+        rl.draw_triangle(rl.Vector2(cx - 18, cy - 24), rl.Vector2(cx - 15, cy - 9), rl.Vector2(cx + 18, cy - 24), glass)
+        rl.draw_triangle(rl.Vector2(cx + 18, cy - 24), rl.Vector2(cx - 15, cy - 9), rl.Vector2(cx + 15, cy - 9), glass)
+        rl.draw_rectangle_rounded(rl.Rectangle(cx - 15, cy - 6, 30, 30), 0.25, 6, rl_color(colors["line"]))
+        rl.draw_triangle(rl.Vector2(cx - 15, cy + 27), rl.Vector2(cx - 17, cy + 37), rl.Vector2(cx + 15, cy + 27), glass)
+        rl.draw_triangle(rl.Vector2(cx + 15, cy + 27), rl.Vector2(cx - 17, cy + 37), rl.Vector2(cx + 17, cy + 37), glass)
+
+    def _ev6_draw_weather(self, weather: dict, colors: dict, dark: bool, text) -> None:
+        # EV6 HUD patch v17: [icon] 18°  맑음 / 최고 21°  최저 12°  ● 미세먼지 좋음
+        self._ev6_draw_weather_icon(weather["kind"], 100, 272, 62, dark)
+        text(f"{weather['temp']:.0f}°", 150, 272, 52, "text")
+        text(weather["label"], 262, 276, 30, "text")
+        line = []
+        if weather.get("max") is not None and weather.get("min") is not None:
+            line.append(f"최고 {weather['max']:.0f}°  최저 {weather['min']:.0f}°")
+        text("  ".join(line), 70, 330, 22, "muted")
+        if weather.get("dust") is not None:
+            label, color = EV6_DUST_GRADES[weather["dust"]]
+            rl.draw_circle(262, 330, 7, rl_color(color))
+            text(f"미세먼지 {label}", 278, 330, 22, "muted")
+
+    @staticmethod
+    def _ev6_draw_weather_icon(kind: str, cx: float, cy: float, s: float, dark: bool) -> None:
+        sun = rl.Color(255, 184, 0, 255)
+        cloud = rl.Color(*((208, 213, 220) if dark else (176, 184, 194)), 255)
+        cloud_hi = rl.Color(*((236, 238, 241) if dark else (214, 219, 226)), 255)
+
+        def cloud_at(x, y, k, color):
+            rl.draw_circle(int(x - 0.30 * k), int(y + 0.05 * k), 0.26 * k, color)
+            rl.draw_circle(int(x + 0.02 * k), int(y - 0.12 * k), 0.34 * k, color)
+            rl.draw_circle(int(x + 0.34 * k), int(y + 0.06 * k), 0.24 * k, color)
+            rl.draw_rectangle_rounded(rl.Rectangle(x - 0.56 * k, y + 0.02 * k, 1.14 * k, 0.30 * k), 1.0, 8, color)
+
+        if kind in ("clear", "partly"):
+            sx, sy, r = (cx, cy, 0.36 * s) if kind == "clear" else (cx - 0.18 * s, cy - 0.16 * s, 0.26 * s)
+            for i in range(8):
+                a = i * math.pi / 4
+                rl.draw_line_ex(rl.Vector2(sx + math.cos(a) * r * 1.35, sy + math.sin(a) * r * 1.35),
+                                rl.Vector2(sx + math.cos(a) * r * 1.75, sy + math.sin(a) * r * 1.75), 0.07 * s, sun)
+            rl.draw_circle(int(sx), int(sy), r, sun)
+            if kind == "partly":
+                cloud_at(cx + 0.10 * s, cy + 0.12 * s, s * 0.85, cloud_hi)
+            return
+        cloud_at(cx, cy - 0.08 * s, s, cloud)
+        if kind == "rain":
+            for i in range(3):
+                x = cx - 0.30 * s + i * 0.30 * s
+                rl.draw_line_ex(rl.Vector2(x + 0.06 * s, cy + 0.36 * s), rl.Vector2(x - 0.04 * s, cy + 0.56 * s), 0.07 * s,
+                                rl.Color(64, 156, 255, 255))
+        elif kind == "snow":
+            for i in range(3):
+                rl.draw_circle(int(cx - 0.30 * s + i * 0.30 * s), int(cy + 0.48 * s), 0.07 * s, rl.Color(170, 205, 255, 255))
+
+    def _ev6_draw_battery(self, soc: float, x: float, cy: float, colors: dict, text) -> None:
+        # ClusterUiState uses the existing carState.fuelGauge fraction (0..1).
+        level = clamp(soc, 0.0, 1.0) * 100.0
+        color = (255, 59, 48) if level < 15 else (255, 159, 10) if level < 30 else (52, 199, 89)
+        w, h = 50.0, 24.0
+        self._rounded_rect(x, cy - h / 2, w, h, 6, colors["card"], colors["muted"], 2)
+        rl.draw_rectangle_rounded(rl.Rectangle(x + w + 1, cy - 5, 4, 10), 0.5, 4, rl_color(colors["muted"]))
+        if level > 0:
+            rl.draw_rectangle_rounded(rl.Rectangle(x + 4, cy - h / 2 + 4, max(3.0, (w - 8) * level / 100.0), h - 8), 0.3, 4,
+                                      rl_color(color))
+        text(f"{int(level)}%", x + w + 16, cy, 34, "text")
+
+    @staticmethod
+    def _ev6_park_duration_text(seconds: float, korean: bool = True) -> str:
+        minutes = int(round(max(0.0, seconds) / 60.0))
+        if korean:
+            return f"{minutes // 60}시간 {minutes % 60:02d}분" if minutes >= 60 else f"{minutes}분"
+        return f"{minutes // 60}h {minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
+
+    def _ev6_draw_park_screen(self, state: ClusterUiState) -> None:
+        theme = self._current_theme()
+        korean = self.language == CLUSTER_LANGUAGE_KO
+        colors = EV6_PARK_COLORS_DARK if theme.is_dark else EV6_PARK_COLORS_LIGHT
+        rl.clear_background(rl_color(colors["bg_bot"]))
+        rl.rl_push_matrix()
+        rl.rl_scalef(self.width / DESIGN_WIDTH, self.height / DESIGN_HEIGHT, 1.0)
+        try:
+            rl.draw_rectangle_gradient_v(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT, rl_color(colors["bg_top"]),
+                                         rl_color(colors["bg_bot"]))
+
+            def text(value, x, y, size, color, anchor="left"):
+                self._draw_text(value, x, y, size, colors[color], anchor)
+
+            # left: date, clock, gear
+            now = time.localtime()
+            if self.language == CLUSTER_LANGUAGE_KO:
+                date_text = f"{now.tm_mon}월 {now.tm_mday}일 {EV6_PARK_WEEKDAYS_KO[now.tm_wday]}요일"
+            else:
+                date_text = time.strftime("%a, %b %d", now)
+            text(date_text, 70, 92, 34, "muted")
+            text(time.strftime("%H:%M", now), 64, 170, 108, "text")
+            weather = EV6_WEATHER.snapshot()  # EV6 HUD patch v17: Open-Meteo weather, fetched in the background
+            gear_y = 300
+            if weather is not None:
+                self._ev6_draw_weather(weather, colors, theme.is_dark, text)
+                gear_y = 400
+            text("P", 70, gear_y, 64, "accent")
+            text("주차" if self.language == CLUSTER_LANGUAGE_KO else "Park", 130, gear_y + 4, 30, "muted")
+            # Use the existing vehicle decoder, never infer EV6 CAN layout from the fallback picture.
+            soc = state.fuel_gauge if state.energy_gauge_label == "battery" else None
+            if soc is not None:
+                self._ev6_draw_battery(soc, 236, gear_y + 2, colors, text)
+
+            # centre: car photo on a soft floor shadow
+            car_cx, car_bottom, car_h = 790.0, 412.0, 350.0
+            for i in range(12):
+                k = 1.0 - i * 0.045
+                rl.draw_ellipse(int(car_cx), int(car_bottom - 10), int(330 * k), int(30 * k),
+                                rl.Color(0, 0, 0, 8 if theme.is_dark else 7))
+            texture = self._park_model_texture
+            if ego_model_name(state.car_fingerprint) == "ev6":
+                texture = self._ev6_park_car_texture(theme.is_dark) or texture
+            if texture is not None:
+                car_w = car_h * texture.width / max(1, texture.height)
+                rl.draw_texture_pro(texture, rl.Rectangle(0, 0, texture.width, texture.height),
+                                    rl.Rectangle(car_cx - car_w / 2, car_bottom - car_h, car_w, car_h),
+                                    rl.Vector2(0, 0), 0.0, rl.WHITE)
+
+            # tyre pressures, top view
+            tpms = getattr(state, "tpms", None)
+            cx, cy = 1290, 290
+            self._ev6_draw_top_view_car(cx, cy, theme.is_dark, colors)
+            for key, dx, dy in (("fl", -70, -34), ("fr", 70, -34), ("rl", -70, 34), ("rr", 70, 34)):
+                value = getattr(tpms, key, None) if tpms is not None else None
+                text("--" if value is None or value <= 0 else f"{value:.0f}", cx + dx, cy + dy, 30, "text", "center")
+            text("공기압 (psi)" if korean else "Tyres (psi)", cx, cy + 86, 22, "muted", "center")
+
+            # right: this trip
+            trip = getattr(state, "trip_report", None)
+            x0, x1 = 1420, 1860
+            text("이번 주행" if korean else "This trip", x0, 70, 30, "muted")
+            rows = (
+                ("거리" if korean else "Distance", format_trip_distance(trip.distance_m, self.is_metric) if trip else "--"),
+                ("시간" if korean else "Time", self._ev6_park_duration_text(trip.duration_s, korean) if trip else "--"),
+                ("평균" if korean else "Average",
+                 f"{display_speed(trip.average_speed_kph, self.is_metric):.1f} {speed_unit(self.is_metric)}" if trip else "--"),
+                ("자동주행" if korean else "Automatic", f"{trip.auto_ratio_percent:.0f} %" if trip else "--"),
+            )
+            for i, (label, value) in enumerate(rows):
+                y = 135 + i * 78
+                text(label, x0, y, 28, "muted")
+                text(value, x1, y, 40, "text", "right")
+                if i < len(rows) - 1:
+                    rl.draw_line_ex(rl.Vector2(x0, y + 39), rl.Vector2(x1, y + 39), 2, rl_color(colors["line"]))
+            if trip:
+                summary = (f"급가속 {trip.hard_accel_count} · 급감속 {trip.hard_brake_count} · 급코너 {trip.hard_corner_count}" if korean
+                           else f"Hard accel {trip.hard_accel_count} · brake {trip.hard_brake_count} · corner {trip.hard_corner_count}")
+                text(summary, x0, 445, 24, "muted")
+        finally:
+            rl.rl_pop_matrix()
+
+    # ---- EV6 HUD patch v15: reverse screen ----
+    def _ev6_reverse_screen_active(self, state: ClusterUiState) -> bool:
+        if not getattr(state, "onroad", False):
+            return False
+        if str(getattr(state, "gear_text", "") or "").strip().upper() != "R":
+            return False
+        now = time.monotonic()
+        if now >= getattr(self, "_ev6_reverse_flag_check_t", 0.0):
+            self._ev6_reverse_flag_check_t = now + 1.0
+            self._ev6_reverse_off = os.path.exists(EV6_REVERSE_SCREEN_OFF_FLAG)
+        return not self._ev6_reverse_off
+
+    @staticmethod
+    def ev6_reverse_path(steering_angle_deg: float) -> list[tuple[float, float, float]]:
+        # Rear-axle path while reversing (kinematic bicycle model): x right, y forward, heading clockwise from +y.
+        # Positive steering angle = wheel turned left, which swings the rear to the car's left.
+        curvature = math.tan(math.radians(steering_angle_deg / EV6_REVERSE_STEER_RATIO)) / EV6_REVERSE_WHEELBASE_M
+        step = EV6_REVERSE_PATH_LENGTH_M / EV6_REVERSE_PATH_STEPS
+        x, y, heading = 0.0, EV6_REVERSE_REAR_AXLE_Y_M, 0.0
+        points = []
+        for _ in range(EV6_REVERSE_PATH_STEPS + 1):
+            points.append((x, y, heading))
+            x -= math.sin(heading) * step
+            y -= math.cos(heading) * step
+            heading += curvature * step
+        return points
+
+    def _ev6_reverse_camera(self):
+        # top view, car front to the left: screen up = the car's right side
+        camera = rl.Camera3D(rl.Vector3(-2.6, -3.3, 12.5), rl.Vector3(0.0, -3.3, 0.0), rl.Vector3(1.0, 0.0, 0.0),
+                             27.0, rl.CameraProjection.CAMERA_PERSPECTIVE)
+        if self._vehicle_shaders:
+            view_pos = rl.ffi.new("float[]", [camera.position.x, camera.position.y, camera.position.z])
+            for vehicle_shader, view_loc in self._vehicle_shaders:
+                if view_loc >= 0:
+                    rl.set_shader_value(vehicle_shader, view_loc, view_pos, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
+        return camera
+
+    def _ev6_draw_reverse_car_model(self, state: ClusterUiState) -> None:
+        from cluster_scene import EV6_EGO_HEIGHT_M, EV6_EGO_LENGTH_M, EV6_EGO_WIDTH_M
+
+        model, key = self._ego_model(ego_model_name(state.car_fingerprint))
+        if model is None:
+            return
+        scale = ((EV6_EGO_WIDTH_M, EV6_EGO_LENGTH_M, EV6_EGO_HEIGHT_M) if key == "ev6" else (1.82, 4.35, 1.35))
+        rl.rl_disable_backface_culling()
+        try:
+            rl.draw_model_ex(model, rl.Vector3(0.0, 0.0, 0.035), rl.Vector3(0.0, 0.0, 1.0), 0.0,
+                             rl.Vector3(*scale), rl.WHITE)
+        finally:
+            rl.rl_enable_backface_culling()
+
+    def _ev6_prepare_reverse_sprite(self, state: ClusterUiState) -> None:
+        """Build the selected car sprite outside the frame target; own every temporary GPU object."""
+        if not self._ev6_reverse_screen_active(state):
+            return
+        model, name = self._ego_model(ego_model_name(state.car_fingerprint))
+        key = (name, self.width, self.height)
+        if model is None or self._ev6_reverse_sprite_key == key:
+            return
+        if self._ev6_reverse_sprite:
+            rl.unload_texture(self._ev6_reverse_sprite[0])
+        self._ev6_reverse_sprite_key = key
+        self._ev6_reverse_sprite = False  # Failure falls back to the live 3D model until the next context/model.
+        target = image = texture = None
+        try:
+            scale = EV6_REVERSE_SPRITE_SUPERSAMPLE
+            width, height = int(self.width * scale), int(self.height * scale)
+            target = rl.load_render_texture(width, height)
+            rl.begin_texture_mode(target)
+            try:
+                rl.clear_background(rl.Color(214, 216, 220, 0))
+                rl.begin_mode_3d(self._ev6_reverse_camera())
+                try:
+                    self._ev6_draw_reverse_car_model(state)
+                finally:
+                    rl.end_mode_3d()
+            finally:
+                rl.end_texture_mode()
+            image = rl.load_image_from_texture(target.texture)
+            rl.image_flip_vertical(image)
+            rl.image_format(image, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+            alpha = np.frombuffer(rl.ffi.buffer(image.data, image.width * image.height * 4),
+                                  dtype=np.uint8).reshape(image.height, image.width, 4)[..., 3]
+            rows = np.nonzero(alpha.max(axis=1))[0]
+            cols = np.nonzero(alpha.max(axis=0))[0]
+            if len(rows) == 0:
+                return
+            x0, y0 = int(cols[0]), int(rows[0])
+            crop_w, crop_h = int(cols[-1]) - x0 + 1, int(rows[-1]) - y0 + 1
+            rl.image_crop(image, rl.Rectangle(x0, y0, crop_w, crop_h))
+            if name == "ev6" and os.path.isfile(EV6_REVERSE_CAR_IMAGE):
+                rl.unload_image(image)
+                image = None
+                image = rl.load_image(EV6_REVERSE_CAR_IMAGE)
+            texture = rl.load_texture_from_image(image)
+            rl.gen_texture_mipmaps(texture)
+            rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+            self._ev6_reverse_sprite = (texture, (x0 / scale, y0 / scale, crop_w / scale, crop_h / scale))
+            texture = None
+        except Exception as exc:
+            print(f"Reverse car preview unavailable, using the 3D model: {exc}", flush=True)
+        finally:
+            if texture is not None:
+                rl.unload_texture(texture)
+            if image is not None:
+                rl.unload_image(image)
+            if target is not None:
+                rl.unload_render_texture(target)
+
+    def _ev6_draw_reverse_screen(self, state: ClusterUiState) -> None:
+        theme = self._current_theme()
+        dark = theme.is_dark
+        colors = EV6_PARK_COLORS_DARK if dark else EV6_PARK_COLORS_LIGHT
+        rl.clear_background(rl_color(colors["bg_bot"]))
+        sx = self.width / DESIGN_WIDTH
+        sy = self.height / DESIGN_HEIGHT
+        rl.rl_push_matrix()
+        rl.rl_scalef(sx, sy, 1.0)
+        rl.draw_rectangle_gradient_v(0, 0, DESIGN_WIDTH, DESIGN_HEIGHT, rl_color(colors["bg_top"]), rl_color(colors["bg_bot"]))
+        rl.rl_pop_matrix()
+
+        steering_deg = float(getattr(state, "steering_angle_deg", None) or 0.0)
+        left_bsd = bool(getattr(state, "left_blindspot", False))
+        right_bsd = bool(getattr(state, "right_blindspot", False))
+        points = self.ev6_reverse_path(steering_deg)
+        accent = colors["accent"]
+        warn = EV6_REVERSE_WARN
+
+        camera = self._ev6_reverse_camera()
+        sprite = getattr(self, "_ev6_reverse_sprite", None)
+
+        def side(point, offset, z):
+            px, py, heading = point
+            return rl.Vector3(px + math.cos(heading) * offset, py - math.sin(heading) * offset, z)
+
+        def quad(a, b, c, d, color):
+            for tri in ((a, b, c), (a, c, d), (a, c, b), (a, d, c)):  # both windings: no culling surprises
+                rl.draw_triangle_3d(*tri, color)
+
+        half_w = EV6_REVERSE_HALF_WIDTH_M
+        rl.begin_mode_3d(camera)
+        try:
+            fill = rl.Color(*accent, 46 if dark else 34)
+            for a, b in zip(points, points[1:], strict=False):
+                quad(side(a, -half_w, 0.01), side(a, half_w, 0.01), side(b, half_w, 0.01), side(b, -half_w, 0.01), fill)
+            line = rl.Color(*accent, 230)
+            for offset in (-half_w, half_w):
+                for a, b in zip(points, points[1:], strict=False):
+                    quad(side(a, offset - 0.07, 0.02), side(a, offset + 0.07, 0.02),
+                         side(b, offset + 0.07, 0.02), side(b, offset - 0.07, 0.02), line)
+            for distance_m, color in EV6_REVERSE_MARKS:
+                point = points[self._ev6_reverse_mark_index(distance_m)]
+                ahead_x, ahead_y = -math.sin(point[2]) * 0.12, -math.cos(point[2]) * 0.12
+                a, b = side(point, -half_w - 0.05, 0.03), side(point, half_w + 0.05, 0.03)
+                quad(a, b, rl.Vector3(b.x + ahead_x, b.y + ahead_y, 0.03), rl.Vector3(a.x + ahead_x, a.y + ahead_y, 0.03),
+                     rl.Color(*color, 235))
+            for active, sign in ((right_bsd, 1.0), (left_bsd, -1.0)):
+                if not active:
+                    continue
+                for i in range(6):  # amber band fading outward along that side of the car
+                    inner = sign * (1.15 + i * 0.12)
+                    outer = sign * (1.27 + i * 0.12)
+                    quad(rl.Vector3(inner, 2.2, 0.01), rl.Vector3(outer, 2.2, 0.01), rl.Vector3(outer, -2.5, 0.01),
+                         rl.Vector3(inner, -2.5, 0.01), rl.Color(*warn, int(170 * (1 - i / 6))))
+            if not sprite:
+                self._ev6_draw_reverse_car_model(state)  # fallback until the car image exists
+        finally:
+            rl.end_mode_3d()
+        if sprite:
+            texture, (car_x, car_y, car_w, car_h) = sprite
+            rl.draw_texture_pro(texture, rl.Rectangle(0, 0, texture.width, texture.height),
+                                rl.Rectangle(car_x, car_y, car_w, car_h), rl.Vector2(0, 0), 0.0, rl.WHITE)
+
+        mark_labels = []
+        for distance_m, _color in EV6_REVERSE_MARKS:
+            point = points[self._ev6_reverse_mark_index(distance_m)]
+            screen = rl.get_world_to_screen_ex(side(point, -half_w - 0.45, 0.0), camera, int(self.width), int(self.height))
+            mark_labels.append((f"{distance_m:.0f}m", screen.x / sx, screen.y / sy))
+
+        rl.rl_push_matrix()
+        rl.rl_scalef(sx, sy, 1.0)
+        try:
+            def text(value, x, y, size, color, anchor="left"):
+                self._draw_text(value, x, y, size, colors[color] if isinstance(color, str) else color, anchor)
+
+            for label, x, y in mark_labels:
+                text(label, x, y, 24, "muted", "center")
+            korean = self.language == CLUSTER_LANGUAGE_KO
+            text("R", 70, 150, 140, "text")
+            text("후진" if korean else "Reverse", 190, 180, 34, "muted")
+            speed = display_speed(abs(state.speed_kph), self.is_metric)
+            text(f"{speed:.0f}", 70, 330, 84, "text")
+            text(speed_unit(self.is_metric), 150 if speed < 9.5 else 190, 350, 30, "muted")
+
+            x0, x1 = 1500, 1860
+            if abs(steering_deg) < 5.0:
+                steer_text = "가운데" if korean else "Centre"
+            elif korean:
+                steer_text = f"{'왼쪽' if steering_deg > 0 else '오른쪽'} {abs(steering_deg):.0f}°"
+            else:
+                steer_text = f"{'Left' if steering_deg > 0 else 'Right'} {abs(steering_deg):.0f}°"
+            text("핸들" if korean else "Wheel", x0, 110, 28, "muted")
+            text(steer_text, x1, 110, 40, "text", "right")
+            rl.draw_line_ex(rl.Vector2(x0, 150), rl.Vector2(x1, 150), 2, rl_color(colors["line"]))
+            text("후측방" if korean else "Blind spot", x0, 200, 28, "muted")
+            for i, (label, active) in enumerate((("좌" if korean else "L", left_bsd), ("우" if korean else "R", right_bsd))):
+                cx = 1700 + i * 130
+                rl.draw_circle(cx, 200, 14, rl_color(warn if active else colors["line"]))
+                text(label, cx + 26, 200, 28, "text" if active else "muted")
+            text("후방 카메라와 주변을 함께 확인하세요" if korean else "Check the rear camera and surroundings",
+                 x0, 420, 24, "muted")
+        finally:
+            rl.rl_pop_matrix()
+
+    @staticmethod
+    def _ev6_reverse_mark_index(distance_m: float) -> int:
+        travelled = distance_m + EV6_REVERSE_REAR_AXLE_Y_M - EV6_REVERSE_REAR_BUMPER_Y_M  # metres behind the bumper
+        return max(0, min(EV6_REVERSE_PATH_STEPS, int(round(travelled / EV6_REVERSE_PATH_LENGTH_M * EV6_REVERSE_PATH_STEPS))))
+
+    def _prepare_trip_report_cache(self, state: ClusterUiState, now: float | None = None) -> None:
+        """Refresh the expensive trip-report panel outside the active frame target."""
+        if self._ev6_park_screen_active(state) or self._ev6_reverse_screen_active(state):
+            self._load_park_vehicle_models()
+            self._prepare_park_model_texture(state)
+            self._ev6_prepare_reverse_sprite(state)
+            self._trip_report_cache_visible = False
+            return
+        if self._effective_screen_mode(state) != CLUSTER_SCREEN_MODE_TRIP_REPORT:
+            self._trip_report_cache_visible = False
+            return
+
+        refresh_time = time.monotonic() if now is None else float(now)
+        theme = self._current_theme()
+        cache_key = (
+            theme,
+            self.language,
+            self.is_metric,
+            self.panel_layout,
+            int(self.width),
+            int(self.height),
+        )
+        needs_refresh = (
+            not self._trip_report_cache_visible
+            or not self._trip_report_cache_valid
+            or self._trip_report_target is None
+            or self._trip_report_cache_key != cache_key
+            or refresh_time >= self._trip_report_cache_next_refresh
+        )
+        if needs_refresh:
+            profile_stage = self._profile_start()
+            self._refresh_trip_report_cache(state)
+            self._trip_report_cache_key = cache_key
+            self._trip_report_cache_valid = True
+            self._trip_report_cache_next_refresh = refresh_time + TRIP_REPORT_CACHE_REFRESH_SECONDS
+            self._profile_add("trip_report_cache.refresh", profile_stage)
+        self._trip_report_cache_visible = True
+
+    def _refresh_trip_report_cache(self, state: ClusterUiState) -> None:
+        target_width = int(round(TRIP_REPORT_PANEL_W))
+        target_height = int(round(TRIP_REPORT_PANEL_H))
+        if self._trip_report_target is None:
+            self._trip_report_target = rl.load_render_texture(target_width, target_height)
+            rl.set_texture_filter(
+                self._trip_report_target.texture,
+                rl.TextureFilter.TEXTURE_FILTER_BILINEAR,
+            )
+
+        panel_x = self._information_panel_x(TRIP_REPORT_PANEL_X)
+        rl.begin_texture_mode(self._trip_report_target)
+        try:
+            rl.clear_background(rl_color((0, 0, 0, 0)))
+            rl.rl_push_matrix()
+            rl.rl_translatef(-panel_x, -TRIP_REPORT_PANEL_Y, 0.0)
+            try:
+                self._draw_trip_report_panel_contents(state)
+            finally:
+                rl.rl_pop_matrix()
+        finally:
+            rl.end_texture_mode()
 
     def _clear_world(self) -> None:
         theme = self._current_theme()
@@ -1015,37 +2514,59 @@ class ClusterUiRenderer:
     def _render_world(self, state: ClusterUiState, signal_lights: tuple[bool, bool] | None = None) -> None:
         if signal_lights is None:
             signal_lights = self._turn_signal_lights(state)
-        if state.camera_view_mode != CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA or not state.onroad:
+        if not cluster_camera_view_is_road_camera(state.camera_view_mode) or not state.onroad:
             self._close_live_road_camera()
         theme = self._current_theme()
         profile_stage = self._profile_start()
-        scene = build_cluster_scene(
-            state,
-            self._profile_add_elapsed if self.profile_enabled else None,
-            highlight_lane_lit=self._highlight_lane_lit(state, signal_lights),
-            theme=theme,
-        )
+        scene = self._scene_for_state(state, self._highlight_lane_lit(state, signal_lights), theme)
         self._profile_add("render_world.build_scene", profile_stage)
         profile_stage = self._profile_start()
         rl.clear_background(rl_color(theme.bg))
         self._profile_add("render_world.clear_background", profile_stage)
-        if state.camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
+        if cluster_camera_view_is_road_camera(state.camera_view_mode):
+            self._camera_overlay_wide = self._select_camera_overlay_stream(state)
+            projection = self._camera_overlay_projection(state)
             profile_stage = self._profile_start()
-            self._draw_camera_background(state)
+            self._draw_camera_background(state, projection)
             self._profile_add("render_world.camera_background", profile_stage)
             profile_stage = self._profile_start()
-            self._draw_camera_projected_overlay(scene, state)
+            self._draw_camera_projected_overlay(scene, state, projection)
             self._profile_add("render_world.camera_projected_overlay", profile_stage)
         else:
+            self._camera_overlay_wide = False
             profile_stage = self._profile_start()
             self._draw_scene(scene, state)
             self._profile_add("render_world.draw_scene", profile_stage)
 
-    def _draw_camera_background(self, state: ClusterUiState) -> None:
-        if state.camera_view_mode != CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA:
+    def _scene_for_state(
+        self,
+        state: ClusterUiState,
+        highlight_lane_lit: bool,
+        theme: ClusterTheme,
+    ) -> ClusterScene:
+        cache_key = (*cluster_scene_state_key(state), highlight_lane_lit, theme, clean_ui_enabled())
+        if self._scene_cache is not None and cache_key == self._scene_cache_key:
+            return self._scene_cache
+        scene = build_cluster_scene(
+            state,
+            self._profile_add_elapsed if self.profile_enabled else None,
+            highlight_lane_lit=highlight_lane_lit,
+            theme=theme,
+        )
+        self._scene_cache_key = cache_key
+        self._scene_cache = scene
+        return scene
+
+    def _draw_camera_background(
+        self,
+        state: ClusterUiState,
+        projection: CameraOverlayProjection | None = None,
+    ) -> None:
+        if not cluster_camera_view_is_road_camera(state.camera_view_mode):
             return
         overlay = state.route_overlay
-        projection = self._camera_overlay_projection(state)
+        if projection is None:
+            projection = self._camera_overlay_projection(state)
         if projection is None:
             return
         texture = None
@@ -1079,13 +2600,70 @@ class ClusterUiRenderer:
                         self._close_live_road_camera()
             if drew_camera:
                 rl.draw_rectangle_rec(projection.dest, rl_color((0, 0, 0), CAMERA_BACKGROUND_VIGNETTE_ALPHA))
+                if texture is None and live_camera is not None:
+                    self._draw_signal_detections(projection, live_camera)
         finally:
             rl.end_scissor_mode()
 
+    def _draw_signal_detections(self, projection, live_camera) -> None:
+        brake = self._brake_display_reader.read(live_camera.display_frame)
+        if brake is not None:
+            video = projection.video_dest
+            if brake.get('box') is not None:
+                x, y, w, h = project_box(brake['box'], (video.x, video.y, video.width, video.height))
+                color = (255, 100, 40) if brake['state'] == 'candidate' else (180, 180, 180)
+                rl.draw_rectangle_lines_ex(rl.Rectangle(x-2, y-2, w+4, h+4), 2., rl_color(color))
+                label = 'BRAKE?' if brake['state'] == 'candidate' else 'BRK?'
+                self._draw_text_with_stroke(label, x, max(projection.dest.y+20, y-15),
+                                            max(14., self.height / DESIGN_HEIGHT * 17.), color, (0, 0, 0), 2)
+        reader = self._signal_display_reader
+        tracks = reader.read(live_camera.display_frame)
+        if not reader.enabled:
+            return
+        dest = projection.dest
+        video = projection.video_dest
+        font_size = max(14., self.height / DESIGN_HEIGHT * 17.)
+        colors = {'red': (255, 65, 65), 'green': (50, 255, 120), 'unknown': (255, 210, 65)}
+        letters = {'red': 'R', 'green': 'G', 'unknown': '?'}
+        visible = 0
+        for track in tracks:
+            x, y, w, h = project_box(track['box'], (video.x, video.y, video.width, video.height))
+            if x+w < dest.x or y+h < dest.y or x > dest.x+dest.width or y > dest.y+dest.height:
+                continue
+            visible += 1
+            color = colors[track['state']]
+            if track.get('held'):
+                color = tuple(int(c * .65) for c in color)
+            # Padding improves visibility without hiding the tiny lamp itself.
+            rect = rl.Rectangle(x-2, y-2, w+4, h+4)
+            rl.draw_rectangle_lines_ex(rect, 4., rl_color((0, 0, 0)))
+            rl.draw_rectangle_lines_ex(rect, 2., rl_color(color))
+            label_x = max(dest.x+4, min(x, dest.x+dest.width-90))
+            label_y = max(dest.y+font_size*2, y-font_size*.7)
+            qualifier = '~' if track.get('held') else '?' if track['state'] != 'unknown' and not track['confirmed'] else ''
+            self._draw_text_with_stroke(f"{letters[track['state']]}{qualifier}", label_x, label_y,
+                                        font_size, color, (0, 0, 0), 2)
+        caption = f"신호 후보 {visible}" if self.language == CLUSTER_LANGUAGE_KO else f"SIGNAL CANDIDATES {visible}"
+        if any(t.get('held') for t in tracks):
+            caption += " · ~ 이전 판독" if self.language == CLUSTER_LANGUAGE_KO else ' · ~ PREVIOUS'
+        if live_camera.is_wide:
+            caption = "신호 관찰: 일반 카메라에서 표시" if self.language == CLUSTER_LANGUAGE_KO else 'SIGNAL VIEW: ROAD CAMERA ONLY'
+        from openpilot.selfdrive.carrot.signal_display import signal_display_status
+        color, held, online = signal_display_status()
+        result = ('?', 'R', 'G', 'R+G')[color]
+        status = ('이전 판독' if held else '판독 중' if online else '입력 대기') if self.language == CLUSTER_LANGUAGE_KO else ('PREVIOUS' if held else 'LIVE' if online else 'WAITING')
+        caption += f' | {result} {status}'
+        if brake is not None:
+            caption += ' | BRAKE?' if brake['state'] == 'candidate' else ' | BRK ?'
+        self._draw_text_with_stroke(caption, dest.x+12, dest.y+font_size, font_size,
+                                    (230, 230, 230), (0, 0, 0), 2)
+        reader.record_draw(live_camera.display_frame, visible)
+
     def _live_road_camera_view(self):
-        if self._live_road_camera is not None:
-            return self._live_road_camera
-        if self._live_road_camera_failed or os.name != "posix":
+        live_camera = getattr(self, "_live_road_camera", None)
+        if live_camera is not None:
+            return live_camera
+        if getattr(self, "_live_road_camera_failed", False) or os.name != "posix":
             return None
         try:
             from cluster_live_camera import LiveRoadCamera
@@ -1096,34 +2674,57 @@ class ClusterUiRenderer:
             self._live_road_camera_failed = True
         return self._live_road_camera
 
+    def _select_camera_overlay_stream(self, state: ClusterUiState) -> bool:
+        overlay = getattr(state, "route_overlay", None)
+        if overlay is not None and overlay.video_rgba is not None:
+            return overlay.camera_stream == "wide"
+        live_camera = self._live_road_camera_view() if state.onroad else None
+        if live_camera is None:
+            return False
+        prefer_wide = cluster_camera_view_prefers_wide(
+            state.camera_view_mode,
+            state.speed_kph,
+            live_camera.is_wide,
+        )
+        try:
+            return bool(live_camera.select_stream(prefer_wide))
+        except Exception as exc:
+            print(f"Cluster live camera stream selection failed: {exc}", flush=True)
+            self._close_live_road_camera()
+            return False
+
     def _close_live_road_camera(self) -> None:
-        if self._live_road_camera is not None:
-            self._live_road_camera.close()
+        live_camera = getattr(self, "_live_road_camera", None)
+        if live_camera is not None:
+            live_camera.close()
             self._live_road_camera = None
 
     def _camera_overlay_content_rect(self) -> rl.Rectangle:
         sx = self.width / DESIGN_WIDTH
         sy = self.height / DESIGN_HEIGHT
         return rl.Rectangle(
-            CAMERA_BACKGROUND_X * sx,
+            (CAMERA_BACKGROUND_X + self._driving_panel_offset_design_x()) * sx,
             CAMERA_BACKGROUND_Y * sy,
             CAMERA_BACKGROUND_W * sx,
             CAMERA_BACKGROUND_H * sy,
         )
 
     @staticmethod
-    def _camera_overlay_camera(state: ClusterUiState):
+    def _camera_overlay_camera(state: ClusterUiState, wide_camera: bool = False):
         device_type = (state.camera_device_type or "").strip().lower()
         sensor = (state.camera_sensor or "").strip().lower()
         for key in ((device_type, sensor), ("unknown", sensor), (device_type, "unknown")):
             device_camera = DEVICE_CAMERAS.get(key)
             if device_camera is not None:
-                return device_camera.fcam
+                camera = device_camera.ecam if wide_camera else device_camera.fcam
+                return camera if camera.width > 0 and camera.height > 0 else device_camera.fcam
         if sensor:
             for (_, known_sensor), device_camera in DEVICE_CAMERAS.items():
                 if known_sensor == sensor:
-                    return device_camera.fcam
-        return CAMERA_OVERLAY_DEFAULT_CAMERA
+                    camera = device_camera.ecam if wide_camera else device_camera.fcam
+                    return camera if camera.width > 0 and camera.height > 0 else device_camera.fcam
+        default_device_camera = DEVICE_CAMERAS["tici", "ar0231"]
+        return default_device_camera.ecam if wide_camera else CAMERA_OVERLAY_DEFAULT_CAMERA
 
     def _camera_overlay_projection(self, state: ClusterUiState) -> CameraOverlayProjection | None:
         overlay = state.route_overlay
@@ -1134,8 +2735,13 @@ class ClusterUiRenderer:
         pitch += math.radians(self.camera_overlay_pitch_offset_deg)
 
         device_from_road = rot_from_euler([roll, pitch, yaw]).dot(np.diag([1.0, -1.0, -1.0]))
-        view_from_road = view_frame_from_device_frame.dot(device_from_road)
-        camera = self._camera_overlay_camera(state)
+        wide_camera = bool(getattr(self, "_camera_overlay_wide", False))
+        if wide_camera and state.wide_camera_from_device_euler is not None:
+            wide_from_device = rot_from_euler(state.wide_camera_from_device_euler)
+            view_from_road = view_frame_from_device_frame.dot(wide_from_device).dot(device_from_road)
+        else:
+            view_from_road = view_frame_from_device_frame.dot(device_from_road)
+        camera = self._camera_overlay_camera(state, wide_camera)
         source_width = (
             float(overlay.video_width)
             if overlay is not None and overlay.video_width > 0
@@ -1150,6 +2756,8 @@ class ClusterUiRenderer:
         calib_transform = intrinsic @ view_from_road
         kep = calib_transform @ np.array([1000.0, 0.0, 0.0])
         zoom = max(dest.width / float(camera.width), dest.height / float(camera.height))
+        if wide_camera:
+            zoom *= cluster_wide_camera_zoom_factor(state.speed_kph)
         cx = float(intrinsic[0, 2])
         cy = float(intrinsic[1, 2])
         max_x_offset = max(0.0, cx * zoom - dest.width * 0.5)
@@ -1160,12 +2768,14 @@ class ClusterUiRenderer:
             x_offset = clamp((float(kep[0]) / float(kep[2]) - cx) * zoom, -max_x_offset, max_x_offset)
             y_offset = clamp((float(kep[1]) / float(kep[2]) - cy) * zoom, -max_y_offset, max_y_offset)
         video_tx = (dest.width * 0.5 + dest.x - x_offset) - cx * zoom
-        video_ty = (dest.height * 0.5 + dest.y - y_offset) - cy * zoom
+        rendered_height = float(camera.height) * zoom
+        vertical_crop = max(0.0, rendered_height - dest.height)
+        video_ty = dest.y - y_offset - vertical_crop * CAMERA_BACKGROUND_VERTICAL_BIAS
         video_dest = rl.Rectangle(
             video_tx,
             video_ty,
             float(camera.width) * zoom,
-            float(camera.height) * zoom,
+            rendered_height,
         )
         camera_height_m = CAMERA_OVERLAY_DEFAULT_HEIGHT_M
         if state.road_transform_trans is not None and len(state.road_transform_trans) >= 3:
@@ -1184,14 +2794,15 @@ class ClusterUiRenderer:
             video_ty=video_ty,
             view_from_road=tuple(tuple(float(value) for value in row) for row in view_from_road),
             camera_height_m=camera_height_m,
+            wide_camera=wide_camera,
         )
 
-    def _project_camera_overlay_point(
+    def _camera_overlay_screen_xy(
         self,
         point: Vec3,
         projection: CameraOverlayProjection,
         scene_shift_x_m: float = 0.0,
-    ) -> rl.Vector2 | None:
+    ) -> tuple[float, float] | None:
         # Scene geometry is shifted forward for the synthetic 3D camera. Camera
         # projection uses the physical road coordinate whose origin is the ego.
         road_forward = float(point.y) - EGO_FORWARD_M
@@ -1200,16 +2811,18 @@ class ClusterUiRenderer:
         if road_forward <= CAMERA_OVERLAY_MIN_DEPTH_M:
             return None
 
-        matrix = projection.view_from_road
-        view_x = matrix[0][0] * road_forward + matrix[0][1] * road_left + matrix[0][2] * road_up
+        row_x, row_y, row_z = projection.view_from_road
+        view_x = row_x[0] * road_forward + row_x[1] * road_left + row_x[2] * road_up
         view_y = (
-            matrix[1][0] * road_forward
-            + matrix[1][1] * road_left
-            + matrix[1][2] * road_up
+            row_y[0] * road_forward
+            + row_y[1] * road_left
+            + row_y[2] * road_up
             + projection.camera_height_m
         )
-        view_z = matrix[2][0] * road_forward + matrix[2][1] * road_left + matrix[2][2] * road_up
-        if view_z <= CAMERA_OVERLAY_MIN_DEPTH_M or not all(math.isfinite(value) for value in (view_x, view_y, view_z)):
+        view_z = row_z[0] * road_forward + row_z[1] * road_left + row_z[2] * road_up
+        if view_z <= CAMERA_OVERLAY_MIN_DEPTH_M or not (
+            math.isfinite(view_x) and math.isfinite(view_y) and math.isfinite(view_z)
+        ):
             return None
 
         camera_x = projection.focal_length * view_x / view_z + projection.camera_width * 0.5
@@ -1224,10 +2837,16 @@ class ClusterUiRenderer:
             or screen_y > projection.dest.y + projection.dest.height + clip_margin
         ):
             return None
-        return rl.Vector2(screen_x, screen_y)
+        return screen_x, screen_y
 
-    def _draw_camera_projected_overlay(self, scene: ClusterScene, state: ClusterUiState) -> None:
-        projection = self._camera_overlay_projection(state)
+    def _draw_camera_projected_overlay(
+        self,
+        scene: ClusterScene,
+        state: ClusterUiState,
+        projection: CameraOverlayProjection | None = None,
+    ) -> None:
+        if projection is None:
+            projection = self._camera_overlay_projection(state)
         if projection is None:
             return
 
@@ -1238,6 +2857,7 @@ class ClusterUiRenderer:
             int(round(projection.dest.height)),
         )
         try:
+            profile_stage = self._profile_start()
             for strip in scene.highlight_lanes:
                 self._draw_camera_overlay_strip(strip, projection, scene.scene_shift_x_m)
             for strip in scene.road_edges:
@@ -1246,10 +2866,20 @@ class ClusterUiRenderer:
                 self._draw_camera_overlay_strip(strip, projection, scene.scene_shift_x_m)
             for strip in scene.planned_path:
                 self._draw_camera_overlay_strip(strip, projection, scene.scene_shift_x_m)
+            self._profile_add("render_world.camera_projected_overlay.strips", profile_stage)
+            profile_stage = self._profile_start()
             for point in scene.radar_points:
                 self._draw_camera_overlay_radar_point(point, projection, scene.scene_shift_x_m, state.radar_info_mode)
+            self._profile_add("render_world.camera_projected_overlay.radar", profile_stage)
+            profile_stage = self._profile_start()
+            metric_labels: list[VehicleMetricLabel] = []
             for vehicle in sorted(scene.vehicles, key=self._camera_overlay_vehicle_draw_key):
-                self._draw_camera_overlay_vehicle(vehicle, projection, scene.scene_shift_x_m, state.radar_info_mode)
+                self._draw_camera_overlay_vehicle(vehicle, projection, scene.scene_shift_x_m, state.radar_info_mode, metric_labels)
+            self._draw_vehicle_metric_labels(metric_labels, (
+                projection.dest.x, projection.dest.y,
+                projection.dest.x + projection.dest.width, projection.dest.y + projection.dest.height,
+            ))
+            self._profile_add("render_world.camera_projected_overlay.vehicles", profile_stage)
         finally:
             rl.end_scissor_mode()
 
@@ -1263,15 +2893,74 @@ class ClusterUiRenderer:
         if count < 2:
             return
         color = rl_color(strip.color)
-        for index in range(count - 1):
-            left0 = self._project_camera_overlay_point(strip.left[index], projection, scene_shift_x_m + strip.x_offset_m)
-            right0 = self._project_camera_overlay_point(strip.right[index], projection, scene_shift_x_m + strip.x_offset_m)
-            left1 = self._project_camera_overlay_point(strip.left[index + 1], projection, scene_shift_x_m + strip.x_offset_m)
-            right1 = self._project_camera_overlay_point(strip.right[index + 1], projection, scene_shift_x_m + strip.x_offset_m)
-            if left0 is None or right0 is None or left1 is None or right1 is None:
+        points = self._camera_overlay_strip_point_buffer(count * 2)
+        pair_visible = self._camera_overlay_strip_visibility_buffer(count)
+        x_offset_m = scene_shift_x_m + strip.x_offset_m
+        project_point = self._camera_overlay_screen_xy
+        left_points = strip.left
+        right_points = strip.right
+        for index in range(count):
+            pair_visible[index] = 0
+            left = project_point(left_points[index], projection, x_offset_m)
+            right = project_point(right_points[index], projection, x_offset_m)
+            if left is None or right is None:
                 continue
+            left_point = points[index * 2]
+            left_point.x, left_point.y = left
+            right_point = points[index * 2 + 1]
+            right_point.x, right_point.y = right
+            pair_visible[index] = 1
+
+        draw_triangle_strip = getattr(self, "_raw_draw_triangle_strip_2d", None)
+        if draw_triangle_strip is not None:
+            point_ptr = rl.ffi.cast("struct Vector2 *", points)
+            index = 0
+            while index < count:
+                # Split at rejected endpoint pairs so batching cannot bridge a
+                # gap that the legacy per-segment clipping left empty.
+                while index < count and not pair_visible[index]:
+                    index += 1
+                start = index
+                while index < count and pair_visible[index]:
+                    index += 1
+                pair_count = index - start
+                if pair_count >= 2:
+                    # L0,R0,L1,R1 expands to the same two triangles and
+                    # winding as the legacy DrawTriangle pair below.
+                    draw_triangle_strip(point_ptr + start * 2, pair_count * 2, color)
+            return
+
+        for index in range(count - 1):
+            if not pair_visible[index] or not pair_visible[index + 1]:
+                continue
+            left0 = points[index * 2]
+            right0 = points[index * 2 + 1]
+            left1 = points[(index + 1) * 2]
+            right1 = points[(index + 1) * 2 + 1]
             rl.draw_triangle(left0, right0, right1, color)
             rl.draw_triangle(left0, right1, left1, color)
+
+    def _camera_overlay_strip_point_buffer(self, point_count: int):
+        capacity = getattr(self, "_camera_overlay_strip_point_capacity", 0)
+        points = getattr(self, "_camera_overlay_strip_points", None)
+        if points is not None and capacity >= point_count:
+            return points
+
+        capacity = 1 << max(0, point_count - 1).bit_length()
+        points = rl.ffi.new("struct Vector2[]", capacity)
+        self._camera_overlay_strip_points = points
+        self._camera_overlay_strip_point_capacity = capacity
+        return points
+
+    def _camera_overlay_strip_visibility_buffer(self, pair_count: int) -> bytearray:
+        pair_visible = getattr(self, "_camera_overlay_strip_pair_visibility", None)
+        if pair_visible is None:
+            pair_visible = bytearray()
+        if len(pair_visible) < pair_count:
+            capacity = 1 << max(0, pair_count - 1).bit_length()
+            pair_visible.extend(bytes(capacity - len(pair_visible)))
+        self._camera_overlay_strip_pair_visibility = pair_visible
+        return pair_visible
 
     def _draw_camera_overlay_vehicle(
         self,
@@ -1279,8 +2968,9 @@ class ClusterUiRenderer:
         projection: CameraOverlayProjection,
         scene_shift_x_m: float,
         radar_info_mode: int,
+        metric_labels: list[VehicleMetricLabel] | None = None,
     ) -> None:
-        self._draw_camera_overlay_vehicle_coin(vehicle, projection, scene_shift_x_m, radar_info_mode)
+        self._draw_camera_overlay_vehicle_frame(vehicle, projection, scene_shift_x_m, radar_info_mode, metric_labels)
 
     @staticmethod
     def _camera_overlay_vehicle_draw_key(vehicle: VehicleBox) -> tuple[int, float]:
@@ -1295,16 +2985,17 @@ class ClusterUiRenderer:
             priority = 2
         return priority, -vehicle_distance_m(vehicle)
 
-    def _draw_camera_overlay_vehicle_coin(
+    def _draw_camera_overlay_vehicle_frame(
         self,
         vehicle: VehicleBox,
         projection: CameraOverlayProjection,
         scene_shift_x_m: float,
         radar_info_mode: int,
+        metric_labels: list[VehicleMetricLabel] | None = None,
     ) -> None:
         center_y_m = vehicle.center.y + RADAR_TO_CAMERA_M + VEHICLE_LENGTH_M
-        base_z = 0.025
-        center = self._project_camera_overlay_point(
+        base_z = CAMERA_OVERLAY_VEHICLE_ROAD_HEIGHT_M
+        center = self._camera_overlay_screen_xy(
             Vec3(vehicle.center.x, center_y_m, base_z),
             projection,
             scene_shift_x_m,
@@ -1316,83 +3007,125 @@ class ClusterUiRenderer:
         lead_two = label.startswith("L2") or "CUT-IN" in label
         lead_one = label.startswith("L1") or (vehicle.primary and not lead_two)
         emphasized = vehicle.primary or vehicle.cut_in
-        radius_m = CORNER_RADAR_COIN_RADIUS_M * (1.42 if lead_two else 1.2 if emphasized else 1.0)
-        right = self._project_camera_overlay_point(
+        half_width_m = max(0.6, vehicle.width_m * 0.58)
+        frame_height_m = max(0.8, vehicle.height_m * 1.12)
+        left_base = self._camera_overlay_screen_xy(
             Vec3(
-                vehicle.center.x + vehicle.right_x * radius_m,
-                center_y_m + vehicle.right_y * radius_m,
+                vehicle.center.x - half_width_m,
+                center_y_m,
                 base_z,
             ),
             projection,
             scene_shift_x_m,
         )
-        forward = self._project_camera_overlay_point(
+        right_base = self._camera_overlay_screen_xy(
             Vec3(
-                vehicle.center.x + vehicle.forward_x * radius_m,
-                center_y_m + vehicle.forward_y * radius_m,
+                vehicle.center.x + half_width_m,
+                center_y_m,
                 base_z,
             ),
             projection,
             scene_shift_x_m,
         )
+        left_top = self._camera_overlay_screen_xy(
+            Vec3(
+                vehicle.center.x - half_width_m,
+                center_y_m,
+                base_z + frame_height_m,
+            ),
+            projection,
+            scene_shift_x_m,
+        )
+        right_top = self._camera_overlay_screen_xy(
+            Vec3(
+                vehicle.center.x + half_width_m,
+                center_y_m,
+                base_z + frame_height_m,
+            ),
+            projection,
+            scene_shift_x_m,
+        )
+        if left_base is None or right_base is None or left_top is None or right_top is None:
+            return
 
-        right_px = math.hypot(right.x - center.x, right.y - center.y) if right is not None else 16.0
-        forward_px = math.hypot(forward.x - center.x, forward.y - center.y) if forward is not None else 10.0
-        radius_x = clamp(
-            max(right_px, forward_px * 0.8),
-            12.0 if lead_two else 10.0 if emphasized else 8.0,
-            42.0 if lead_two else 36.0 if emphasized else 28.0,
+        min_x = min(left_base[0], right_base[0], left_top[0], right_top[0])
+        max_x = max(left_base[0], right_base[0], left_top[0], right_top[0])
+        min_y = min(left_base[1], right_base[1], left_top[1], right_top[1])
+        max_y = max(left_base[1], right_base[1], left_top[1], right_top[1])
+        width = max_x - min_x
+        height = max_y - min_y
+        if not (math.isfinite(width) and math.isfinite(height)) or width <= 0.0 or height <= 0.0:
+            return
+        pad_x = max(4.0, width * 0.08)
+        pad_y = max(4.0, height * 0.08)
+        frame_width = clamp(
+            width + pad_x * 2.0,
+            CAMERA_OVERLAY_FRAME_MIN_SIZE_PX,
+            projection.dest.width * CAMERA_OVERLAY_FRAME_MAX_WIDTH_RATIO,
         )
-        radius_y = clamp(
-            min(forward_px * 0.42, radius_x * 0.46),
-            5.0 if lead_two else 4.5 if emphasized else 3.5,
-            15.0 if lead_two else 13.0 if emphasized else 10.0,
+        frame_height = clamp(
+            height + pad_y * 2.0,
+            CAMERA_OVERLAY_FRAME_MIN_SIZE_PX,
+            projection.dest.height * CAMERA_OVERLAY_FRAME_MAX_HEIGHT_RATIO,
+        )
+        if frame_width > frame_height * CAMERA_OVERLAY_FRAME_MAX_ASPECT:
+            frame_width = frame_height * CAMERA_OVERLAY_FRAME_MAX_ASPECT
+        elif frame_height > frame_width * CAMERA_OVERLAY_FRAME_MAX_ASPECT:
+            frame_height = frame_width * CAMERA_OVERLAY_FRAME_MAX_ASPECT
+        frame_center_x = (min_x + max_x) * 0.5
+        frame_center_y = (min_y + max_y) * 0.5
+        available_half_width = min(
+            frame_center_x - projection.dest.x - CAMERA_OVERLAY_FRAME_EDGE_PAD_PX,
+            projection.dest.x + projection.dest.width - frame_center_x - CAMERA_OVERLAY_FRAME_EDGE_PAD_PX,
+        )
+        available_half_height = min(
+            frame_center_y - projection.dest.y - CAMERA_OVERLAY_FRAME_EDGE_PAD_PX,
+            projection.dest.y + projection.dest.height - frame_center_y - CAMERA_OVERLAY_FRAME_EDGE_PAD_PX,
+        )
+        minimum_half_size = CAMERA_OVERLAY_FRAME_MIN_SIZE_PX * 0.5
+        if available_half_width < minimum_half_size or available_half_height < minimum_half_size:
+            return
+        frame_width = min(frame_width, available_half_width * 2.0)
+        frame_height = min(frame_height, available_half_height * 2.0)
+        marker = rl.Rectangle(
+            frame_center_x - frame_width * 0.5,
+            frame_center_y - frame_height * 0.5,
+            frame_width,
+            frame_height,
         )
 
         confidence = clamp(vehicle.confidence, 0.0, 1.0)
-        fill_base, side_base, ring_base = camera_overlay_vehicle_coin_colors(vehicle, lead_one, lead_two)
-        fill_alpha = int((145 if emphasized else 120) + (95 if emphasized else 110) * confidence)
+        _fill_base, _side_base, ring_base = camera_overlay_vehicle_coin_colors(vehicle, lead_one, lead_two)
         ring_alpha = int(180 + 65 * confidence)
-
-        cx = int(round(center.x))
-        cy = int(round(center.y))
-        rx = int(round(radius_x))
-        ry = int(round(radius_y))
-        rl.draw_ellipse(cx + 1, cy + 3, rx + 3, ry + 2, rl_color((0, 0, 0), int(70 + 45 * confidence)))
-        rl.draw_ellipse(cx, cy + 1, rx + 1, ry + 1, rl_color(side_base, max(120, fill_alpha - 35)))
-        rl.draw_ellipse(cx, cy, rx, ry, rl_color(ring_base, ring_alpha))
-        rl.draw_ellipse(cx, cy, max(1, int(rx * 0.78)), max(1, int(ry * 0.70)), rl_color(fill_base, fill_alpha))
-        rl.draw_ellipse(cx - int(rx * 0.18), cy - max(1, int(ry * 0.25)), max(1, int(rx * 0.26)), max(1, int(ry * 0.28)), rl_color((245, 255, 255), int(72 + 58 * confidence)))
-        rl.draw_ellipse_lines(cx, cy, rx, ry, rl_color(ring_base, 245))
-        if emphasized:
-            rl.draw_ellipse_lines(cx, cy, rx + 4, ry + 3, rl_color(ring_base, 185))
-
-        if forward is not None:
-            end_x = center.x + (forward.x - center.x) * 0.58
-            end_y = center.y + (forward.y - center.y) * 0.58
-            rl.draw_line_ex(
-                center,
-                rl.Vector2(end_x, end_y),
-                3.0 if emphasized else 2.0,
-                rl_color((255, 255, 255), int(170 + 70 * confidence)),
-            )
+        rl.draw_rectangle_rounded_lines_ex(
+            marker,
+            0.20,
+            CAMERA_OVERLAY_FRAME_ROUND_SEGMENTS,
+            3.5 if emphasized else 3.0,
+            rl_color(ring_base, ring_alpha),
+        )
 
         label = self._vehicle_overlay_label(vehicle, radar_info_mode)
         if label:
+            label_size = LEAD_ONE_DISTANCE_FONT_SIZE if vehicle_has_lead_one_metrics(vehicle) else 17 if emphasized else 15
             label_color = (*ring_base[:3], 255 if vehicle.primary or vehicle.cut_in else 230)
-            label_y = center.y - radius_y - 16.0
+            label_y = marker.y - 12.0
             if lead_one:
-                label_y = center.y - radius_y - 22.0
+                label_y = marker.y - 18.0
             elif lead_two:
-                label_y = center.y + radius_y + 16.0
-            self._draw_world_label_text(
-                label,
-                center.x,
-                max(14.0, label_y),
-                17 if emphasized else 15,
+                label_y = marker.y + marker.height + 16.0
+            metric = VehicleMetricLabel(
+                vehicle,
+                (VehicleMetricLine(label, marker.x + marker.width * 0.5, max(14.0, label_y), label_size),),
                 label_color,
-                anchor="center",
             )
+            if metric_labels is None:
+                self._draw_vehicle_metric_labels([metric], (
+                    projection.dest.x, projection.dest.y,
+                    projection.dest.x + projection.dest.width, projection.dest.y + projection.dest.height,
+                ))
+            else:
+                metric_labels.append(metric)
 
     def _vehicle_overlay_label(self, vehicle: VehicleBox, radar_info_mode: int) -> str:
         parts: list[str] = []
@@ -1402,9 +3135,9 @@ class ClusterUiRenderer:
             if not (label.startswith("L1") or label.startswith("L2") or "CUT-IN" in label):
                 parts.append(vehicle.label)
         if (stopped or radar_info_shows_distance(radar_info_mode)) and vehicle.longitudinal_m is not None:
-            parts.append(f"{vehicle.longitudinal_m:.0f} m")
+            parts.append(format_radar_distance(vehicle.longitudinal_m, self.is_metric))
         if not stopped and radar_info_shows_speed(radar_info_mode) and vehicle.absolute_speed_kph is not None:
-            parts.append(f"{vehicle.absolute_speed_kph:.0f} km/h")
+            parts.append(f"{display_speed(vehicle.absolute_speed_kph, self.is_metric):.0f} {speed_unit(self.is_metric)}")
         return " ".join(parts)
 
     def _draw_camera_overlay_radar_point(
@@ -1415,20 +3148,33 @@ class ClusterUiRenderer:
         radar_info_mode: int,
     ) -> None:
         camera_point = Vec3(point.center.x, point.center.y + RADAR_TO_CAMERA_M, point.center.z)
-        screen = self._project_camera_overlay_point(camera_point, projection, scene_shift_x_m)
+        screen = self._camera_overlay_screen_xy(camera_point, projection, scene_shift_x_m)
         if screen is None:
             return
-        radius = max(3.0, min(10.0, 80.0 / max(6.0, point.longitudinal_m)))
-        rl.draw_circle_v(screen, radius, rl_color(point.color, 190))
+        radius = max(2.5, min(5.0, 40.0 / max(6.0, abs(point.longitudinal_m))))
+        marker = rl.Rectangle(
+            screen[0] - radius,
+            screen[1] - radius,
+            radius * 2.0,
+            radius * 2.0,
+        )
+        rl.draw_rectangle_rec(marker, rl_color(point.color, 225))
         if not radar_info_shows_radar_points(radar_info_mode):
             return
         label_parts = []
         if radar_info_shows_distance(radar_info_mode):
-            label_parts.append(f"{point.longitudinal_m:.0f} m")
+            label_parts.append(format_radar_distance(point.longitudinal_m, self.is_metric))
         if point.absolute_speed_kph is not None:
-            label_parts.append(f"{point.absolute_speed_kph:.0f} km/h")
+            label_parts.append(f"{display_speed(point.absolute_speed_kph, self.is_metric):.0f} {speed_unit(self.is_metric)}")
         if label_parts:
-            self._draw_world_label_text(" ".join(label_parts), screen.x, screen.y - 16.0, 15, (*WHITE[:3], 220), anchor="center")
+            self._draw_world_label_text(
+                " ".join(label_parts),
+                screen[0],
+                screen[1] - 16.0,
+                15,
+                (*WHITE[:3], 220),
+                anchor="center",
+            )
 
     def render_to_file(self, state: ClusterUiState, output_path: str | Path) -> None:
         image = self._render_to_image(state)
@@ -1525,6 +3271,10 @@ class ClusterUiRenderer:
         byte_count: int,
         buffer: bytearray | None = None,
         flip_x: bool = False,
+        destination_address: int | None = None,
+        destination_size: int = 0,
+        async_readback: bool = False,
+        destination_dmabuf_fd: int | None = None,
     ) -> Iterator[object]:
         self.open(hidden=self.hidden)
         output_width = int(output_width)
@@ -1541,6 +3291,7 @@ class ClusterUiRenderer:
         if uv_offset < stride * y_scanlines or byte_count < uv_offset + stride * uv_scanlines:
             raise RuntimeError("NV12 render target byte layout is inconsistent")
 
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         target = self._get_capture_target()
         self._profile_add("render_to_nv12.get_capture_target", profile_stage)
@@ -1550,6 +3301,7 @@ class ClusterUiRenderer:
         self.render(state)
         rl.end_texture_mode()
         self._profile_add("render_to_nv12.draw_to_target", profile_stage)
+        self._flush_pending_stroked_text_textures()
 
         profile_stage = self._profile_start()
         upload_target = self._get_portrait_upload_target(output_width, output_height)
@@ -1582,6 +3334,12 @@ class ClusterUiRenderer:
         self._profile_add("render_to_nv12.gpu_upload_transform", profile_stage)
 
         pack_direct_input = stride % 4 == 0 and byte_count % stride == 0 and uv_offset % stride == 0
+        if (destination_address is not None or async_readback or destination_dmabuf_fd is not None) and not pack_direct_input:
+            raise DirectNv12ReadbackError("direct NV12 readback requires a four-byte packed Venus layout")
+        if destination_address is not None and async_readback:
+            raise DirectNv12ReadbackError("asynchronous NV12 readback cannot use a direct destination")
+        if destination_dmabuf_fd is not None and (destination_address is not None or async_readback):
+            raise DirectNv12DmabufError("encoder DMA-BUF output cannot use a readback destination")
         if pack_direct_input:
             full_pack_w = stride // 4
             full_pack_h = byte_count // stride
@@ -1590,7 +3348,13 @@ class ClusterUiRenderer:
             y_pack_y = tail_pack_h + uv_scanlines
 
             profile_stage = self._profile_start()
-            full_target = self._get_nv12_pack_target("full", full_pack_w, full_pack_h)
+            if destination_dmabuf_fd is None:
+                full_target = self._get_nv12_pack_target("full", full_pack_w, full_pack_h)
+            else:
+                dmabuf_pool = self._nv12_dmabuf_pool
+                if dmabuf_pool is None:
+                    raise DirectNv12DmabufError("encoder DMA-BUF render targets are unavailable")
+                full_target = dmabuf_pool.target_for(destination_dmabuf_fd, stride, byte_count)
             self._profile_add("render_to_nv12.get_pack_targets", profile_stage)
 
             profile_stage = self._profile_start()
@@ -1623,6 +3387,43 @@ class ClusterUiRenderer:
                 clear_target=False,
             )
             self._profile_add("render_to_nv12.pack_uv_shader", profile_stage)
+
+            if destination_dmabuf_fd is not None:
+                profile_stage = self._profile_start()
+                dmabuf_pool.wait_for_gpu()
+                self._profile_add("render_to_nv12.dmabuf_fence_wait", profile_stage)
+                yield destination_dmabuf_fd
+                return
+
+            if async_readback:
+                readback = self._direct_nv12_readback
+                if readback is None or not readback.async_supported:
+                    raise DirectNv12ReadbackError("TICI GLES asynchronous NV12 readback is not available")
+                profile_stage = self._profile_start()
+                enqueued = readback.enqueue_rgba(
+                    full_target.id,
+                    full_target.texture.width,
+                    full_target.texture.height,
+                )
+                self._profile_add("render_to_nv12.readback_pbo_enqueue", profile_stage)
+                yield enqueued
+                return
+
+            if destination_address is not None:
+                readback = self._direct_nv12_readback
+                if readback is None:
+                    raise DirectNv12ReadbackError("TICI GLES direct NV12 readback is not available")
+                profile_stage = self._profile_start()
+                readback.read_rgba(
+                    full_target.id,
+                    full_target.texture.width,
+                    full_target.texture.height,
+                    destination_address,
+                    destination_size,
+                )
+                self._profile_add("render_to_nv12.readback_direct_ion", profile_stage)
+                yield destination_address
+                return
 
             profile_stage = self._profile_start()
             image = rl.load_image_from_texture(full_target.texture)
@@ -1736,6 +3537,7 @@ class ClusterUiRenderer:
         output_height: int | None = None,
     ):
         self.open(hidden=self.hidden)
+        self._prepare_trip_report_cache(state)
         profile_stage = self._profile_start()
         target = self._get_capture_target()
         self._profile_add("render_to_image.get_capture_target", profile_stage)
@@ -1745,6 +3547,7 @@ class ClusterUiRenderer:
         self.render(state)
         rl.end_texture_mode()
         self._profile_add("render_to_image.draw_to_target", profile_stage)
+        self._flush_pending_stroked_text_textures()
 
         if portrait_upload:
             profile_stage = self._profile_start()
@@ -1921,17 +3724,19 @@ class ClusterUiRenderer:
             rl.end_texture_mode()
 
     def _load_font(self):
+        glyphs = None
+        glyph_count = 0
+        base_size = 160
         for candidate in self._font_candidates():
             if candidate.exists():
                 try:
                     # Some TTFs have glyph bounds slightly taller than the requested
                     # size, which makes raylib print harmless FONT warnings at startup.
                     rl.set_trace_log_level(rl.TraceLogLevel.LOG_ERROR)
-                    font = rl.load_font_ex(str(candidate), 160, None, 0)
+                    font = rl.load_font_ex(str(candidate), base_size, glyphs, glyph_count)
                     rl.set_trace_log_level(rl.TraceLogLevel.LOG_WARNING)
                     if font.texture.id > 0:
-                        rl.gen_texture_mipmaps(font.texture)
-                        rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_TRILINEAR)
+                        rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
                         self._owns_font = True
                         return font
                 except Exception as exc:
@@ -1940,10 +3745,32 @@ class ClusterUiRenderer:
         self._owns_font = False
         return rl.get_font_default()
 
+    def _load_korean_font(self):
+        codepoints = self._navi_font_codepoints()
+        glyph_buffer = rl.ffi.new("int[]", codepoints)
+        glyphs = rl.ffi.cast("int *", glyph_buffer)
+        for candidate in self._font_candidates():
+            if not candidate.exists():
+                continue
+            try:
+                rl.set_trace_log_level(rl.TraceLogLevel.LOG_ERROR)
+                font = rl.load_font_ex(str(candidate), KOREAN_FONT_BASE_SIZE, glyphs, len(codepoints))
+                rl.set_trace_log_level(rl.TraceLogLevel.LOG_WARNING)
+                if font.texture.id > 0:
+                    rl.set_texture_filter(font.texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+                    self._owns_korean_font = True
+                    return font
+            except Exception as exc:
+                rl.set_trace_log_level(rl.TraceLogLevel.LOG_WARNING)
+                print(f"Cluster Korean font load failed for {candidate}: {exc}")
+        self._owns_korean_font = False
+        return None
+
     def _font_candidates(self) -> list[Path]:
         return [
             KAIGEN_GOTHIC_KR_BOLD_FONT_PATH,
             OPENPILOT_ADDON_FONT_DIR / "KaiGenGothicKR-Bold.ttf",
+            Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "malgun.ttf",
             JETBRAINS_MONO_FONT_PATH,
             OPENPILOT_FONT_DIR / "JetBrainsMono-Bold.ttf",
             Path("/data/openpilot/openpilot/selfdrive/assets/fonts/KaiGenGothicKR-Bold.ttf"),
@@ -1951,6 +3778,17 @@ class ClusterUiRenderer:
             Path("/usr/share/fonts/TTF/JetBrainsMono-Medium.ttf"),
             Path("/usr/local/share/fonts/JetBrainsMono-Medium.ttf"),
         ]
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _navi_font_codepoints() -> tuple[int, ...]:
+        return (
+            *range(0x20, 0x0250),
+            *range(0x2000, 0x2070),
+            0x20A9,
+            *range(0x3131, 0x3190),
+            *range(0xAC00, 0xD7A4),
+        )
 
     def _load_vehicle_model(self) -> None:
         if self._vehicle_model_load_attempted:
@@ -1976,6 +3814,103 @@ class ClusterUiRenderer:
             print(f"Cybertruck vehicle model load failed: {exc}")
             self._vehicle_model = None
 
+    def _load_park_vehicle_models(self) -> None:
+        """P/R resources never replace the normal driving model or its material."""
+        if self._park_vehicle_models_loaded:
+            return
+        self._park_vehicle_models_loaded = True
+        if PARK_VEHICLE_MODEL_PATH.exists():
+            try:
+                mesh = self._load_obj_mesh(PARK_VEHICLE_MODEL_PATH, park_materials=True)
+                rl.upload_mesh(rl.ffi.addressof(mesh), False)
+                model = rl.load_model_from_mesh(mesh)
+                if rl.is_model_valid(model):
+                    self._park_vehicle_model = model
+                    self._attach_vehicle_shader(model)
+                else:
+                    rl.unload_model(model)
+            except Exception as exc:
+                print(f"Parked EV6 fallback model load failed: {exc}")
+        self._other_vehicle_models = self._load_other_vehicle_models()
+
+    def _load_other_vehicle_models(self) -> list[object]:
+        # Lead / cut-in / confident side vehicles: every OBJ in assets/models/others (sorted), else the
+        # generic car. Any file that fails is skipped; with none loaded the original marker boxes stay.
+        paths = sorted(OTHER_VEHICLE_MODELS_DIR.glob("*.obj")) if OTHER_VEHICLE_MODELS_DIR.is_dir() else []
+        if not paths and OTHER_VEHICLE_MODEL_PATH.exists():
+            paths = [OTHER_VEHICLE_MODEL_PATH]
+        models = []
+        self._other_vehicle_paint = []
+        self._other_vehicle_names = []
+        for path in paths:
+            try:
+                mesh = self._load_obj_mesh(path, park_materials=True)
+                rl.upload_mesh(rl.ffi.addressof(mesh), False)
+                model = rl.load_model_from_mesh(mesh)
+                if not rl.is_model_valid(model):
+                    rl.unload_model(model)
+                    continue
+                shader = self._attach_vehicle_shader(model)
+                paint = None
+                if shader is not None:
+                    key = rl.ffi.new("float[]", [c / 255.0 for c in OTHER_VEHICLE_PAINT_RGB] + [1.0])
+                    rl.set_shader_value(shader, rl.get_shader_location(shader, "paintKey"), key,
+                                        rl.ShaderUniformDataType.SHADER_UNIFORM_VEC4)
+                    override_loc = rl.get_shader_location(shader, "paintOverride")
+                    if override_loc >= 0:
+                        paint = (shader, override_loc)
+                models.append(model)
+                self._other_vehicle_names.append(path.stem.removesuffix("_cluster"))
+                self._other_vehicle_paint.append(paint)
+            except Exception as exc:
+                print(f"Other vehicle model {path.name} load failed: {exc}")
+        if models:
+            print(f"Other vehicle models loaded: {len(models)}")
+        return models
+
+    def _other_model_index(self, vehicle: VehicleBox) -> int:
+        key = vehicle.model_key if vehicle.model_key >= 0 else zlib.crc32((vehicle.label or vehicle.source).encode())
+        return int(key) % len(self._other_vehicle_models)
+
+    def _set_other_paint(self, index: int, color) -> bool:
+        paint = self._other_vehicle_paint[index] if index < len(self._other_vehicle_paint) else None
+        if paint is None:
+            return False
+        shader, loc = paint
+        value = [0.0, 0.0, 0.0, 0.0] if color is None else [c / 255.0 for c in color[:3]] + [1.0]
+        rl.set_shader_value(shader, loc, rl.ffi.new("float[]", value), rl.ShaderUniformDataType.SHADER_UNIFORM_VEC4)
+        return True
+
+    def _uses_other_model(self, vehicle: VehicleBox) -> bool:
+        if not clean_ui_enabled():
+            return False
+        if not self._other_vehicle_models or vehicle.source == "radarPoint":
+            return False
+        if vehicle.primary or vehicle.cut_in:
+            return True
+        if clean_ui_enabled() and (vehicle.source in SIDE_VEHICLE_MODEL_SOURCES or vehicle.source == "carState"):
+            return True  # EV6 HUD patch v6 (carState = blind-spot car reported by the car itself)
+        return vehicle.source in SIDE_VEHICLE_MODEL_SOURCES and vehicle.confidence >= SIDE_VEHICLE_MODEL_MIN_CONFIDENCE
+
+    def _attach_vehicle_shader(self, model):
+        # One shader instance per model (UnloadModel frees its material shader).
+        # Any failure keeps raylib's default (unlit) shader, i.e. the original look.
+        try:
+            vs, fs = vehicle_shader_sources(int(rl.rl_get_version()))
+            shader = rl.load_shader_from_memory(vs, fs)
+            if not rl.is_shader_valid(shader):
+                return None
+            light = rl.ffi.new("float[]", list(VEHICLE_LIGHT_DIR))
+            rl.set_shader_value(shader, rl.get_shader_location(shader, "lightDir"), light,
+                                rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
+            for index in range(int(model.materialCount)):
+                model.materials[index].shader = shader
+            self._vehicle_shaders.append((shader, rl.get_shader_location(shader, "viewPos")))
+            return shader
+        except Exception as exc:
+            print(f"Vehicle shader setup failed, using unlit model: {exc}")
+            return None
+
     def _load_follow_vehicle_texture(self) -> None:
         if self._follow_vehicle_texture is not None:
             return
@@ -1984,12 +3919,23 @@ class ClusterUiRenderer:
     def _load_drive_status_textures(self) -> None:
         if self._speed_bg_texture is None:
             self._speed_bg_texture = self._load_icon_texture(SPEED_BG_PATH, "Speed background")
+        if self._traffic_red_texture is None:
+            self._traffic_red_texture = self._load_alpha_cropped_icon_texture(TRAFFIC_RED_ICON_PATH, "Red traffic light")
+        if self._traffic_green_texture is None:
+            self._traffic_green_texture = self._load_alpha_cropped_icon_texture(
+                TRAFFIC_GREEN_ICON_PATH,
+                "Green traffic light",
+            )
         if self._lfa_texture is None:
             self._lfa_texture = self._load_icon_texture(LFA_ICON_PATH, "LFA")
         if self._lfa_active_texture is None:
             self._lfa_active_texture = self._load_lfa_active_texture()
+        if self._lfa_lane_texture is None:
+            self._lfa_lane_texture = self._load_icon_texture(LFA_LANE_ICON_PATH, "LFA lane mode")
         if self._wifi_texture is None:
             self._wifi_texture = self._load_icon_texture(WIFI_ICON_PATH, "Wi-Fi")
+        if self._tpms_car_texture is None:
+            self._tpms_car_texture = self._load_icon_texture(TPMS_CAR_ICON_PATH, "TPMS toy car")
 
     def _load_icon_texture(self, path: Path, label: str):
         if not path.exists():
@@ -2003,6 +3949,50 @@ class ClusterUiRenderer:
         except Exception as exc:
             print(f"{label} icon load failed: {exc}")
             return None
+
+    def _load_alpha_cropped_icon_texture(self, path: Path, label: str):
+        if not path.exists():
+            return None
+        image = None
+        try:
+            image = rl.load_image(str(path))
+            if not rl.is_image_valid(image):
+                return None
+            if image.format != rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8:
+                rl.image_format(image, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_R8G8B8A8)
+
+            data = rl.ffi.cast("unsigned char *", image.data)
+            min_x, min_y = image.width, image.height
+            max_x = max_y = -1
+            for y in range(image.height):
+                for x in range(image.width):
+                    if int(data[(y * image.width + x) * 4 + 3]) <= 8:
+                        continue
+                    min_x = min(min_x, x)
+                    min_y = min(min_y, y)
+                    max_x = max(max_x, x)
+                    max_y = max(max_y, y)
+            if max_x < min_x or max_y < min_y:
+                return None
+
+            padding = 2
+            min_x = max(0, min_x - padding)
+            min_y = max(0, min_y - padding)
+            max_x = min(image.width - 1, max_x + padding)
+            max_y = min(image.height - 1, max_y + padding)
+            rl.image_crop(image, rl.Rectangle(min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+
+            texture = rl.load_texture_from_image(image)
+            if texture.id <= 0:
+                return None
+            rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+            return texture
+        except Exception as exc:
+            print(f"{label} icon load failed: {exc}")
+            return None
+        finally:
+            if image is not None and rl.is_image_valid(image):
+                rl.unload_image(image)
 
     def _load_lfa_active_texture(self):
         if not LFA_ICON_PATH.exists():
@@ -2042,7 +4032,7 @@ class ClusterUiRenderer:
             if image is not None and rl.is_image_valid(image):
                 rl.unload_image(image)
 
-    def _load_obj_mesh(self, path: Path):
+    def _load_obj_mesh(self, path: Path, *, park_materials: bool = False):
         vertices: list[tuple[float, float, float]] = []
         normals: list[tuple[float, float, float]] = []
         mesh_vertices: list[float] = []
@@ -2088,7 +4078,8 @@ class ClusterUiRenderer:
             elif tag == "vn" and len(parts) >= 4:
                 normals.append((float(parts[1]), float(parts[2]), float(parts[3])))
             elif tag == "usemtl" and len(parts) >= 2:
-                material_color = VEHICLE_MATERIAL_COLORS.get(parts[1], DEFAULT_VEHICLE_MATERIAL_COLOR)
+                material_color = (vehicle_material_color(parts[1]) if park_materials
+                                  else VEHICLE_MATERIAL_COLORS.get(parts[1], DEFAULT_VEHICLE_MATERIAL_COLOR))
             elif tag == "f" and len(parts) >= 4:
                 face = [parse_face_token(token) for token in parts[1:]]
                 for index in range(1, len(face) - 1):
@@ -2115,15 +4106,15 @@ class ClusterUiRenderer:
         return mesh
 
     def _alloc_float_array(self, values: list[float]):
-        data = rl.ffi.cast("float *", rl.mem_alloc(len(values) * rl.ffi.sizeof("float")))
-        for index, value in enumerate(values):
-            data[index] = value
+        raw = np.asarray(values, dtype=np.float32).tobytes()
+        data = rl.ffi.cast("float *", rl.mem_alloc(len(raw)))
+        rl.ffi.memmove(data, raw, len(raw))
         return data
 
     def _alloc_uchar_array(self, values: list[int]):
-        data = rl.ffi.cast("unsigned char *", rl.mem_alloc(len(values) * rl.ffi.sizeof("unsigned char")))
-        for index, value in enumerate(values):
-            data[index] = int(value)
+        raw = np.asarray(values, dtype=np.uint8).tobytes()
+        data = rl.ffi.cast("unsigned char *", rl.mem_alloc(len(raw)))
+        rl.ffi.memmove(data, raw, len(raw))
         return data
 
     def _draw_scene(self, scene: ClusterScene, state: ClusterUiState) -> None:
@@ -2134,6 +4125,18 @@ class ClusterUiRenderer:
             scene.camera.fovy_deg,
             rl.CameraProjection.CAMERA_PERSPECTIVE,
         )
+        view_shift_x = self._world_view_shift_x(state)
+        driving_offset_x = 0.0
+        if abs(view_shift_x) > 0.001:
+            driving_offset_x = self._driving_panel_offset_design_x() * self.width / DESIGN_WIDTH
+        scene_offset_x = driving_offset_x - view_shift_x
+        if abs(scene_offset_x) > 0.001:
+            rl.rl_viewport(int(round(scene_offset_x)), 0, self.width, self.height)
+        if clean_ui_enabled() and self._vehicle_shaders:
+            view_pos = rl.ffi.new("float[]", [float(camera.position.x), float(camera.position.y), float(camera.position.z)])
+            for vehicle_shader, view_loc in self._vehicle_shaders:
+                if view_loc >= 0:
+                    rl.set_shader_value(vehicle_shader, view_loc, view_pos, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
         profile_stage = self._profile_start()
         rl.begin_mode_3d(camera)
         self._profile_add("draw_scene.begin_mode_3d", profile_stage)
@@ -2141,6 +4144,8 @@ class ClusterUiRenderer:
         if abs(scene.scene_shift_x_m) > 0.0001:
             rl.rl_translatef(scene.scene_shift_x_m, 0.0, 0.0)
         try:
+            if clean_ui_enabled():
+                self._draw_ground()  # EV6 HUD patch v5
             profile_stage = self._profile_start()
             for strip in scene.highlight_lanes:
                 self._draw_strip(strip)
@@ -2154,12 +4159,19 @@ class ClusterUiRenderer:
                 self._draw_strip(strip)
             self._profile_add("draw_scene.lane_markings", profile_stage)
             profile_stage = self._profile_start()
+            path_grey = clean_ui_enabled() and state.lfa_active is False  # EV6 HUD patch v6
             for strip in scene.planned_path:
+                if path_grey:
+                    r, g, b = strip.color[:3]
+                    lum = int(0.30 * r + 0.59 * g + 0.11 * b)
+                    lum = int(lum * 0.55 + 70)
+                    strip = replace(strip, color=(lum, lum, lum, strip.color[3] if len(strip.color) > 3 else 255))
                 self._draw_strip(strip)
             self._profile_add("draw_scene.planned_path", profile_stage)
             profile_stage = self._profile_start()
-            for point in scene.radar_points:
-                self._draw_radar_point(point)
+            if not clean_ui_enabled():  # EV6 HUD patch v6
+                for point in scene.radar_points:
+                    self._draw_radar_point(point)
             self._profile_add("draw_scene.radar_points", profile_stage)
             profile_stage = self._profile_start()
             for vehicle in scene.vehicles:
@@ -2170,75 +4182,237 @@ class ClusterUiRenderer:
         profile_stage = self._profile_start()
         rl.end_mode_3d()
         self._profile_add("draw_scene.end_mode_3d", profile_stage)
-        profile_stage = self._profile_start()
-        self._draw_radar_point_labels(
-            scene.radar_points,
-            camera,
-            scene.scene_shift_x_m,
-            state.radar_info_mode,
-        )
-        self._profile_add("draw_scene.radar_labels", profile_stage)
-        profile_stage = self._profile_start()
-        self._draw_vehicle_badges(
-            scene.vehicles,
-            camera,
-            scene.scene_shift_x_m,
-            state.radar_info_mode,
-            state.radar_source_color_mode,
-        )
-        self._profile_add("draw_scene.vehicle_badges", profile_stage)
-        if scene.vehicles:
-            self._draw_ego_tpms(scene.vehicles[0], state.tpms, camera, scene.scene_shift_x_m)
+        if abs(scene_offset_x) > 0.001:
+            rl.rl_viewport(0, 0, self.width, self.height)
+            rl.rl_push_matrix()
+            rl.rl_translatef(scene_offset_x, 0.0, 0.0)
+        try:
+            profile_stage = self._profile_start()
+            self._draw_radar_point_labels(
+                () if clean_ui_enabled() else scene.radar_points,  # EV6 HUD patch v6
+                camera,
+                scene.scene_shift_x_m,
+                state.radar_info_mode,
+            )
+            self._profile_add("draw_scene.radar_labels", profile_stage)
+            profile_stage = self._profile_start()
+            self._draw_vehicle_badges(
+                scene.vehicles,
+                camera,
+                scene.scene_shift_x_m,
+                state.radar_info_mode,
+                state.radar_source_color_mode,
+            )
+            self._profile_add("draw_scene.vehicle_badges", profile_stage)
+        finally:
+            if abs(scene_offset_x) > 0.001:
+                rl.rl_pop_matrix()
 
-    def _draw_ego_tpms(
-        self,
-        vehicle: VehicleBox,
-        tpms: TpmsInfo,
-        camera,
-        scene_shift_x_m: float,
-    ) -> None:
+    def _draw_ground(self) -> None:
+        # Flat ground plane that fades into the background colour towards the horizon.
+        theme = self._current_theme()
+        near = GROUND_DARK_RGB if theme.is_dark else GROUND_LIGHT_RGB
+        far = tuple(theme.bg[:3])
+        half_w = GROUND_HALF_WIDTH_M
+        rl.rl_begin(rl.RL_TRIANGLES)
+        for index in range(len(GROUND_ROWS_M) - 1):
+            y0, y1 = GROUND_ROWS_M[index], GROUND_ROWS_M[index + 1]
+            c0 = [int(round(n + (f - n) * GROUND_FADE[index])) for n, f in zip(near, far, strict=True)]
+            c1 = [int(round(n + (f - n) * GROUND_FADE[index + 1])) for n, f in zip(near, far, strict=True)]
+            for x, y, c in ((-half_w, y0, c0), (half_w, y0, c0), (half_w, y1, c1),
+                            (-half_w, y0, c0), (half_w, y1, c1), (-half_w, y1, c1)):
+                rl.rl_color4ub(c[0], c[1], c[2], 255)
+                rl.rl_vertex3f(x, y, GROUND_Z_M)
+        rl.rl_end()
+
+    def _world_view_shift_x(self, state: ClusterUiState) -> float:
+        screen_mode = self._effective_screen_mode(state)
+        if cluster_camera_view_is_road_camera(state.camera_view_mode):
+            return 0.0
+        if screen_mode in (
+            CLUSTER_SCREEN_MODE_DEBUG,
+            CLUSTER_SCREEN_MODE_DEBUG_SYSTEM,
+            CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
+            CLUSTER_SCREEN_MODE_TRIP_REPORT,
+            CLUSTER_SCREEN_MODE_NAV_MODEL,
+        ):
+            return NAVI_WORLD_VIEW_SHIFT_X * self.width / DESIGN_WIDTH
+        if screen_mode != CLUSTER_SCREEN_MODE_DEFAULT:
+            return 0.0
+        navi_panel_visible = bool(
+            self._navi_live_panel_visible(state.navi_live)
+            or self._navi_map_frame_present(state.navi_dashboard)
+            or state.navi_dashboard is not None
+        )
+        if not navi_panel_visible:
+            return 0.0
+        return NAVI_WORLD_VIEW_SHIFT_X * self.width / DESIGN_WIDTH
+
+    def _world_view_shift_design_x(self, state: ClusterUiState) -> float:
+        if self.width <= 0:
+            return 0.0
+        return self._world_view_shift_x(state) * DESIGN_WIDTH / self.width
+
+    def _turn_signal_center_x_offset(self, state: ClusterUiState, side: str) -> float:
+        signal_center_x = (
+            LANE_TURN_SIGNAL_LEFT_CENTER_X if side == "left" else LANE_TURN_SIGNAL_RIGHT_CENTER_X
+        )
+        if self._effective_screen_mode(state) == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
+            return 0.0
+        if cluster_camera_view_is_road_camera(state.camera_view_mode):
+            camera_signal_center_x = CAMERA_BACKGROUND_X + signal_center_x * CAMERA_BACKGROUND_W / DESIGN_WIDTH
+            return camera_signal_center_x - signal_center_x
+        view_shift_x = self._world_view_shift_design_x(state)
+        if self._panel_swap_active() and abs(view_shift_x) <= 0.001:
+            view_shift_x = NAVI_WORLD_VIEW_SHIFT_X
+        return -view_shift_x
+
+    def _draw_tpms_status(self, state: ClusterUiState) -> None:
+        if clean_ui_enabled():
+            self._draw_clean_tpms(state)  # EV6 HUD patch v6
+            return
+        tpms = state.tpms
         pressures = (tpms.fl, tpms.fr, tpms.rl, tpms.rr)
         if not any(value is not None for value in pressures):
             return
 
-        lateral_m = vehicle.width_m * 0.60
-        longitudinal_m = vehicle.length_m * 0.31
-        wheels = (
-            (-lateral_m, longitudinal_m, tpms.fl),
-            (lateral_m, longitudinal_m, tpms.fr),
-            (-lateral_m, -longitudinal_m, tpms.rl),
-            (lateral_m, -longitudinal_m, tpms.rr),
-        )
-        for local_x, local_y, pressure in wheels:
-            anchor = rl.Vector3(
-                vehicle.center.x + vehicle.right_x * local_x + vehicle.forward_x * local_y + scene_shift_x_m,
-                vehicle.center.y + vehicle.right_y * local_x + vehicle.forward_y * local_y,
-                0.25,
-            )
-            screen = world_to_screen_label_anchor(anchor, camera, self.width, self.height)
-            if screen is None:
-                continue
+        if not self._draw_tpms_car_icon():
+            self._draw_tpms_car_fallback()
 
-            center_x = clamp(screen.x + (-18.0 if local_x < 0.0 else 18.0), TPMS_BADGE_WIDTH * 0.5 + 4.0, self.width - TPMS_BADGE_WIDTH * 0.5 - 4.0)
-            center_y = clamp(screen.y, TPMS_BADGE_HEIGHT * 0.5 + 4.0, self.height - TPMS_BADGE_HEIGHT * 0.5 - 4.0)
-            low = pressure is not None and pressure < TPMS_LOW_PRESSURE_PSI
-            text = "--" if pressure is None else f"{pressure:.0f}"
-            outline = (*RED, 235) if low else (105, 214, 242, 210)
-            text_color = (*RED, 255) if low else (245, 250, 255, 255)
-            if pressure is None:
-                outline = (120, 130, 140, 170)
-                text_color = (175, 182, 190, 220)
+        badge_positions = (
+            (
+                TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+                tpms.fl,
+            ),
+            (
+                TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+                tpms.fr,
+            ),
+            (
+                TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+                tpms.rl,
+            ),
+            (
+                TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+                tpms.rr,
+            ),
+        )
+        for center_x, center_y, pressure in badge_positions:
+            self._draw_compact_tpms_value(pressure, center_x, center_y)
+
+    def _draw_tpms_car_icon(self) -> bool:
+        texture = getattr(self, "_tpms_car_texture", None)
+        if texture is None:
+            return False
+        source = rl.Rectangle(0.0, 0.0, float(texture.width), float(texture.height))
+        destination = rl.Rectangle(
+            TPMS_STATUS_CENTER_X - TPMS_STATUS_ICON_W * 0.5,
+            TPMS_STATUS_CAR_CENTER_Y - TPMS_STATUS_ICON_H * 0.5,
+            TPMS_STATUS_ICON_W,
+            TPMS_STATUS_ICON_H,
+        )
+        rl.draw_texture_pro(
+            texture,
+            source,
+            destination,
+            rl.Vector2(0.0, 0.0),
+            0.0,
+            rl_color(WHITE),
+        )
+        return True
+
+    def _draw_tpms_car_fallback(self) -> None:
+        theme = self._current_theme()
+        if theme.is_dark:
+            body_fill = (0, 0, 0, 255)
+            body_outline = (214, 224, 231, 237)
+            glass_fill = (70, 190, 224, 220)
+        else:
+            body_fill = (245, 248, 252, 255)
+            body_outline = (112, 124, 134, 237)
+            glass_fill = (75, 185, 216, 220)
+        wheel_fill = (5, 9, 12, 247)
+        wheel_outline = (180, 192, 201, 235)
+
+        car_x = TPMS_STATUS_CENTER_X - TPMS_STATUS_CAR_W * 0.5
+        car_y = TPMS_STATUS_CAR_CENTER_Y - TPMS_STATUS_CAR_H * 0.5
+        wheel_centers = (
+            (
+                TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+            ),
+            (
+                TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+            ),
+            (
+                TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+            ),
+            (
+                TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+                TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+            ),
+        )
+        for wheel_center_x, wheel_center_y in wheel_centers:
             self._rounded_rect(
-                center_x - TPMS_BADGE_WIDTH * 0.5,
-                center_y - TPMS_BADGE_HEIGHT * 0.5,
-                TPMS_BADGE_WIDTH,
-                TPMS_BADGE_HEIGHT,
-                8.0,
-                (8, 15, 22, 218),
-                outline,
-                1.5,
+                wheel_center_x - TPMS_STATUS_WHEEL_W * 0.5,
+                wheel_center_y - TPMS_STATUS_WHEEL_H * 0.5,
+                TPMS_STATUS_WHEEL_W,
+                TPMS_STATUS_WHEEL_H,
+                7.0,
+                wheel_fill,
+                wheel_outline,
+                1.4,
             )
-            self._draw_text(text, center_x, center_y, TPMS_BADGE_FONT_SIZE, text_color, anchor="center")
+
+        self._rounded_rect(
+            car_x,
+            car_y,
+            TPMS_STATUS_CAR_W,
+            TPMS_STATUS_CAR_H,
+            6.5,
+            body_fill,
+            body_outline,
+            2.0,
+        )
+        self._rounded_rect(
+            car_x + 6.0,
+            car_y + 10.0,
+            TPMS_STATUS_CAR_W - 12.0,
+            21.0,
+            5.0,
+            glass_fill,
+            body_outline,
+            1.2,
+        )
+        rl.draw_line_ex(
+            rl.Vector2(car_x + 6.0, car_y + 56.0),
+            rl.Vector2(car_x + TPMS_STATUS_CAR_W - 6.0, car_y + 56.0),
+            1.5,
+            rl_color(body_outline),
+        )
+
+    def _draw_compact_tpms_value(self, pressure: float | None, center_x: float, center_y: float) -> None:
+        low = pressure is not None and pressure < TPMS_LOW_PRESSURE_PSI
+        text = "--" if pressure is None else f"{pressure:.0f}"
+        color = RED if low else WHITE
+        if pressure is None:
+            color = (170, 180, 188, 255)
+        self._draw_text_with_stroke(
+            text,
+            center_x,
+            center_y,
+            TPMS_STATUS_FONT_SIZE,
+            color,
+            (0, 0, 0, 255),
+            2,
+            anchor="center",
+        )
 
     def _draw_strip(self, strip: MeshStrip) -> None:
         count = min(len(strip.left), len(strip.right))
@@ -2314,7 +4488,7 @@ class ClusterUiRenderer:
             and not source_marker
             and (not vehicle.source or vehicle.primary or vehicle.cut_in)
         )
-        if use_model:
+        if use_model or self._uses_other_model(vehicle):  # EV6 HUD patch v3: realistic 3D cars
             self._draw_vehicle_shadow(vehicle)
             self._draw_vehicle_model(vehicle)
             return
@@ -2400,8 +4574,16 @@ class ClusterUiRenderer:
                 continue
             if profile_enabled:
                 layout_stage = time.perf_counter()
-            distance = radar_point_distance_label(point) if radar_info_shows_distance(radar_info_mode) else ""
-            speed = radar_point_speed_label(point) if radar_info_shows_speed(radar_info_mode) else ""
+            distance = (
+                radar_point_distance_label(point, self.is_metric)
+                if radar_info_shows_distance(radar_info_mode)
+                else ""
+            )
+            speed = (
+                radar_point_speed_label(point, self.is_metric)
+                if radar_info_shows_speed(radar_info_mode)
+                else ""
+            )
             if not distance and not speed:
                 if profile_enabled:
                     layout_ms += (time.perf_counter() - layout_stage) * 1000.0
@@ -2490,11 +4672,56 @@ class ClusterUiRenderer:
         position = rl.Vector3(vehicle.center.x, vehicle.center.y, 0.035)
         rotation_axis = rl.Vector3(0.0, 0.0, 1.0)
         scale = rl.Vector3(vehicle.width_m, vehicle.length_m, vehicle.height_m)
+        is_ego = not vehicle.source and not vehicle.primary and not vehicle.cut_in
+        if not is_ego and not vehicle.primary and not vehicle.cut_in and self._uses_other_model(vehicle):
+            # side-lane vehicles: slightly smaller than lead vehicles (radar-only position)
+            scale = rl.Vector3(vehicle.width_m * SIDE_VEHICLE_MODEL_SCALE, vehicle.length_m * SIDE_VEHICLE_MODEL_SCALE,
+                               vehicle.height_m * SIDE_VEHICLE_MODEL_SCALE)
         try:
             rl.rl_disable_backface_culling()
             alpha = int(92 + 163 * clamp(vehicle.confidence, 0.0, 1.0))
-            tint = rl_color(vehicle.body_color) if vehicle.source == "radarPoint" else rl_color(WHITE, alpha)
-            rl.draw_model_ex(self._vehicle_model, position, rotation_axis, yaw_deg, scale, tint)
+            model = self._vehicle_model
+            if not clean_ui_enabled():
+                tint = rl_color(vehicle.body_color) if vehicle.source == "radarPoint" else rl_color(WHITE, alpha)
+            elif vehicle.source == "radarPoint":
+                tint = rl_color(vehicle.body_color)
+            elif is_ego:
+                model, _ = self._ego_model(vehicle.model_name)
+                tint = rl_color(WHITE, alpha)
+            elif self._uses_other_model(vehicle):
+                index = self._other_model_index(vehicle)
+                held = False
+                if clean_ui_enabled():
+                    # The cut-in flag often lasts only a few frames and the same car then comes back under a
+                    # different track id: follow it by position for CLEAN_CUTIN_HOLD_S (colour and model).
+                    now = time.monotonic()
+                    hold = self._cutin_hold
+                    if vehicle.cut_in:
+                        if hold is not None and hold[4] > now and abs(hold[1] - vehicle.center.x) < 1.6:
+                            index = int(hold[3]) % len(self._other_vehicle_models)
+                        self._cutin_hold = [now + CLEAN_CUTIN_HOLD_S, vehicle.center.x, vehicle.longitudinal_m, index,
+                                            now + CLEAN_CUTIN_MODEL_HOLD_S]
+                    elif (hold is not None and hold[4] > now and (vehicle.primary or vehicle.longitudinal_m > 0.0)
+                          and abs(hold[1] - vehicle.center.x) < 1.6 and abs(hold[2] - vehicle.longitudinal_m) < 4.0):
+                        index = int(hold[3]) % len(self._other_vehicle_models)
+                        hold[1], hold[2] = vehicle.center.x, vehicle.longitudinal_m
+                        held = hold[0] > now
+                model = self._other_vehicle_models[index]
+                body_rgb = tuple(vehicle.body_color[:3])
+                warning = VEHICLE_CUTIN_TINT if held else None
+                if vehicle.cut_in:
+                    warning = VEHICLE_CUTIN_TINT
+                elif body_rgb in (tuple(RED), tuple(AMBER)):
+                    warning = body_rgb  # oncoming / crossing traffic keeps its warning colour
+                ghost = (warning is None and not vehicle.primary and not vehicle.cut_in
+                         and vehicle.confidence < SIDE_VEHICLE_MODEL_MIN_CONFIDENCE)
+                if self._set_other_paint(index, warning) or warning is None:
+                    tint = rl_color(CLEAN_GHOST_TINT if ghost else WHITE)  # warning colour repaints the body in the shader
+                else:
+                    tint = rl_color(warning)  # unlit fallback: multiply
+            else:
+                tint = rl_color(VEHICLE_OTHER_TINT, alpha)
+            rl.draw_model_ex(model, position, rotation_axis, yaw_deg, scale, tint)
         finally:
             rl.rl_enable_backface_culling()
 
@@ -2506,6 +4733,9 @@ class ClusterUiRenderer:
         radar_info_mode: int = CLUSTER_RADAR_INFO_ALL_SPEED_DISTANCE,
         radar_source_color_mode: int = 0,
     ) -> None:
+        clean = clean_ui_enabled()
+        if clean:  # EV6 HUD patch v6: only the lead (L1) and cut-in vehicles get a label
+            vehicles = tuple(v for v in vehicles if v.cut_in or vehicle_has_lead_one_metrics(v))
         show_vehicle_info = radar_info_shows_vehicle(radar_info_mode)
         if not show_vehicle_info and not any(vehicle.primary or vehicle.cut_in for vehicle in vehicles):
             return
@@ -2528,16 +4758,7 @@ class ClusterUiRenderer:
 
         project_ms = 0.0
         layout_ms = 0.0
-        text_ms = 0.0
-
-        def draw_label_text(label, x, y, size, color) -> None:
-            nonlocal text_ms
-            if profile_enabled:
-                text_stage = time.perf_counter()
-                self._draw_world_label_text(label, x, y, size, color, anchor="center")
-                text_ms += (time.perf_counter() - text_stage) * 1000.0
-                return
-            self._draw_world_label_text(label, x, y, size, color, anchor="center")
+        metric_labels: list[VehicleMetricLabel] = []
 
         for vehicle in ordered:
             anchor = rl.Vector3(
@@ -2557,19 +4778,24 @@ class ClusterUiRenderer:
                 layout_stage = time.perf_counter()
             show_important_label = vehicle.primary or vehicle.cut_in
             distance = (
-                vehicle_distance_label(vehicle)
+                vehicle_distance_label(vehicle, self.is_metric)
                 if radar_info_shows_distance(radar_info_mode) or show_important_label
                 else ""
             )
-            speed = vehicle_speed_label(vehicle) if radar_info_shows_speed(radar_info_mode) else ""
+            speed = (
+                vehicle_speed_label(vehicle, self.is_metric)
+                if radar_info_shows_speed(radar_info_mode)
+                else ""
+            )
             if not distance and not speed:
                 if profile_enabled:
                     layout_ms += (time.perf_counter() - layout_stage) * 1000.0
                 continue
             distance_m = vehicle_distance_m(vehicle)
-            scale = world_label_scale(distance_m)
-            distance_size = max(9.0, VEHICLE_BADGE_DISTANCE_FONT_SIZE * scale)
-            speed_size = max(8.0, VEHICLE_BADGE_SPEED_FONT_SIZE * scale)
+            lead_one = vehicle_has_lead_one_metrics(vehicle)
+            scale = 1.0 if lead_one else world_label_scale(distance_m)
+            distance_size = LEAD_ONE_DISTANCE_FONT_SIZE if lead_one else max(9.0, VEHICLE_BADGE_DISTANCE_FONT_SIZE * scale)
+            speed_size = LEAD_ONE_SPEED_FONT_SIZE if lead_one else max(8.0, VEHICLE_BADGE_SPEED_FONT_SIZE * scale)
             shadow_offset = max(1.0, 1.2 * scale)
             gap = max(2.0, 4.0 * scale)
             if speed and distance:
@@ -2581,43 +4807,82 @@ class ClusterUiRenderer:
             else:
                 distance_y = screen.y - distance_size * 0.5
             center_x = screen.x
-            shadow = theme.world_label_shadow
             text_color = vehicle_metric_color(vehicle, theme, radar_source_color_mode)
+            if clean:
+                text = "  ".join(part for part in (distance, speed) if part)
+                text_color = AMBER if vehicle.cut_in else (WHITE if theme.is_dark else (26, 30, 36))
+                closing = vehicle.relative_speed_mps is not None and vehicle.relative_speed_mps < -0.5
+                if closing and vehicle.ttc_s is not None and 0.0 < vehicle.ttc_s < CLEAN_TTC_AMBER_S:
+                    text_color = RED if vehicle.ttc_s < CLEAN_TTC_RED_S else AMBER
+                metric_labels.append(VehicleMetricLabel(
+                    vehicle, (VehicleMetricLine(text, center_x, screen.y - 16.0, 20.0),), text_color, 0.0))
+                continue
+            lines = []
+            if distance:
+                lines.append(VehicleMetricLine(distance, center_x, distance_y, distance_size))
+            if speed:
+                lines.append(VehicleMetricLine(speed, center_x, speed_y, speed_size))
+            metric_labels.append(VehicleMetricLabel(vehicle, tuple(lines), text_color, shadow_offset))
             if profile_enabled:
                 layout_ms += (time.perf_counter() - layout_stage) * 1000.0
-            if distance:
-                draw_label_text(
-                    distance,
-                    center_x + shadow_offset,
-                    distance_y + shadow_offset,
-                    distance_size,
-                    shadow,
-                )
-                draw_label_text(
-                    distance,
-                    center_x,
-                    distance_y,
-                    distance_size,
-                    text_color,
-                )
-            if speed:
-                draw_label_text(
-                    speed,
-                    center_x + shadow_offset,
-                    speed_y + shadow_offset,
-                    speed_size,
-                    shadow,
-                )
-                draw_label_text(
-                    speed,
-                    center_x,
-                    speed_y,
-                    speed_size,
-                    text_color,
-                )
+        profile_stage = self._profile_start()
+        self._draw_vehicle_metric_labels(metric_labels)
+        self._profile_add("draw_scene.vehicle_badges.text", profile_stage)
         self._profile_add_elapsed("draw_scene.vehicle_badges.project", project_ms)
         self._profile_add_elapsed("draw_scene.vehicle_badges.layout", layout_ms)
-        self._profile_add_elapsed("draw_scene.vehicle_badges.text", text_ms)
+
+    def _vehicle_metric_label_rect(self, label: VehicleMetricLabel) -> tuple[float, float, float, float]:
+        rects = []
+        for line in label.lines:
+            width, height = self._measure_text(line.text, line.size, max(1.0, line.size * 0.02), self._font_for_text(line.text))
+            rects.append((line.x - width * 0.5, line.y - height * 0.5, line.x + width * 0.5, line.y + height * 0.5))
+        left, top = min(rect[0] for rect in rects), min(rect[1] for rect in rects)
+        right, bottom = max(rect[2] for rect in rects), max(rect[3] for rect in rects)
+        return left, top, right - left + label.shadow_offset, bottom - top + label.shadow_offset
+
+    def _draw_vehicle_metric_labels(
+        self,
+        labels: list[VehicleMetricLabel],
+        bounds: tuple[float, float, float, float] | None = None,
+    ) -> None:
+        lead = next((label for label in labels if vehicle_has_lead_one_metrics(label.vehicle)), None)
+        protected = None
+        if lead is not None:
+            left, top, right, bottom = bounds if bounds is not None else (0.0, 0.0, float(self.width), float(self.height))
+            x, y, width, height = self._vehicle_metric_label_rect(lead)
+            # Keep the full-size L1 group inside the viewport even at the horizon.
+            dx = clamp(x, left + 4.0, max(left + 4.0, right - width - 4.0)) - x
+            dy = clamp(y, top + 4.0, max(top + 4.0, bottom - height - 4.0)) - y
+            lead = replace(lead, lines=tuple(replace(line, x=line.x + dx, y=line.y + dy) for line in lead.lines))
+            protected = (x + dx - 4.0, y + dy - 4.0, width + 8.0, height + 8.0)
+
+        # Reserve L1's space first, but paint it last. Only overlapping secondary
+        # vehicle text is omitted; their geometry and the radar/control state stay intact.
+        visible = []
+        for label in labels:
+            if lead is not None and label.vehicle is lead.vehicle:
+                continue
+            if protected is not None and rectangles_overlap(self._vehicle_metric_label_rect(label), protected):
+                continue
+            visible.append(label)
+        if lead is not None:
+            visible.append(lead)
+        shadow = self._current_theme().world_label_shadow if any(label.shadow_offset for label in visible) else None
+        if clean_ui_enabled():  # EV6 HUD patch v6: chip behind the label
+            dark = self._current_theme().is_dark
+            for label in visible:
+                x, y, width, height = self._vehicle_metric_label_rect(label)
+                self._rounded_rect(x - 10.0, y - 4.0, width + 20.0, height + 8.0, (height + 8.0) * 0.5,
+                                   (12, 14, 18, 175) if dark else (255, 255, 255, 215),
+                                   (*label.color[:3], 120), 1.5)
+        for label in visible:
+            for line in label.lines:
+                if label.shadow_offset:
+                    self._draw_world_label_text(
+                        line.text, line.x + label.shadow_offset, line.y + label.shadow_offset,
+                        line.size, shadow, anchor="center",
+                    )
+                self._draw_world_label_text(line.text, line.x, line.y, line.size, label.color, anchor="center")
 
     def _world_label_bounds(
         self,
@@ -2766,8 +5031,22 @@ class ClusterUiRenderer:
         rl.rl_scalef(sx, sy, 1.0)
         self._profile_add("hud.push_scale", profile_stage)
         try:
-            screen_mode = self.screen_mode
-            navi_active = state.navi_debug is not None
+            screen_mode = self._effective_screen_mode(state)
+            if screen_mode == CLUSTER_SCREEN_MODE_NAV_MODEL:
+                self._draw_driving_hud_content(state, screen_mode, left_signal_lit, right_signal_lit)
+                self._draw_nav_model_map()
+                self._draw_status_footer(state)
+                return
+            if screen_mode == CLUSTER_SCREEN_MODE_NAVI:
+                self._draw_navi_dashboard(state)
+                self._draw_status_footer(state)
+                return
+            navi_debug_active = state.navi_debug is not None
+            navi_live_active = (
+                self._navi_live_panel_visible(state.navi_live)
+                or self._navi_map_frame_present(state.navi_dashboard)
+                or (screen_mode == CLUSTER_SCREEN_MODE_DEFAULT and state.navi_dashboard is not None)
+            )
             if screen_mode == CLUSTER_SCREEN_MODE_DEBUG_GRAPH:
                 profile_stage = self._profile_start()
                 self._draw_speed_block(state)
@@ -2785,76 +5064,273 @@ class ClusterUiRenderer:
                     DEBUG_PLOT_FULL_H,
                 )
                 self._profile_add("hud.debug_plot_full", profile_stage)
+                self._draw_status_footer(state)
                 return
 
-            profile_stage = self._profile_start()
-            self._draw_speed_block(state)
-            self._profile_add("hud.speed_block", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_accel_block(state)
-            self._profile_add("hud.accel_block", profile_stage)
-            self._draw_steering_output_block(state)
-            profile_stage = self._profile_start()
-            self._draw_turn_signal("left", left_signal_lit, show_inactive=state.debug_ui_visible)
-            self._profile_add("hud.turn_signal_left", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_drive_status(state)
-            self._profile_add("hud.drive_status", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_turn_signal("right", right_signal_lit, show_inactive=state.debug_ui_visible)
-            self._profile_add("hud.turn_signal_right", profile_stage)
-            if navi_active:
+            self._draw_driving_hud_content(
+                state,
+                screen_mode,
+                left_signal_lit,
+                right_signal_lit,
+            )
+            if screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D:
+                self._draw_status_footer(state)
+                return
+            if screen_mode == CLUSTER_SCREEN_MODE_DEBUG_SYSTEM:
                 profile_stage = self._profile_start()
-                self._draw_navi_traffic_light_panel(state.navi_debug)
-                self._profile_add("hud.navi_traffic", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_center_clock(state)
-            self._profile_add("hud.center_clock", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_actual_fps(state.actual_fps)
-            self._profile_add("hud.actual_fps", profile_stage)
+                self._draw_system_dashboard_panel(state)
+                self._profile_add("hud.system_dashboard", profile_stage)
+                self._draw_status_footer(state)
+                return
             if screen_mode == CLUSTER_SCREEN_MODE_DEBUG:
                 profile_stage = self._profile_start()
                 self._draw_live_debug_panel(state)
                 self._profile_add("hud.live_debug", profile_stage)
-            if screen_mode == CLUSTER_SCREEN_MODE_DEBUG_SYSTEM:
-                profile_stage = self._profile_start()
-                self._draw_system_stats_panel(state)
-                self._profile_add("hud.system_stats", profile_stage)
             if screen_mode == CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT:
                 profile_stage = self._profile_start()
                 self._draw_debug_plot(
                     state.debug_plot,
-                    DEBUG_PLOT_RIGHT_X,
+                    self._information_panel_x(DEBUG_PLOT_RIGHT_X),
                     DEBUG_PLOT_RIGHT_Y,
                     DEBUG_PLOT_RIGHT_W,
                     DEBUG_PLOT_RIGHT_H,
                 )
                 self._profile_add("hud.debug_plot_right", profile_stage)
-            if screen_mode == CLUSTER_SCREEN_MODE_NAVI_DEBUG or navi_active:
+            if screen_mode == CLUSTER_SCREEN_MODE_TRIP_REPORT:
+                profile_stage = self._profile_start()
+                self._draw_trip_report_panel(state)
+                self._profile_add("hud.trip_report", profile_stage)
+            elif navi_debug_active:
                 profile_stage = self._profile_start()
                 self._draw_navi_debug_panel(state.navi_debug)
                 self._profile_add("hud.navi_debug", profile_stage)
+            elif screen_mode == CLUSTER_SCREEN_MODE_DEFAULT and navi_live_active:
+                profile_stage = self._profile_start()
+                self._draw_navi_live_panel(state)
+                self._profile_add("hud.navi_live", profile_stage)
             if screen_mode not in (
                 CLUSTER_SCREEN_MODE_DEBUG,
-                CLUSTER_SCREEN_MODE_DEBUG_SYSTEM,
                 CLUSTER_SCREEN_MODE_DEBUG_GRAPH,
                 CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
-                CLUSTER_SCREEN_MODE_NAVI_DEBUG,
-            ) and not navi_active:
+                CLUSTER_SCREEN_MODE_TRIP_REPORT,
+            ) and not navi_debug_active and not navi_live_active:
                 profile_stage = self._profile_start()
                 self._draw_route_overlay(state.route_overlay)
                 self._profile_add("hud.route_overlay", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_git_status(state.git_status, state.network_address)
-            self._profile_add("hud.git_status", profile_stage)
-            profile_stage = self._profile_start()
-            self._draw_cluster_core_usage(state.cluster_core_usage_text)
-            self._profile_add("hud.cluster_core_usage", profile_stage)
+            self._draw_status_footer(
+                state,
+                include_core_usage=screen_mode != CLUSTER_SCREEN_MODE_TRIP_REPORT,
+            )
         finally:
             profile_stage = self._profile_start()
             rl.rl_pop_matrix()
             self._profile_add("hud.pop_matrix", profile_stage)
+
+    def _draw_alert_overlay(self, alert: ClusterAlert | None) -> None:
+        if alert is None or alert.size <= 0 or not (alert.text1 or alert.text2):
+            return
+
+        sx = self.width / DESIGN_WIDTH
+        sy = self.height / DESIGN_HEIGHT
+        rl.rl_push_matrix()
+        rl.rl_scalef(sx, sy, 1.0)
+        try:
+            panel_x = self._driving_panel_offset_design_x()
+            panel_w = CAMERA_BACKGROUND_W
+            panel_center_x = panel_x + panel_w * 0.5
+
+            if alert.size >= CLUSTER_ALERT_SIZE_FULL:
+                max_text_w = panel_w - 100.0
+                title_size = 56.0
+                detail_size = 32.0
+            elif alert.size == CLUSTER_ALERT_SIZE_MID:
+                max_text_w = panel_w - 128.0
+                title_size = 48.0
+                detail_size = 28.0
+            else:
+                max_text_w = panel_w - 200.0
+                title_size = 42.0
+                detail_size = 24.0
+
+            title, detail = self._cluster_alert_text(alert)
+            if not title and detail:
+                title, detail = detail, ""
+            title, title_size = self._fit_alert_text(title, title_size, max_text_w, 30.0)
+            detail, detail_size = self._fit_alert_text(detail, detail_size, max_text_w, 20.0)
+            center_y = DESIGN_HEIGHT * 0.5
+            title_color = CLUSTER_ALERT_TEXT_COLORS.get(alert.status, CLUSTER_ALERT_TEXT_COLORS[0])
+            if detail:
+                title_y = center_y - (22.0 if alert.size == CLUSTER_ALERT_SIZE_SMALL else 30.0)
+                detail_y = center_y + (27.0 if alert.size == CLUSTER_ALERT_SIZE_SMALL else 36.0)
+                self._draw_text_with_stroke(
+                    title, panel_center_x, title_y, title_size, title_color,
+                    CLUSTER_ALERT_TEXT_STROKE, 4, anchor="center", cache=True,
+                )
+                self._draw_text_with_stroke(
+                    detail, panel_center_x, detail_y, detail_size, WHITE,
+                    CLUSTER_ALERT_TEXT_STROKE, 3, anchor="center", cache=True,
+                )
+            else:
+                self._draw_text_with_stroke(
+                    title, panel_center_x, center_y, title_size, title_color,
+                    CLUSTER_ALERT_TEXT_STROKE, 4, anchor="center", cache=True,
+                )
+        finally:
+            rl.rl_pop_matrix()
+
+    def _cluster_alert_text(self, alert: ClusterAlert) -> tuple[str, str]:
+        keys = CLUSTER_SYNTHETIC_ALERT_TEXT_KEYS.get(alert.alert_type)
+        if keys is not None:
+            return self._text(keys[0]), self._text(keys[1])
+        return " ".join(alert.text1.split()), " ".join(alert.text2.split())
+
+    def _fit_alert_text(
+        self,
+        text: str,
+        preferred_size: float,
+        max_width: float,
+        minimum_size: float,
+    ) -> tuple[str, float]:
+        if not text:
+            return "", preferred_size
+        size = preferred_size
+        while size > minimum_size and self._measure_text(text, size)[0] > max_width:
+            size -= 2.0
+        return self._ellipsize_text(text, size, max_width), size
+
+    def _draw_driving_hud_content(
+        self,
+        state: ClusterUiState,
+        screen_mode: int,
+        left_signal_lit: bool,
+        right_signal_lit: bool,
+    ) -> None:
+        offset_x = self._driving_hud_offset_design_x(screen_mode)
+        tpms_offset_x = self._tpms_offset_design_x(screen_mode)
+        side_gauge_offset_x = self._side_gauge_offset_design_x(screen_mode)
+        rl.rl_push_matrix()
+        if abs(offset_x) > 0.001:
+            rl.rl_translatef(offset_x, 0.0, 0.0)
+        try:
+            profile_stage = self._profile_start()
+            self._draw_speed_block(state, tpms_offset_x=tpms_offset_x)
+            self._profile_add("hud.speed_block", profile_stage)
+            side_gauges_translated = abs(side_gauge_offset_x) > 0.001
+            if side_gauges_translated:
+                rl.rl_push_matrix()
+                rl.rl_translatef(side_gauge_offset_x, 0.0, 0.0)
+            try:
+                profile_stage = self._profile_start()
+                self._draw_accel_block(state)
+                self._profile_add("hud.accel_block", profile_stage)
+                self._draw_steering_output_block(state)
+            finally:
+                if side_gauges_translated:
+                    rl.rl_pop_matrix()
+            profile_stage = self._profile_start()
+            self._draw_turn_signal(
+                "left",
+                left_signal_lit,
+                show_inactive=state.debug_ui_visible,
+                center_x_offset=self._turn_signal_center_x_offset(state, "left"),
+            )
+            self._profile_add("hud.turn_signal_left", profile_stage)
+            profile_stage = self._profile_start()
+            self._draw_drive_status(state)
+            self._profile_add("hud.drive_status", profile_stage)
+            profile_stage = self._profile_start()
+            self._draw_turn_signal(
+                "right",
+                right_signal_lit,
+                show_inactive=state.debug_ui_visible,
+                center_x_offset=self._turn_signal_center_x_offset(state, "right"),
+            )
+            self._profile_add("hud.turn_signal_right", profile_stage)
+            traffic_drawn_in_map = screen_mode == CLUSTER_SCREEN_MODE_DEFAULT and self._navi_map_frame_present(
+                state.navi_dashboard
+            )
+            dashboard = state.navi_dashboard
+            traffic_frame = next(
+                (frame for frame in dashboard.media if frame.key == "image:traffic_signal"),
+                None,
+            ) if dashboard is not None and dashboard.connected else None
+            if (
+                traffic_frame is not None
+                and not traffic_drawn_in_map
+                and screen_mode != CLUSTER_SCREEN_MODE_TRIP_REPORT
+            ):
+                profile_stage = self._profile_start()
+                traffic_panel_right = self._traffic_panel_right(screen_mode)
+                self._draw_navi_media(
+                    traffic_frame,
+                    rl.Rectangle(traffic_panel_right - 230.0, NAVI_TRAFFIC_PANEL_Y, 230.0, 98.0),
+                    align_x=1.0,
+                    align_y=0.0,
+                )
+                self._profile_add("hud.navi_traffic", profile_stage)
+            profile_stage = self._profile_start()
+            self._draw_center_clock(state, center_x=self._center_clock_x(screen_mode))
+            self._profile_add("hud.center_clock", profile_stage)
+        finally:
+            rl.rl_pop_matrix()
+
+    def _effective_screen_mode(self, state: ClusterUiState) -> int:
+        requested_screen_mode = getattr(self, "screen_mode", CLUSTER_SCREEN_MODE_DEFAULT)
+        if (
+            requested_screen_mode == CLUSTER_SCREEN_MODE_FULLSCREEN_3D
+            and cluster_camera_view_is_road_camera(getattr(state, "camera_view_mode", 0))
+        ):
+            requested_screen_mode = CLUSTER_SCREEN_MODE_DEFAULT
+        if requested_screen_mode != CLUSTER_SCREEN_MODE_DEFAULT:
+            return requested_screen_mode
+        gear_text = str(getattr(state, "gear_text", "") or "").strip().upper()
+        if getattr(state, "onroad", False) and gear_text == "P":
+            # Surface the completed trip as soon as the driver parks, even
+            # when an active navigation session would otherwise own the panel.
+            return CLUSTER_SCREEN_MODE_TRIP_REPORT
+        dashboard = getattr(state, "navi_dashboard", None)
+        dashboard_connected = bool(
+            dashboard is not None and dashboard.connected
+        )
+        navigation_received = bool(
+            getattr(state, "external_nav_active", False)
+            or dashboard_connected
+            or self._navi_live_panel_visible(getattr(state, "navi_live", None))
+        )
+        return (
+            CLUSTER_SCREEN_MODE_DEFAULT
+            if navigation_received
+            else CLUSTER_SCREEN_MODE_TRIP_REPORT
+        )
+
+    def _draw_status_footer(
+        self,
+        state: ClusterUiState,
+        *,
+        include_core_usage: bool = True,
+    ) -> None:
+        if clean_ui_enabled():
+            return  # EV6 HUD patch v6
+        profile_stage = self._profile_start()
+        screen_mode = self._effective_screen_mode(state)
+        offset_x = self._driving_hud_offset_design_x(screen_mode)
+        if abs(offset_x) > 0.001:
+            rl.rl_push_matrix()
+            try:
+                rl.rl_translatef(offset_x, 0.0, 0.0)
+                self._draw_git_status(state.git_status, state.network_address, state.actual_fps)
+            finally:
+                rl.rl_pop_matrix()
+        else:
+            self._draw_git_status(state.git_status, state.network_address, state.actual_fps)
+        self._profile_add("hud.git_status", profile_stage)
+        if include_core_usage:
+            profile_stage = self._profile_start()
+            self._draw_cluster_core_usage(
+                state.cluster_core_usage_text,
+                right_x=self._core_usage_right_x(screen_mode),
+            )
+            self._profile_add("hud.cluster_core_usage", profile_stage)
 
     def _draw_route_replay_controls(
         self,
@@ -2945,30 +5421,36 @@ class ClusterUiRenderer:
         secs = total % 60
         return f"{minutes:d}:{secs:02d}"
 
-    def _draw_center_clock(self, state: ClusterUiState) -> None:
-        if not state.center_clock_text:
-            return
-
-        theme = self._current_theme()
-        text = state.center_clock_text
-        x = SYSTEM_PANEL_X + SYSTEM_PANEL_W * 0.5
-        y = 58
-        size = 54
-        spacing = max(1.0, size * 0.02)
-        text_width, text_height = self._measure_text(text, size, spacing)
-
-        pad_x = 28
-        pad_y = 14
-        rect = rl.Rectangle(
-            x - text_width * 0.5 - pad_x,
-            y - text_height * 0.5 - pad_y,
-            text_width + pad_x * 2,
-            text_height + pad_y * 2,
+    def _draw_center_clock(self, state: ClusterUiState, *, center_x: float = TOP_CLOCK_CENTER_X) -> None:
+        if state.center_clock_text:
+            self._draw_text_with_stroke(
+                state.center_clock_text,
+                center_x,
+                TOP_STATUS_CENTER_Y,
+                48,
+                WHITE,
+                (10, 13, 16),
+                2,
+                anchor="center",
+            )
+        navi_connected = bool(state.navi_dashboard is not None and state.navi_dashboard.connected)
+        navi_status = navigation_status_presentation(
+            getattr(state, "vehicle_navi_available", False),
+            state.external_nav_active or navi_connected,
         )
-
-        rl.draw_rectangle_rounded(rect, 0.28, 12, rl_color(theme.clock_bg))
-        rl.draw_rectangle_rounded_lines_ex(rect, 0.28, 12, 2.0, rl_color(theme.clock_outline))
-        self._draw_text(text, x, y, size, theme.clock_text, anchor="center")
+        if navi_status is not None:
+            navi_label, navi_color_mode = navi_status
+            self._draw_text_with_stroke(
+                navi_label,
+                NAV_STATUS_CENTER_X,
+                NAV_STATUS_CENTER_Y,
+                NAV_STATUS_FONT_SIZE,
+                VEHICLE_NAVI if navi_color_mode == 3 else AMBER,
+                (10, 13, 16),
+                2,
+                anchor="center",
+                cache=True,
+            )
 
     def _draw_debug_plot(
         self,
@@ -3140,9 +5622,1194 @@ class ClusterUiRenderer:
         label_y = clamp(latest.y + (24.0 if series_index > 0 else 0.0), plot_y + 12.0, plot_y + plot_h - 12.0)
         self._draw_text(label, label_x, label_y, label_size, color, anchor="right")
 
+    def _draw_navi_dashboard(self, state: ClusterUiState) -> None:
+        theme = self._current_theme()
+        dashboard = state.navi_dashboard
+        navi = state.navi_live
+        rl.draw_rectangle(0, 0, int(NAVI_MODE_LEFT_W), DESIGN_HEIGHT, rl_color(theme.panel_bg))
+        rl.draw_rectangle(
+            int(NAVI_MODE_RIGHT_X),
+            0,
+            int(NAVI_MODE_RIGHT_W),
+            DESIGN_HEIGHT,
+            rl_color(theme.panel_bg),
+        )
+        rl.draw_line_ex(
+            rl.Vector2(NAVI_MODE_LEFT_W, 0.0),
+            rl.Vector2(NAVI_MODE_LEFT_W, DESIGN_HEIGHT),
+            2.0,
+            rl_color(theme.faint),
+        )
+        rl.draw_line_ex(
+            rl.Vector2(NAVI_MODE_RIGHT_X, 0.0),
+            rl.Vector2(NAVI_MODE_RIGHT_X, DESIGN_HEIGHT),
+            2.0,
+            rl_color(theme.faint),
+        )
+
+        media = {frame.key: frame for frame in dashboard.media} if dashboard is not None else {}
+        map_rect = rl.Rectangle(NAVI_MODE_MAP_X, 0.0, NAVI_MODE_MAP_W, DESIGN_HEIGHT)
+        map_frame = media.get("render:map_main")
+        rl.draw_rectangle_rec(map_rect, rl_color(NAVI_MAP_BACKGROUND))
+        if not self._draw_navi_media(map_frame, map_rect, cover=False):
+            self._draw_navi_route_fallback(navi, map_rect)
+        if dashboard is not None and dashboard.map_stream_stalled:
+            self._draw_navi_map_stalled(map_rect, dashboard.map_frame_age_ms)
+
+        self._draw_navi_map_media(media)
+        self._draw_navi_left_band(state, navi, media)
+        self._draw_navi_right_band(navi, dashboard, media)
+
+    def _draw_navi_left_band(
+        self,
+        state: ClusterUiState,
+        navi: NaviLiveState | None,
+        media: dict[str, NaviMediaFrame],
+    ) -> None:
+        theme = self._current_theme()
+        full_rect = rl.Rectangle(10.0, 8.0, 500.0, 88.0)
+        compact_rect = rl.Rectangle(10.0, 104.0, 330.0, 145.0)
+        next_rect = rl.Rectangle(350.0, 104.0, 160.0, 72.0)
+        drew_full = self._draw_navi_media(media.get("image:tbt_current_full"), full_rect)
+        drew_compact = self._draw_navi_media(media.get("image:tbt_current_compact"), compact_rect)
+        drew_next = self._draw_navi_media(media.get("image:tbt_next"), next_rect)
+
+        current = navi.current if navi is not None else None
+        if current is not None and not (drew_full or drew_compact):
+            self._draw_navi_turn_icon(current.turn_type, 72.0, 78.0, 92.0)
+            self._draw_text(self._format_navi_distance(current.distance_m), 136.0, 30.0, 42.0, theme.text)
+            current_text = current.main_text or current.road_name or current.near_direction
+            self._draw_text(
+                self._ellipsize_text(current_text, 26.0, 350.0),
+                136.0,
+                82.0,
+                26.0,
+                theme.text,
+            )
+        next_guidance = navi.next if navi is not None else None
+        if next_guidance is not None and not drew_next:
+            self._draw_navi_turn_icon(next_guidance.turn_type, 386.0, 143.0, 54.0)
+            self._draw_text(
+                self._format_navi_distance(next_guidance.distance_m),
+                422.0,
+                119.0,
+                20.0,
+                theme.text,
+            )
+
+        displayed_speed = display_speed(state.speed_kph, self.is_metric)
+        road_limit = state.speed_limit_kph
+        road_name = ""
+        if navi is not None:
+            if navi.vehicle is not None:
+                road_name = navi.vehicle.road_name
+            if road_limit is None and navi.speed is not None:
+                road_limit = navi.speed.road_limit_kph
+        self._draw_text(f"{displayed_speed:.0f}", 32.0, 284.0, 82.0, theme.text)
+        self._draw_text(speed_unit(self.is_metric), 143.0, 332.0, 18.0, theme.muted)
+        if road_limit is not None:
+            rl.draw_circle_v(rl.Vector2(218.0, 325.0), 36.0, rl_color(WHITE))
+            rl.draw_ring(rl.Vector2(218.0, 325.0), 30.0, 36.0, 0.0, 360.0, 48, rl_color(RED))
+            self._draw_text(
+                str(int(round(display_speed(road_limit, self.is_metric)))),
+                218.0,
+                308.0,
+                27.0,
+                (20, 24, 28),
+                anchor="center",
+            )
+        if road_name:
+            self._draw_text(
+                self._ellipsize_text(road_name, 22.0, 480.0),
+                20.0,
+                389.0,
+                22.0,
+                theme.text,
+            )
+        if navi is not None and navi.route is not None:
+            route = navi.route
+            route_text = self._format_navi_distance(route.remaining_distance_m)
+            if route.remaining_time_s > 0:
+                route_text += f"  {max(1, round(route.remaining_time_s / 60.0))} min"
+            self._draw_text(route_text, 20.0, 431.0, 24.0, BLUE_SOFT)
+
+    def _draw_navi_map_media(self, media: dict[str, NaviMediaFrame]) -> None:
+        expanded = media.get("image:crossroad_expanded")
+        minimized = media.get("image:crossroad_minimized")
+        if expanded is not None and expanded.present:
+            self._draw_navi_media(expanded, rl.Rectangle(NAVI_MODE_MAP_X + 55.0, 20.0, 770.0, 430.0))
+        elif minimized is not None and minimized.present:
+            self._draw_navi_media(
+                minimized,
+                rl.Rectangle(NAVI_MODE_MAP_X + NAVI_MODE_MAP_W - 260.0, 48.0, 250.0, 410.0),
+            )
+
+        self._draw_navi_media(
+            media.get("image:lane_bottom"),
+            rl.Rectangle(NAVI_MODE_MAP_X + 80.0, 298.0, NAVI_MODE_MAP_W - 160.0, 174.0),
+        )
+        self._draw_navi_media(
+            media.get("image:traffic_signal"),
+            rl.Rectangle(NAVI_MODE_MAP_X + 16.0, 18.0, 230.0, 98.0),
+        )
+
+        center_x = NAVI_MODE_MAP_X + NAVI_MODE_MAP_W * 0.5
+        self._draw_navi_media(
+            media.get("image:center_tbt_icon"),
+            rl.Rectangle(center_x - 112.0, 104.0, 92.0, 92.0),
+        )
+        self._draw_navi_media(
+            media.get("image:center_tbt_text"),
+            rl.Rectangle(center_x - 12.0, 108.0, 220.0, 78.0),
+        )
+        self._draw_navi_media(
+            media.get("image:center_tbt_fee"),
+            rl.Rectangle(center_x - 90.0, 188.0, 180.0, 58.0),
+        )
+
+    def _draw_navi_right_band(
+        self,
+        navi: NaviLiveState | None,
+        dashboard: NaviDashboardState | None,
+        media: dict[str, NaviMediaFrame],
+    ) -> None:
+        theme = self._current_theme()
+        x = NAVI_MODE_RIGHT_X + 18.0
+        width = NAVI_MODE_RIGHT_W - 36.0
+        current = navi.current if navi is not None else None
+        next_guidance = navi.next if navi is not None else None
+        self._draw_text(self._text("navigation"), x, 14.0, 16.0, theme.muted)
+        if current is not None:
+            current_text = current.main_text or current.road_name or current.near_direction
+            self._draw_text(
+                self._ellipsize_text(current_text, 27.0, width - 120.0),
+                x,
+                42.0,
+                27.0,
+                theme.text,
+            )
+            self._draw_text(
+                self._format_navi_distance(current.distance_m),
+                NAVI_MODE_RIGHT_X + NAVI_MODE_RIGHT_W - 18.0,
+                42.0,
+                27.0,
+                BLUE_SOFT,
+                anchor="right",
+            )
+        if next_guidance is not None:
+            next_text = next_guidance.main_text or next_guidance.road_name or next_guidance.near_direction
+            next_line = f"{self._text('next')} {self._format_navi_distance(next_guidance.distance_m)}  {next_text}"
+            self._draw_text(self._ellipsize_text(next_line, 18.0, width), x, 82.0, 18.0, theme.muted)
+
+        y = 116.0
+        safety_frames = [
+            media.get("image:safety_primary"),
+            media.get("image:safety_secondary"),
+            media.get("image:safety_section"),
+        ]
+        active_safety = [frame for frame in safety_frames if frame is not None and frame.present]
+        if active_safety:
+            slot_h = min(82.0, 176.0 / len(active_safety))
+            for frame in active_safety:
+                self._draw_navi_media(frame, rl.Rectangle(x, y, width, slot_h - 4.0))
+                y += slot_h
+        elif navi is not None and navi.speed is not None:
+            speed = navi.speed
+            sdi_values = (
+                ("SDI", speed.sdi_type, speed.sdi_speed_limit_kph, speed.sdi_distance_m),
+                ("SDI 2", speed.secondary_sdi_type, speed.secondary_sdi_speed_limit_kph,
+                 speed.secondary_sdi_distance_m),
+            )
+            for label, sdi_type, speed_limit_kph, distance_m in sdi_values:
+                if sdi_type is None:
+                    continue
+                sdi = label
+                if speed_limit_kph is not None:
+                    sdi += f" {display_speed(speed_limit_kph, self.is_metric):.0f} {speed_unit(self.is_metric)}"
+                if distance_m is not None:
+                    sdi += f"  {self._format_navi_distance(distance_m)}"
+                self._draw_text(sdi, x, y + 6.0, 24.0, AMBER)
+                y += 40.0
+            if speed.section_active:
+                section = self._text("section")
+                if speed.section_average_kph is not None:
+                    section += f" {self._text('average')} {display_speed(speed.section_average_kph, self.is_metric):.0f}"
+                if speed.section_remaining_distance_m is not None:
+                    section += f"  {self._format_navi_distance(speed.section_remaining_distance_m)}"
+                self._draw_text(self._ellipsize_text(section, 20.0, width), x, y + 4.0, 20.0, theme.text)
+                y += 34.0
+
+        route_y = max(292.0, y + 8.0)
+        if navi is not None and navi.route is not None:
+            route = navi.route
+            total = max(1, route.total_distance_m)
+            progress = clamp(route.moved_distance_m / total, 0.0, 1.0)
+            self._draw_text(self._text("route"), x, route_y, 15.0, theme.muted)
+            route_value = self._format_navi_distance(route.remaining_distance_m)
+            if route.remaining_time_s > 0:
+                route_value += f" / {max(1, round(route.remaining_time_s / 60.0))} min"
+            self._draw_text(route_value, x + width, route_y - 2.0, 20.0, theme.text, anchor="right")
+            bar_y = route_y + 28.0
+            rl.draw_rectangle_rounded(rl.Rectangle(x, bar_y, width, 8.0), 1.0, 8, rl_color(theme.faint))
+            if progress > 0.0:
+                rl.draw_rectangle_rounded(
+                    rl.Rectangle(x, bar_y, max(8.0, width * progress), 8.0),
+                    1.0,
+                    8,
+                    rl_color(BLUE_SOFT),
+                )
+
+        status_y = 358.0
+        if dashboard is None:
+            self._draw_text(f"TCP 7714 {self._text('waiting')}", x, status_y, 18.0, AMBER)
+            return
+        status_color = GREEN if dashboard.connected and dashboard.error is None else RED if dashboard.error else AMBER
+        status_text = self._text("connected") if dashboard.connected else self._text("waiting")
+        self._draw_text(status_text, x, status_y, 18.0, status_color)
+        self._draw_text(
+            f"{dashboard.app_version or '-'}  rev {dashboard.manifest_revision}  rx {dashboard.received_count}",
+            x + width,
+            status_y,
+            15.0,
+            theme.muted,
+            anchor="right",
+        )
+        self._draw_text(self._ellipsize_text(dashboard.app_status, 14.0, width), x, status_y + 27.0, 14.0, theme.text)
+        self._draw_text(self._ellipsize_text(dashboard.camera_status, 14.0, width), x, status_y + 49.0, 14.0, theme.text)
+        self._draw_text(
+            self._ellipsize_text(dashboard.composition_status, 14.0, width),
+            x,
+            status_y + 71.0,
+            14.0,
+            theme.text,
+        )
+        present = sum(1 for item in dashboard.items if item.present)
+        age = "-" if dashboard.last_received_age_ms is None else f"{dashboard.last_received_age_ms} ms"
+        footer = f"STREAMS {present}/28 VALUE  |  AGE {age}  |  {dashboard.peer}"
+        self._draw_text(self._ellipsize_text(footer, 13.0, width), x, 458.0, 13.0, theme.muted)
+        if dashboard.error:
+            self._draw_text(self._ellipsize_text(dashboard.error, 13.0, width), x, 436.0, 13.0, RED)
+
+    def _draw_navi_route_fallback(self, navi: NaviLiveState | None, rect: rl.Rectangle) -> None:
+        theme = self._current_theme()
+        rl.draw_rectangle_rec(rect, rl_color((9, 13, 18)))
+        route = navi.route if navi is not None else None
+        points = route.polyline if route is not None else ()
+        if len(points) >= 2:
+            latitudes = [point[0] for point in points]
+            longitudes = [point[1] for point in points]
+            min_lat, max_lat = min(latitudes), max(latitudes)
+            min_lon, max_lon = min(longitudes), max(longitudes)
+            lat_span = max(0.00001, max_lat - min_lat)
+            lon_span = max(0.00001, max_lon - min_lon)
+
+            def project(latitude: float, longitude: float) -> rl.Vector2:
+                px = rect.x + 42.0 + (longitude - min_lon) / lon_span * (rect.width - 84.0)
+                py = rect.y + rect.height - 42.0 - (latitude - min_lat) / lat_span * (rect.height - 84.0)
+                return rl.Vector2(px, py)
+
+            previous = project(*points[0])
+            for point in points[1:]:
+                current = project(*point)
+                rl.draw_line_ex(previous, current, 7.0, rl_color((21, 58, 96)))
+                rl.draw_line_ex(previous, current, 3.0, rl_color(BLUE_SOFT))
+                previous = current
+            if navi is not None and navi.vehicle is not None:
+                vehicle = project(navi.vehicle.latitude, navi.vehicle.longitude)
+                rl.draw_circle_v(vehicle, 11.0, rl_color(WHITE))
+                rl.draw_circle_v(vehicle, 7.0, rl_color(BLUE))
+        self._draw_text("MAP STREAM WAITING", rect.x + rect.width * 0.5, 224.0, 18.0, theme.muted, anchor="center")
+
+    def _draw_navi_media(
+        self,
+        frame: NaviMediaFrame | None,
+        rect: rl.Rectangle,
+        *,
+        cover: bool = False,
+        align_x: float = 0.5,
+        align_y: float = 0.5,
+    ) -> bool:
+        texture = self._navi_media_texture_for(frame)
+        cached = self._navi_media_textures.get(frame.key) if frame is not None else None
+        if texture is None or cached is None or cached.size[0] <= 0 or cached.size[1] <= 0:
+            return False
+        source_w = float(cached.size[0])
+        source_h = float(cached.size[1])
+        scale = max(rect.width / source_w, rect.height / source_h) if cover else min(
+            rect.width / source_w,
+            rect.height / source_h,
+        )
+        draw_w = source_w * scale
+        draw_h = source_h * scale
+        source = rl.Rectangle(0.0, 0.0, source_w, source_h)
+        dest = rl.Rectangle(
+            rect.x + (rect.width - draw_w) * clamp(align_x, 0.0, 1.0),
+            rect.y + (rect.height - draw_h) * clamp(align_y, 0.0, 1.0),
+            draw_w,
+            draw_h,
+        )
+        self._draw_cached_navi_media(cached, source, dest)
+        return True
+
+    def _navi_media_fitted_size(
+        self,
+        frame: NaviMediaFrame | None,
+        rect: rl.Rectangle,
+        *,
+        cover: bool = False,
+    ) -> tuple[float, float] | None:
+        texture = self._navi_media_texture_for(frame)
+        cached = self._navi_media_textures.get(frame.key) if frame is not None else None
+        if texture is None or cached is None or cached.size[0] <= 0 or cached.size[1] <= 0:
+            return None
+        source_w = float(cached.size[0])
+        source_h = float(cached.size[1])
+        scale = max(rect.width / source_w, rect.height / source_h) if cover else min(
+            rect.width / source_w,
+            rect.height / source_h,
+        )
+        return source_w * scale, source_h * scale
+
+    def _draw_cached_navi_media(
+        self,
+        cached: CachedNaviMediaTexture,
+        source: rl.Rectangle,
+        dest: rl.Rectangle,
+    ) -> None:
+        if cached.mime == "video/nv12-dmabuf":
+            token = cached.hardware_token
+            egl_image = self._navi_egl_images.get(token) if token is not None else None
+            if egl_image is None:
+                return
+            from openpilot.system.ui.lib.egl import bind_egl_image_to_texture
+
+            shader = self._get_navi_external_shader()
+            rl.begin_shader_mode(shader)
+            try:
+                # GL_TEXTURE_EXTERNAL_OES is texture-unit state and raylib only
+                # restores GL_TEXTURE_2D during a batch draw. Rebind on every
+                # draw so the road camera cannot remain selected on texture0.
+                bind_egl_image_to_texture(cached.texture.id, egl_image)
+                rl.draw_texture_pro(cached.texture, source, dest, rl.Vector2(0.0, 0.0), 0.0, rl_color(WHITE))
+            finally:
+                rl.end_shader_mode()
+            return
+        if cached.mime != "image/yuv420p":
+            rl.draw_texture_pro(cached.texture, source, dest, rl.Vector2(0.0, 0.0), 0.0, rl_color(WHITE))
+            return
+        if cached.u_texture is None or cached.v_texture is None:
+            return
+        shader = self._get_navi_yuv_shader()
+        locations = self._navi_yuv_shader_locations
+        rl.begin_shader_mode(shader)
+        try:
+            rl.set_shader_value_texture(shader, locations["texture1"], cached.u_texture)
+            rl.set_shader_value_texture(shader, locations["texture2"], cached.v_texture)
+            rl.set_shader_value(
+                shader,
+                locations["uvScaleU"],
+                cached.uv_scale_u,
+                rl.ShaderUniformDataType.SHADER_UNIFORM_VEC2,
+            )
+            rl.set_shader_value(
+                shader,
+                locations["uvScaleV"],
+                cached.uv_scale_v,
+                rl.ShaderUniformDataType.SHADER_UNIFORM_VEC2,
+            )
+            rl.draw_texture_pro(cached.texture, source, dest, rl.Vector2(0.0, 0.0), 0.0, rl_color(WHITE))
+        finally:
+            rl.end_shader_mode()
+
+    def _get_navi_external_shader(self):
+        if self._navi_external_shader is None:
+            self._navi_external_shader = rl.load_shader_from_memory(
+                NAVI_EXTERNAL_VERTEX_SHADER,
+                NAVI_EXTERNAL_FRAGMENT_SHADER,
+            )
+            if not rl.is_shader_valid(self._navi_external_shader):
+                rl.unload_shader(self._navi_external_shader)
+                self._navi_external_shader = None
+                raise RuntimeError("failed to load Navi external NV12 shader")
+        return self._navi_external_shader
+
+    def _get_navi_yuv_shader(self):
+        if self._navi_yuv_shader is None:
+            self._navi_yuv_shader = rl.load_shader_from_memory(
+                NV12_PACK_VERTEX_SHADER,
+                NAVI_YUV420_FRAGMENT_SHADER,
+            )
+            if not rl.is_shader_valid(self._navi_yuv_shader):
+                rl.unload_shader(self._navi_yuv_shader)
+                self._navi_yuv_shader = None
+                raise RuntimeError("failed to load Navi YUV420 shader")
+            self._navi_yuv_shader_locations = {
+                name: rl.get_shader_location(self._navi_yuv_shader, name)
+                for name in ("texture1", "texture2", "uvScaleU", "uvScaleV")
+            }
+        return self._navi_yuv_shader
+
+    @staticmethod
+    def _load_navi_plane_texture(width: int, height: int, texture_filter):
+        image = rl.Image(None, int(width), int(height), 1, rl.PixelFormat.PIXELFORMAT_UNCOMPRESSED_GRAYSCALE)
+        texture = rl.load_texture_from_image(image)
+        if not rl.is_texture_valid(texture):
+            raise RuntimeError(f"failed to allocate Navi YUV plane texture {width}x{height}")
+        rl.set_texture_filter(texture, texture_filter)
+        return texture
+
+    @staticmethod
+    def _unload_navi_media_texture(cached: CachedNaviMediaTexture) -> None:
+        for texture in (cached.texture, cached.u_texture, cached.v_texture):
+            if texture is not None:
+                rl.unload_texture(texture)
+
+    def _evict_navi_egl_images(self) -> None:
+        if len(self._navi_egl_images) <= NAVI_EGL_IMAGE_CACHE_LIMIT:
+            return
+        from openpilot.system.ui.lib.egl import destroy_egl_image
+
+        active_tokens = {
+            cached.hardware_token
+            for cached in self._navi_media_textures.values()
+            if cached.hardware_token is not None
+        }
+        for token in tuple(self._navi_egl_images):
+            if len(self._navi_egl_images) <= NAVI_EGL_IMAGE_CACHE_LIMIT:
+                break
+            if token in active_tokens:
+                continue
+            destroy_egl_image(self._navi_egl_images.pop(token))
+
+    def _discard_stale_navi_egl_generation(self, generation: int) -> None:
+        stale_tokens = tuple(token for token in self._navi_egl_images if token[0] != generation)
+        if not stale_tokens:
+            return
+        from openpilot.system.ui.lib.egl import destroy_egl_image
+
+        for token in stale_tokens:
+            destroy_egl_image(self._navi_egl_images.pop(token))
+
+    def _upload_navi_hardware_buffer(
+        self,
+        frame: NaviMediaFrame,
+        cached: CachedNaviMediaTexture | None,
+    ):
+        hardware_buffer = frame.hardware_buffer
+        if hardware_buffer is None:
+            return cached.texture if cached is not None else None
+        width = int(frame.width)
+        height = int(frame.height)
+        stride = int(getattr(hardware_buffer, "stride", 0))
+        uv_offset = int(getattr(hardware_buffer, "uv_offset", 0))
+        fd = int(getattr(hardware_buffer, "fd", -1))
+        token = tuple(getattr(hardware_buffer, "token", ()))
+        if (
+            width <= 0
+            or height <= 0
+            or stride < width
+            or uv_offset < stride * height
+            or fd < 0
+            or len(token) != 2
+        ):
+            return cached.texture if cached is not None else None
+
+        profile_stage = self._profile_start()
+        try:
+            from openpilot.system.ui.lib.egl import bind_egl_image_to_texture, create_egl_image, init_egl
+
+            if not init_egl():
+                raise RuntimeError("EGL DMA-BUF import is unavailable")
+            self._discard_stale_navi_egl_generation(int(token[0]))
+            egl_image = self._navi_egl_images.get(token)
+            if egl_image is None:
+                egl_image = create_egl_image(width, height, stride, fd, uv_offset)
+                if egl_image is None:
+                    raise RuntimeError("EGL rejected the decoded NV12 DMA-BUF")
+                self._navi_egl_images[token] = egl_image
+            else:
+                self._navi_egl_images.move_to_end(token)
+
+            reuse = bool(
+                cached is not None
+                and cached.mime == frame.mime
+                and cached.size == (width, height)
+                and cached.u_texture is None
+                and cached.v_texture is None
+            )
+            texture = cached.texture if reuse else None
+            if texture is None:
+                image = rl.gen_image_color(1, 1, rl.BLACK)
+                try:
+                    texture = rl.load_texture_from_image(image)
+                finally:
+                    rl.unload_image(image)
+                if not rl.is_texture_valid(texture):
+                    raise RuntimeError("failed to allocate Navi external texture")
+                rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+            texture.width = width
+            texture.height = height
+            bind_egl_image_to_texture(texture.id, egl_image)
+        except Exception as exc:
+            if "texture" in locals() and texture is not None and (cached is None or texture is not cached.texture):
+                rl.unload_texture(texture)
+            mark_failed = getattr(hardware_buffer, "mark_egl_import_failed", None)
+            if mark_failed is not None:
+                mark_failed(str(exc))
+            print(
+                f"Navi hardware H264 EGL import failed token={token}; requesting PyAV fallback: {exc}",
+                flush=True,
+            )
+            return cached.texture if cached is not None else None
+
+        replacement = CachedNaviMediaTexture(
+            sequence=frame.sequence,
+            size=(width, height),
+            mime=frame.mime,
+            texture=texture,
+            hardware_token=(int(token[0]), int(token[1])),
+        )
+        if cached is not None and cached.texture is not texture:
+            self._unload_navi_media_texture(cached)
+        self._navi_media_textures[frame.key] = replacement
+        self._evict_navi_egl_images()
+        self._profile_add("navi_media.bind_nv12_dmabuf", profile_stage)
+        return texture
+
+    def _upload_navi_yuv420p(
+        self,
+        frame: NaviMediaFrame,
+        cached: CachedNaviMediaTexture | None,
+    ):
+        if frame.plane_data is None or frame.plane_strides is None:
+            return cached.texture if cached is not None else None
+        width = int(frame.width)
+        height = int(frame.height)
+        if width <= 0 or height <= 0 or (width & 1) != 0 or (height & 1) != 0:
+            return cached.texture if cached is not None else None
+        y_stride, u_stride, v_stride = (int(value) for value in frame.plane_strides)
+        chroma_width = width // 2
+        chroma_height = height // 2
+        if y_stride < width or u_stride < chroma_width or v_stride < chroma_width:
+            return cached.texture if cached is not None else None
+        plane_shapes = (
+            (y_stride, height),
+            (u_stride, chroma_height),
+            (v_stride, chroma_height),
+        )
+        if any(
+            len(data) < stride * plane_height
+            for data, (stride, plane_height) in zip(frame.plane_data, plane_shapes, strict=True)
+        ):
+            return cached.texture if cached is not None else None
+
+        reuse = bool(
+            cached is not None
+            and cached.mime == frame.mime
+            and cached.size == (width, height)
+            and cached.texture.width == y_stride
+            and cached.texture.height == height
+            and cached.u_texture is not None
+            and cached.u_texture.width == u_stride
+            and cached.v_texture is not None
+            and cached.v_texture.width == v_stride
+        )
+        replacement = cached
+        if not reuse:
+            created: list[object] = []
+            try:
+                y_texture = self._load_navi_plane_texture(
+                    y_stride,
+                    height,
+                    rl.TextureFilter.TEXTURE_FILTER_BILINEAR,
+                )
+                created.append(y_texture)
+                u_texture = self._load_navi_plane_texture(
+                    u_stride,
+                    chroma_height,
+                    rl.TextureFilter.TEXTURE_FILTER_POINT,
+                )
+                created.append(u_texture)
+                v_texture = self._load_navi_plane_texture(
+                    v_stride,
+                    chroma_height,
+                    rl.TextureFilter.TEXTURE_FILTER_POINT,
+                )
+                created.append(v_texture)
+                replacement = CachedNaviMediaTexture(
+                    sequence=frame.sequence,
+                    size=(width, height),
+                    mime=frame.mime,
+                    texture=y_texture,
+                    u_texture=u_texture,
+                    v_texture=v_texture,
+                    uv_scale_u=rl.ffi.new("float[]", [y_stride / (2.0 * u_stride), 1.0]),
+                    uv_scale_v=rl.ffi.new("float[]", [y_stride / (2.0 * v_stride), 1.0]),
+                )
+            except Exception:
+                for texture in created:
+                    rl.unload_texture(texture)
+                return cached.texture if cached is not None else None
+
+        if replacement is None or replacement.u_texture is None or replacement.v_texture is None:
+            return cached.texture if cached is not None else None
+        profile_stage = self._profile_start()
+        try:
+            for texture, plane in zip(
+                (replacement.texture, replacement.u_texture, replacement.v_texture),
+                frame.plane_data,
+                strict=True,
+            ):
+                pixels = rl.ffi.cast("void *", rl.ffi.from_buffer("const unsigned char[]", plane))
+                rl.update_texture(texture, pixels)
+        except Exception:
+            if replacement is not cached:
+                self._unload_navi_media_texture(replacement)
+            return cached.texture if cached is not None else None
+        self._profile_add("navi_media.upload_yuv420p", profile_stage)
+
+        replacement.sequence = frame.sequence
+        if replacement is not cached:
+            if cached is not None:
+                self._unload_navi_media_texture(cached)
+            self._navi_media_textures[frame.key] = replacement
+        return replacement.texture
+
+    def _navi_media_texture_for(self, frame: NaviMediaFrame | None):
+        if frame is None:
+            return None
+        cached = self._navi_media_textures.get(frame.key)
+        has_payload = frame.hardware_buffer is not None or frame.data is not None or (
+            frame.mime == "image/yuv420p" and frame.plane_data is not None and frame.plane_strides is not None
+        )
+        if not frame.present or not has_payload:
+            if cached is not None:
+                self._unload_navi_media_texture(cached)
+                self._navi_media_textures.pop(frame.key, None)
+            return None
+        if cached is not None and cached.sequence == frame.sequence and cached.mime == frame.mime:
+            return cached.texture
+        if frame.mime == "video/nv12-dmabuf":
+            return self._upload_navi_hardware_buffer(frame, cached)
+        if frame.mime == "image/yuv420p":
+            return self._upload_navi_yuv420p(frame, cached)
+        size = (frame.width, frame.height)
+        if frame.mime == "image/rgba":
+            if len(frame.data) != frame.width * frame.height * 4:
+                return cached.texture if cached is not None else None
+            if cached is None or cached.mime != frame.mime or cached.size != size:
+                if cached is not None:
+                    self._unload_navi_media_texture(cached)
+                image = rl.gen_image_color(frame.width, frame.height, rl_color((0, 0, 0)))
+                texture = rl.load_texture_from_image(image)
+                rl.unload_image(image)
+                if not rl.is_texture_valid(texture):
+                    return None
+                rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+            else:
+                texture = cached.texture
+            pixels = rl.ffi.cast("void *", rl.ffi.from_buffer("const unsigned char[]", frame.data))
+            rl.update_texture(texture, pixels)
+            self._navi_media_textures[frame.key] = CachedNaviMediaTexture(
+                frame.sequence,
+                size,
+                frame.mime,
+                texture,
+            )
+            return texture
+
+        extension = ".jpg" if "jpeg" in frame.mime else ".png"
+        loaded_image = None
+        try:
+            loaded_image = rl.load_image_from_memory(extension, frame.data, len(frame.data))
+            if not rl.is_image_valid(loaded_image):
+                return cached.texture if cached is not None else None
+            texture = rl.load_texture_from_image(loaded_image)
+            if not rl.is_texture_valid(texture):
+                rl.unload_texture(texture)
+                return cached.texture if cached is not None else None
+            rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+            if cached is not None:
+                self._unload_navi_media_texture(cached)
+            self._navi_media_textures[frame.key] = CachedNaviMediaTexture(
+                frame.sequence,
+                (int(texture.width), int(texture.height)),
+                frame.mime,
+                texture,
+            )
+            return texture
+        except Exception:
+            return cached.texture if cached is not None else None
+        finally:
+            if loaded_image is not None and rl.is_image_valid(loaded_image):
+                rl.unload_image(loaded_image)
+
+    @staticmethod
+    def _navi_live_panel_visible(navi: NaviLiveState | None) -> bool:
+        if navi is None:
+            return False
+        return bool(
+            navi.current is not None
+            or navi.next is not None
+            or navi.lane_current is not None
+            or navi.route is not None
+            or (navi.crossroad is not None and navi.crossroad.visible)
+            or (
+                navi.speed is not None
+                and (navi.speed.sdi_type is not None or navi.speed.section_active)
+            )
+            or (navi.status is not None and navi.status.guidance_active)
+        )
+
+    @staticmethod
+    def _navi_map_frame_present(dashboard: NaviDashboardState | None) -> bool:
+        if dashboard is None or not dashboard.connected or dashboard.map_stream_stalled:
+            return False
+        return any(frame.key == "render:map_main" and frame.present for frame in dashboard.media)
+
+    def _draw_navi_map_stalled(self, rect: rl.Rectangle, age_ms: int | None) -> None:
+        rl.draw_rectangle_rec(rect, rl_color(NAVI_MAP_BACKGROUND))
+        center_x = rect.x + rect.width * 0.5
+        center_y = rect.y + rect.height * 0.5
+        self._draw_text_with_stroke(
+            "MAP STREAM STALLED",
+            center_x,
+            center_y - 18.0,
+            24.0,
+            AMBER,
+            (5, 9, 12),
+            2,
+            anchor="center",
+        )
+        age_text = "WAITING FOR NEXT FRAME"
+        if age_ms is not None:
+            age_text = f"NO MAP FRAME FOR {age_ms / 1000.0:.1f} s"
+        self._draw_text_with_stroke(
+            age_text,
+            center_x,
+            center_y + 18.0,
+            16.0,
+            WHITE,
+            (5, 9, 12),
+            1,
+            anchor="center",
+        )
+
+    def _draw_navi_live_panel(self, state: ClusterUiState) -> None:
+        navi = state.navi_live
+        theme = self._current_theme()
+        x = self._information_panel_x(NAVI_LIVE_PANEL_X)
+        y = NAVI_LIVE_PANEL_Y
+        w = NAVI_LIVE_PANEL_W
+        h = NAVI_LIVE_PANEL_H
+
+        dashboard = state.navi_dashboard
+        if dashboard is not None and not dashboard.connected:
+            self._draw_system_stats_panel(
+                state,
+                panel_x=x,
+                panel_y=y,
+                panel_w=w,
+                panel_h=h,
+                status_text="NAVI DISCONNECTED",
+            )
+            return
+        if dashboard is not None and dashboard.map_stream_stalled:
+            self._rounded_rect(x, y, w, h, 8.0, NAVI_MAP_BACKGROUND, theme.faint, 2.0)
+            self._draw_navi_map_stalled(
+                rl.Rectangle(x + 3.0, y + 3.0, w - 6.0, h - 6.0),
+                dashboard.map_frame_age_ms,
+            )
+            self._rounded_rect(x, y, w, h, 8.0, (0, 0, 0, 0), theme.faint, 2.0)
+            return
+
+        media = {
+            frame.key: frame
+            for frame in dashboard.media
+        } if dashboard is not None else {}
+        map_frame = media.get("render:map_main")
+        panel_bg = NAVI_MAP_BACKGROUND if map_frame is not None and map_frame.present else theme.route_panel_bg
+        self._rounded_rect(x, y, w, h, 8.0, panel_bg, theme.faint, 2.0)
+        map_rect = rl.Rectangle(x + 3.0, y + 3.0, w - 6.0, h - 6.0)
+        if map_frame is not None and map_frame.present:
+            rl.draw_rectangle_rec(map_rect, rl_color(NAVI_MAP_BACKGROUND))
+            rl.begin_scissor_mode(
+                int(round(map_rect.x)),
+                int(round(map_rect.y)),
+                int(round(map_rect.width)),
+                int(round(map_rect.height)),
+            )
+            try:
+                self._draw_navi_media(map_frame, map_rect, cover=True)
+            finally:
+                rl.end_scissor_mode()
+            self._rounded_rect(x, y, w, h, 8.0, (0, 0, 0, 0), theme.faint, 2.0)
+            self._draw_navi_crossroad_box(media.get("image:crossroad_expanded"), x, y, h)
+
+            current_frame = media.get("image:tbt_current_compact")
+            if current_frame is None or not current_frame.present:
+                current_frame = media.get("image:tbt_current_full")
+            current_rect = rl.Rectangle(
+                x + 12.0,
+                y + 12.0,
+                310.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE,
+                116.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE,
+            )
+            current_size = self._navi_media_fitted_size(current_frame, current_rect)
+            self._draw_navi_media(
+                current_frame,
+                current_rect,
+                align_x=0.0,
+                align_y=0.0,
+            )
+            # The compact TBT bitmap includes transparent padding at its bottom.
+            next_y = current_rect.y + max(
+                0.0,
+                (current_size[1] if current_size is not None else 0.0)
+                - 24.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE,
+            )
+            self._draw_navi_media(
+                media.get("image:tbt_next"),
+                rl.Rectangle(
+                    x + 12.0,
+                    next_y,
+                    190.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE,
+                    68.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE,
+                ),
+                align_x=0.0,
+                align_y=0.0,
+            )
+
+            map_center_x = x + w * 0.5
+            center_tbt_icon_rect = rl.Rectangle(map_center_x - 55.0, y + 76.0, 110.0, 110.0)
+            self._draw_navi_media(
+                media.get("image:center_tbt_icon"),
+                center_tbt_icon_rect,
+            )
+            self._draw_navi_media(
+                media.get("image:center_tbt_text"),
+                rl.Rectangle(
+                    map_center_x - 110.0,
+                    center_tbt_icon_rect.y + center_tbt_icon_rect.height + 2.0,
+                    220.0,
+                    78.0,
+                ),
+            )
+            traffic_rect = rl.Rectangle(x + w - 242.0, y + 12.0, 230.0, 98.0)
+            self._draw_navi_media(
+                media.get("image:traffic_signal"),
+                traffic_rect,
+                align_x=1.0,
+                align_y=0.0,
+            )
+
+            safety_frame = next(
+                (
+                    frame
+                    for key in ("image:safety_primary", "image:safety_secondary", "image:safety_section")
+                    for frame in (media.get(key),)
+                    if frame is not None and frame.present
+                ),
+                None,
+            )
+            self._draw_navi_media(
+                safety_frame,
+                rl.Rectangle(x + 10.0, y + h * 0.62 - 50.0, 110.0, 100.0),
+                align_x=0.0,
+            )
+            lane_width = 226.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE
+            lane_height = 67.0 * NAVI_LIVE_GUIDANCE_MEDIA_SCALE
+            lane_rect = rl.Rectangle(
+                x + (w - lane_width) * 0.5,
+                y + h - lane_height - 6.0,
+                lane_width,
+                lane_height,
+            )
+            lane_frame = media.get("image:lane_bottom")
+            lane_size = self._navi_media_fitted_size(lane_frame, lane_rect)
+            self._draw_navi_media(
+                lane_frame,
+                lane_rect,
+            )
+
+            lane_left = lane_rect.x
+            lane_right = lane_rect.x + lane_rect.width
+            if lane_size is not None:
+                lane_left += (lane_rect.width - lane_size[0]) * 0.5
+                lane_right = lane_left + lane_size[0]
+
+            if navi is not None and navi.route is not None:
+                route = navi.route
+                left_x = x + 14.0
+                left_width = lane_left - left_x - 14.0
+                distance = self._format_navi_distance(route.remaining_distance_m)
+                minutes = max(1, round(route.remaining_time_s / 60.0))
+                arrival = time.strftime("%H:%M", time.localtime(time.time() + max(0, route.remaining_time_s)))
+                self._draw_text_with_stroke(
+                    self._ellipsize_text(distance, 25.0, left_width),
+                    left_x,
+                    y + h - 48.0,
+                    25.0,
+                    WHITE,
+                    (10, 13, 16),
+                    2,
+                )
+                self._draw_text_with_stroke(
+                    self._ellipsize_text(f"{arrival}  {minutes} min", 22.0, left_width),
+                    left_x,
+                    y + h - 19.0,
+                    22.0,
+                    WHITE,
+                    (10, 13, 16),
+                    2,
+                )
+
+            road_name = navi.vehicle.road_name if navi is not None and navi.vehicle is not None else ""
+            right_x = x + w - 14.0
+            right_width = right_x - lane_right - 14.0
+            if road_name and right_width >= 70.0:
+                self._draw_text_with_stroke(
+                    self._ellipsize_text(road_name, 20.0, right_width),
+                    right_x,
+                    y + h - 25.0,
+                    20.0,
+                    WHITE,
+                    (10, 13, 16),
+                    2,
+                    anchor="right",
+                    cache=True,
+                )
+            return
+
+        if navi is None:
+            return
+
+        current = navi.current
+        if current is not None:
+            self._draw_navi_turn_icon(current.turn_type, x + 72.0, NAVI_LIVE_ICON_Y, NAVI_LIVE_ICON_SIZE)
+            distance_text = self._format_navi_distance(current.distance_m)
+            self._draw_text(distance_text, x + 136.0, y + 26.0, 38.0, theme.text)
+            main_text = current.main_text or current.road_name or current.near_direction
+            self._draw_text(
+                self._ellipsize_text(main_text, 25.0, NAVI_LIVE_CONTENT_W),
+                x + 136.0,
+                y + 75.0,
+                25.0,
+                theme.text,
+            )
+            detail = current.road_name if current.road_name and current.road_name != main_text else current.near_direction
+            if detail:
+                self._draw_text(
+                    self._ellipsize_text(detail, 18.0, NAVI_LIVE_CONTENT_W),
+                    x + 136.0,
+                    y + 112.0,
+                    18.0,
+                    theme.muted,
+                )
+        elif navi.vehicle is not None and navi.vehicle.road_name:
+            road_name = self._ellipsize_text(navi.vehicle.road_name, 28.0, w - 48.0)
+            self._draw_text(road_name, x + 24.0, y + 34.0, 28.0, theme.text)
+
+        next_guidance = navi.next
+        if next_guidance is not None:
+            rl.draw_line_ex(
+                rl.Vector2(x + 20.0, NAVI_LIVE_NEXT_Y - 12.0),
+                rl.Vector2(x + w - 20.0, NAVI_LIVE_NEXT_Y - 12.0),
+                1.5,
+                rl_color(theme.faint),
+            )
+            self._draw_navi_turn_icon(next_guidance.turn_type, x + 46.0, NAVI_LIVE_NEXT_Y + 22.0, 44.0)
+            self._draw_text(
+                self._format_navi_distance(next_guidance.distance_m),
+                x + 82.0,
+                NAVI_LIVE_NEXT_Y - 1.0,
+                24.0,
+                theme.text,
+            )
+            next_text = next_guidance.main_text or next_guidance.road_name or next_guidance.near_direction
+            self._draw_text(
+                self._ellipsize_text(next_text, 18.0, w - 180.0),
+                x + 180.0,
+                NAVI_LIVE_NEXT_Y + 5.0,
+                18.0,
+                theme.muted,
+            )
+
+        lane = navi.lane_current
+        if lane is None and navi.lane_ahead:
+            lane = navi.lane_ahead[0]
+        if lane is not None and lane.visible:
+            self._draw_navi_lane_strip(lane)
+
+        footer_parts: list[str] = []
+        if navi.route is not None and navi.route.remaining_distance_m > 0:
+            route_text = self._format_navi_distance(navi.route.remaining_distance_m)
+            if navi.route.remaining_time_s > 0:
+                route_text += f" / {max(1, round(navi.route.remaining_time_s / 60.0))} min"
+            footer_parts.append(route_text)
+        if navi.speed is not None and navi.speed.sdi_type is not None:
+            sdi_text = "SDI"
+            if navi.speed.sdi_speed_limit_kph:
+                sdi_text += f" {display_speed(navi.speed.sdi_speed_limit_kph, self.is_metric):.0f}"
+            if navi.speed.sdi_distance_m is not None:
+                sdi_text += f" / {self._format_navi_distance(navi.speed.sdi_distance_m)}"
+            footer_parts.append(sdi_text)
+        if navi.speed is not None and navi.speed.secondary_sdi_type is not None:
+            secondary_sdi_text = "SDI2"
+            if navi.speed.secondary_sdi_speed_limit_kph:
+                secondary_sdi_text += (
+                    f" {display_speed(navi.speed.secondary_sdi_speed_limit_kph, self.is_metric):.0f}"
+                )
+            if navi.speed.secondary_sdi_distance_m is not None:
+                secondary_sdi_text += f" / {self._format_navi_distance(navi.speed.secondary_sdi_distance_m)}"
+            footer_parts.append(secondary_sdi_text)
+        if navi.crossroad is not None and navi.crossroad.visible:
+            footer_parts.append(f"JCT {self._format_navi_distance(navi.crossroad.distance_m)}")
+        if navi.status is not None and navi.status.off_route:
+            footer_parts.append(self._text("off_route"))
+        if footer_parts:
+            footer = self._ellipsize_text("   ".join(footer_parts), 18.0, w - 40.0)
+            self._draw_text(footer, x + 20.0, NAVI_LIVE_FOOTER_Y, 18.0, theme.muted)
+
+    def _draw_navi_crossroad_box(
+        self,
+        frame: NaviMediaFrame | None,
+        map_left: float,
+        map_top: float,
+        map_height: float,
+    ) -> None:
+        if frame is None or not frame.present or frame.width <= 0 or frame.height <= 0:
+            return
+        theme = self._current_theme()
+        box_h = map_height * 0.70
+        aspect = frame.width / max(1.0, float(frame.height))
+        if self._panel_swap_active():
+            box_x = map_left + NAVI_LIVE_PANEL_W
+            available_w = DESIGN_WIDTH - box_x - 4.0
+        else:
+            available_w = map_left - 830.0
+            box_x = map_left
+        box_w = clamp(box_h * aspect, 320.0, max(320.0, available_w))
+        if not self._panel_swap_active():
+            box_x -= box_w
+        box = rl.Rectangle(box_x, map_top, box_w, box_h)
+        self._rounded_rect(box.x, box.y, box.width, box.height, 8.0, theme.route_panel_bg, theme.faint, 2.0)
+        image_rect = rl.Rectangle(box.x + 4.0, box.y + 4.0, box.width - 8.0, box.height - 8.0)
+        rl.begin_scissor_mode(
+            int(round(image_rect.x)),
+            int(round(image_rect.y)),
+            int(round(image_rect.width)),
+            int(round(image_rect.height)),
+        )
+        try:
+            self._draw_navi_media(frame, image_rect, cover=True)
+        finally:
+            rl.end_scissor_mode()
+        self._rounded_rect(box.x, box.y, box.width, box.height, 8.0, (0, 0, 0, 0), theme.faint, 2.0)
+
+    def _draw_navi_lane_strip(self, lane: NaviLaneInfo) -> None:
+        theme = self._current_theme()
+        count = min(8, max(lane.count, len(lane.available), len(lane.turn_info)))
+        if count <= 0:
+            return
+        x = self._information_panel_x(NAVI_LIVE_PANEL_X) + 22.0
+        available_w = NAVI_LIVE_PANEL_W - 44.0
+        gap = 6.0
+        cell_w = min(46.0, (available_w - gap * (count - 1)) / count)
+        total_w = cell_w * count + gap * (count - 1)
+        x += (available_w - total_w) * 0.5
+        y = NAVI_LIVE_LANE_Y
+        current_index = lane.current_lane - 1 if 1 <= lane.current_lane <= count else lane.current_lane
+        for index in range(count):
+            available = index < len(lane.available) and lane.available[index] > 0
+            active = index == current_index
+            fill = (35, 92, 58, 230) if available else theme.panel_bg
+            outline = GREEN if active else (102, 194, 132) if available else theme.faint
+            self._rounded_rect(x, y, cell_w, 46.0, 4.0, fill, outline, 3.0 if active else 1.5)
+            center_x = x + cell_w * 0.5
+            arrow_color = GREEN if available else theme.muted
+            self._draw_navi_round_line(
+                rl.Vector2(center_x, y + 33.0),
+                rl.Vector2(center_x, y + 14.0),
+                3.0,
+                arrow_color,
+            )
+            rl.draw_triangle(
+                rl.Vector2(center_x, y + 8.0),
+                rl.Vector2(center_x - 5.0, y + 16.0),
+                rl.Vector2(center_x + 5.0, y + 16.0),
+                rl_color(arrow_color),
+            )
+            x += cell_w + gap
+
+    def _draw_navi_turn_icon(self, turn_type: int, cx: float, cy: float, size: float) -> None:
+        theme = self._current_theme()
+        radius = size * 0.5
+        rl.draw_circle_v(rl.Vector2(cx, cy), radius, rl_color((24, 88, 148, 235)))
+        rl.draw_ring(
+            rl.Vector2(cx, cy),
+            max(0.0, radius - 2.0),
+            radius,
+            0.0,
+            360.0,
+            48,
+            rl_color(BLUE_SOFT),
+        )
+        color = WHITE if theme.is_dark else (246, 249, 252)
+        width = max(3.0, size * 0.075)
+
+        def point(dx: float, dy: float) -> rl.Vector2:
+            return rl.Vector2(cx + dx * size, cy + dy * size)
+
+        if turn_type in (153, 154, 249):
+            self._draw_text("TG", cx, cy - size * 0.16, size * 0.34, color, anchor="center")
+            return
+        if turn_type == 14:
+            rl.draw_ring(
+                rl.Vector2(cx, cy - size * 0.04),
+                size * 0.16,
+                size * 0.16 + width,
+                190.0,
+                360.0,
+                30,
+                rl_color(color),
+            )
+            self._draw_navi_round_line(point(0.20, -0.04), point(0.20, 0.28), width, color)
+            rl.draw_triangle(point(-0.24, 0.23), point(-0.34, 0.08), point(-0.12, 0.13), rl_color(color))
+            return
+        if turn_type in NAVI_TURN_ROUNDABOUT_TYPES:
+            rl.draw_ring(
+                rl.Vector2(cx, cy),
+                size * 0.16,
+                size * 0.16 + width,
+                25.0,
+                330.0,
+                36,
+                rl_color(color),
+            )
+            rl.draw_triangle(point(0.29, -0.20), point(0.11, -0.22), point(0.23, -0.05), rl_color(color))
+            return
+
+        direction = -1.0 if turn_type in NAVI_TURN_LEFT_TYPES else 1.0 if turn_type in NAVI_TURN_RIGHT_TYPES else 0.0
+        if direction == 0.0:
+            self._draw_navi_round_line(point(0.0, 0.28), point(0.0, -0.24), width, color)
+            rl.draw_triangle(point(0.0, -0.35), point(-0.11, -0.19), point(0.11, -0.19), rl_color(color))
+            return
+        self._draw_navi_round_line(point(0.0, 0.28), point(0.0, -0.03), width, color)
+        self._draw_navi_round_line(point(0.0, -0.03), point(direction * 0.27, -0.03), width, color)
+        rl.draw_triangle(
+            point(direction * 0.36, -0.03),
+            point(direction * 0.22, -0.15),
+            point(direction * 0.22, 0.09),
+            rl_color(color),
+        )
+
+    def _format_navi_distance(self, distance_m: int | float) -> str:
+        return format_navi_distance(distance_m, self.is_metric)
+
     def _draw_navi_debug_panel(self, info: NaviDebugInfo | None) -> None:
         theme = self._current_theme()
-        panel_x = SYSTEM_PANEL_X
+        panel_x = self._information_panel_x(SYSTEM_PANEL_X)
         panel_y = SYSTEM_PANEL_Y
         panel_w = SYSTEM_PANEL_W
         panel_h = min(DESIGN_HEIGHT - SYSTEM_PANEL_Y - 18.0, 520.0)
@@ -3183,19 +6850,31 @@ class ClusterUiRenderer:
             y += 31.0
         self._draw_navi_guidance_image_box(info.guidance_image)
 
-    def _draw_navi_traffic_light_panel(self, info: NaviDebugInfo | None) -> None:
+    def _draw_navi_traffic_light_panel(
+        self,
+        traffic: NaviTrafficLightInfo,
+        *,
+        panel_right: float = NAVI_TRAFFIC_PANEL_RIGHT,
+        panel_y: float = NAVI_TRAFFIC_PANEL_Y,
+    ) -> None:
         theme = self._current_theme()
-        y = NAVI_TRAFFIC_PANEL_Y
+        y = panel_y
         h = NAVI_TRAFFIC_PANEL_H
-        traffic = info.traffic_light if info is not None else None
         bg = NAVI_TRAFFIC_BG_DARK if theme.is_dark else NAVI_TRAFFIC_BG_LIGHT
         off = NAVI_TRAFFIC_OFF_DARK if theme.is_dark else NAVI_TRAFFIC_OFF_LIGHT
 
-        red_s = traffic.red_s if traffic is not None else None
-        straight_s = traffic.straight_s if traffic is not None else None
-        left_s = traffic.left_s if traffic is not None else None
-        right_s = traffic.right_s if traffic is not None else None
-        uturn_s = traffic.uturn_s if traffic is not None else None
+        elapsed_s = 0
+        if traffic.meta is not None:
+            elapsed_s = max(0, int(time.monotonic() - traffic.meta.received_mono_s))
+
+        def countdown(seconds: int | None) -> int | None:
+            return None if seconds is None else max(0, seconds - elapsed_s)
+
+        red_s = countdown(traffic.red_s)
+        straight_s = countdown(traffic.straight_s)
+        left_s = countdown(traffic.left_s)
+        right_s = countdown(traffic.right_s)
+        uturn_s = countdown(traffic.uturn_s)
         red_on = self._navi_signal_active(traffic, "red", red_s)
         straight_on = self._navi_signal_active(traffic, "straight", straight_s)
         left_on = self._navi_signal_active(traffic, "left", left_s)
@@ -3203,7 +6882,14 @@ class ClusterUiRenderer:
         uturn_on = self._navi_signal_active(traffic, "uturn", uturn_s)
         use_uturn_slot = (uturn_on or uturn_s is not None) and not (left_on or left_s is not None)
 
-        primary_seconds, primary_red = self._navi_primary_signal_seconds(traffic)
+        primary_seconds, primary_red = self._navi_primary_signal_seconds(
+            traffic,
+            red_s=red_s,
+            straight_s=straight_s,
+            left_s=left_s,
+            right_s=right_s,
+            uturn_s=uturn_s,
+        )
         remain_text = "--" if primary_seconds is None else str(primary_seconds)
         remain_color = NAVI_TRAFFIC_RED if primary_red else NAVI_TRAFFIC_GREEN
         remain_size = 54.0
@@ -3213,7 +6899,7 @@ class ClusterUiRenderer:
         slot_span = slot_count * NAVI_TRAFFIC_SIGNAL_SIZE + (slot_count - 1) * NAVI_TRAFFIC_SIGNAL_GAP
         content_w = slot_span + NAVI_TRAFFIC_TEXT_GAP + remain_width
         w = max(270.0, content_w + NAVI_TRAFFIC_PANEL_PAD_X * 2.0)
-        x = NAVI_TRAFFIC_PANEL_RIGHT - w
+        x = panel_right - w
         shadow = (0, 0, 0, 92)
         outline = theme.faint if theme.is_dark else NAVI_TRAFFIC_BG_OUTLINE
         self._rounded_rect(x + 5.0, y + 7.0, w, h, 20.0, shadow, None, 0.0)
@@ -3255,15 +6941,24 @@ class ClusterUiRenderer:
             return bool(flag)
         return seconds is not None
 
-    def _navi_primary_signal_seconds(self, traffic: NaviTrafficLightInfo | None) -> tuple[int | None, bool]:
+    def _navi_primary_signal_seconds(
+        self,
+        traffic: NaviTrafficLightInfo | None,
+        *,
+        red_s: int | None = None,
+        straight_s: int | None = None,
+        left_s: int | None = None,
+        right_s: int | None = None,
+        uturn_s: int | None = None,
+    ) -> tuple[int | None, bool]:
         if traffic is None:
             return None, False
         ordered = (
-            ("red", traffic.red_s, True),
-            ("left", traffic.left_s, False),
-            ("uturn", traffic.uturn_s, False),
-            ("straight", traffic.straight_s, False),
-            ("right", traffic.right_s, False),
+            ("red", traffic.red_s if red_s is None else red_s, True),
+            ("left", traffic.left_s if left_s is None else left_s, False),
+            ("uturn", traffic.uturn_s if uturn_s is None else uturn_s, False),
+            ("straight", traffic.straight_s if straight_s is None else straight_s, False),
+            ("right", traffic.right_s if right_s is None else right_s, False),
         )
         for name, seconds, is_red in ordered:
             if self._navi_signal_active(traffic, name, seconds):
@@ -3374,7 +7069,7 @@ class ClusterUiRenderer:
 
     def _draw_navi_guidance_image_box(self, image: NaviGuidanceImage | None) -> None:
         theme = self._current_theme()
-        box_x = NAVI_GUIDANCE_IMAGE_X
+        box_x = self._information_panel_x(NAVI_GUIDANCE_IMAGE_X)
         box_y = NAVI_GUIDANCE_IMAGE_Y
         box_w = NAVI_GUIDANCE_IMAGE_W
         box_h = NAVI_GUIDANCE_IMAGE_H
@@ -3443,49 +7138,134 @@ class ClusterUiRenderer:
             if loaded_image is not None and rl.is_image_valid(loaded_image):
                 rl.unload_image(loaded_image)
 
-    def _draw_system_stats_panel(self, state: ClusterUiState) -> None:
+    def _draw_system_dashboard_panel(self, state: ClusterUiState) -> None:
         theme = self._current_theme()
         stats = self._system_stats.sample()
+        panel_x = self._information_panel_x(NAVI_LIVE_PANEL_X)
+        panel_y = NAVI_LIVE_PANEL_Y
+        panel_w = NAVI_LIVE_PANEL_W
+        panel_h = NAVI_LIVE_PANEL_H
+        card_y = panel_y + 8.0
+        card_h = panel_h - 16.0
+        detail_x = panel_x + 16.0
+        detail_w = 474.0
+        health_x = detail_x + detail_w + 10.0
+        health_w = panel_x + panel_w - 16.0 - health_x
+
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, theme.panel_bg, theme.faint, 1.5)
+        self._draw_system_stats_panel(
+            state,
+            panel_x=detail_x,
+            panel_y=card_y,
+            panel_w=detail_w,
+            panel_h=card_h,
+            show_runtime_info=True,
+            title_text="DETAIL",
+            stats=stats,
+        )
+        self._draw_system_health_card(
+            state,
+            stats,
+            health_x,
+            card_y,
+            health_w,
+            card_h,
+        )
+
+    def _draw_system_stats_panel(
+        self,
+        state: ClusterUiState,
+        *,
+        panel_x: float | None = None,
+        panel_y: float = SYSTEM_PANEL_Y,
+        panel_w: float = SYSTEM_PANEL_W,
+        panel_h: float | None = None,
+        status_text: str | None = None,
+        show_runtime_info: bool = False,
+        title_text: str = "SYSTEM",
+        stats: SystemStats | None = None,
+    ) -> None:
+        if panel_x is None:
+            panel_x = self._information_panel_x(SYSTEM_PANEL_X)
+        theme = self._current_theme()
+        if stats is None:
+            stats = self._system_stats.sample()
+        disconnected = status_text is not None
+        detailed = disconnected or show_runtime_info
         cpu_count = len(stats.cpu_core_percents)
         columns = 2 if cpu_count <= 8 else 4
         rows = max(1, math.ceil(max(1, cpu_count) / columns))
         core_row_h = 30.0 if columns == 2 else 24.0
-        header_h = 122.0
-        panel_h = min(DESIGN_HEIGHT - SYSTEM_PANEL_Y - 18.0, header_h + rows * core_row_h + 18.0)
+        header_h = 216.0 if detailed else 122.0
+        if panel_h is None:
+            panel_h = min(DESIGN_HEIGHT - panel_y - 18.0, header_h + rows * core_row_h + 18.0)
         core_area_h = max(24.0, panel_h - header_h - 14.0)
         core_row_h = min(core_row_h, core_area_h / rows)
 
-        panel_x = SYSTEM_PANEL_X
-        panel_y = SYSTEM_PANEL_Y
-        panel_w = SYSTEM_PANEL_W
         pad_x = 24.0
-        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 18, theme.route_panel_bg, theme.faint, 2)
-        self._draw_text("SYSTEM", panel_x + pad_x, panel_y + 28, 18, theme.muted)
+        panel_bg = NAVI_MAP_BACKGROUND if disconnected else theme.route_panel_bg
+        panel_outline = (82, 92, 100, 255) if disconnected else theme.faint
+        text_color = WHITE if disconnected else theme.text
+        muted_color = (154, 164, 172, 255) if disconnected else theme.muted
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 18, panel_bg, panel_outline, 2)
+        self._draw_text(title_text, panel_x + pad_x, panel_y + 28, 18, muted_color)
+        if status_text:
+            self._draw_text(
+                status_text,
+                panel_x + panel_w - pad_x,
+                panel_y + 28,
+                18,
+                AMBER,
+                anchor="right",
+            )
+
+        if detailed:
+            fps_text = "-- Hz"
+            if state.actual_fps is not None and math.isfinite(state.actual_fps):
+                fps_text = f"{state.actual_fps:.1f} Hz"
+            camera_text = "STANDBY"
+            if state.onroad:
+                camera_text = (
+                    "ROAD CAMERA"
+                    if cluster_camera_view_is_road_camera(state.camera_view_mode)
+                    else "ONROAD"
+                )
+            info_rows = (
+                ("NETWORK", state.network_address or "unavailable"),
+                ("DISPLAY", f"{self.width} x {self.height}  /  {fps_text}"),
+                ("CAMERA", camera_text),
+            )
+            for index, (label, value) in enumerate(info_rows):
+                line_y = panel_y + 66.0 + index * 30.0
+                self._draw_text(label, panel_x + pad_x, line_y, 16, muted_color)
+                self._draw_text(value, panel_x + panel_w - pad_x, line_y, 17, text_color, anchor="right")
 
         mem_percent = stats.memory_used_percent
         mem_color = self._system_metric_color(mem_percent)
-        self._draw_text("MEM", panel_x + pad_x, panel_y + 62, 17, theme.muted)
+        mem_text_y = panel_y + (164.0 if detailed else 62.0)
+        mem_bar_y = panel_y + (182.0 if detailed else 80.0)
+        self._draw_text("MEM", panel_x + pad_x, mem_text_y, 17, muted_color)
         self._draw_text(
             self._memory_text(stats),
             panel_x + 86,
-            panel_y + 62,
+            mem_text_y,
             17,
-            theme.text if stats.memory_used_bytes is not None else theme.muted,
+            text_color if stats.memory_used_bytes is not None else muted_color,
         )
         self._draw_text(
             self._percent_text(mem_percent),
             panel_x + panel_w - pad_x,
-            panel_y + 62,
+            mem_text_y,
             17,
             mem_color,
             anchor="right",
         )
-        self._draw_percent_bar(panel_x + pad_x, panel_y + 80, panel_w - pad_x * 2, 12, mem_percent, mem_color)
+        self._draw_percent_bar(panel_x + pad_x, mem_bar_y, panel_w - pad_x * 2, 12, mem_percent, mem_color)
 
-        cpu_header_y = panel_y + 104
-        self._draw_text("CPU CORE %", panel_x + pad_x, cpu_header_y, 15, theme.muted)
+        cpu_header_y = panel_y + (208.0 if detailed else 104.0)
+        self._draw_text("CPU CORE %", panel_x + pad_x, cpu_header_y, 15, muted_color)
         if cpu_count == 0:
-            self._draw_text("unavailable", panel_x + panel_w - pad_x, cpu_header_y, 15, theme.muted, anchor="right")
+            self._draw_text("unavailable", panel_x + panel_w - pad_x, cpu_header_y, 15, muted_color, anchor="right")
             return
 
         core_start_y = panel_y + header_h
@@ -3498,125 +7278,544 @@ class ClusterUiRenderer:
             line_y = core_start_y + row * core_row_h
             color = self._system_metric_color(percent)
             text_size = 15 if columns == 2 else 12
-            self._draw_text(f"C{index}", cell_x, line_y + 8, text_size, theme.muted)
+            self._draw_text(f"C{index}", cell_x, line_y + 8, text_size, muted_color)
             self._draw_text(self._percent_text(percent), cell_x + cell_w, line_y + 8, text_size, color, anchor="right")
             self._draw_percent_bar(cell_x, line_y + 19, cell_w, 6, percent, color)
 
-    def _draw_live_debug_panel(self, state: ClusterUiState) -> None:
-        sections = self._live_debug_sections(state)
-        if not sections:
+    def _draw_trip_report_panel(self, state: ClusterUiState) -> None:
+        target = getattr(self, "_trip_report_target", None)
+        if not getattr(self, "_trip_report_cache_valid", False) or target is None:
+            self._draw_trip_report_panel_contents(state)
             return
 
+        panel_x = self._information_panel_x(TRIP_REPORT_PANEL_X)
+        source = rl.Rectangle(
+            0.0,
+            0.0,
+            float(target.texture.width),
+            -float(target.texture.height),
+        )
+        destination = rl.Rectangle(
+            panel_x,
+            TRIP_REPORT_PANEL_Y,
+            TRIP_REPORT_PANEL_W,
+            TRIP_REPORT_PANEL_H,
+        )
+        rl.draw_texture_pro(
+            target.texture,
+            source,
+            destination,
+            rl.Vector2(0.0, 0.0),
+            0.0,
+            rl_color(WHITE),
+        )
+
+    def _draw_trip_report_panel_contents(self, state: ClusterUiState) -> None:
+        report = state.trip_report or TripReportState()
+        stats = self._system_stats.sample()
         theme = self._current_theme()
-        panel_x = SYSTEM_PANEL_X
-        panel_y = SYSTEM_PANEL_Y
-        panel_w = SYSTEM_PANEL_W
-        pad_x = 24.0
-        header_h = 54.0
-        section_title_h = 20.0
-        row_h = 24.0
-        section_gap = 10.0
-        content_h = sum(section_title_h + len(rows) * row_h for _, rows in sections)
-        content_h += max(0, len(sections) - 1) * section_gap
-        panel_h = min(DESIGN_HEIGHT - SYSTEM_PANEL_Y - 18.0, header_h + content_h + 18.0)
-        max_y = panel_y + panel_h - 18.0
+        panel_x = self._information_panel_x(TRIP_REPORT_PANEL_X)
+        panel_y = TRIP_REPORT_PANEL_Y
+        panel_w = TRIP_REPORT_PANEL_W
+        panel_h = TRIP_REPORT_PANEL_H
+        panel_bg = theme.panel_bg
+        card_bg = theme.route_panel_bg
+        card_outline = theme.faint
+        text_color = theme.text
+        muted = theme.muted
 
-        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 18, theme.route_panel_bg, theme.faint, 2)
-        self._draw_text("LIVE DEBUG", panel_x + pad_x, panel_y + 28, 18, theme.muted)
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, panel_bg, card_outline, 1.5)
 
-        y = panel_y + header_h
-        label_x = panel_x + pad_x
-        value_x = panel_x + panel_w - pad_x
-        label_w = 168.0
-        value_max_w = panel_w - pad_x * 2 - label_w - 12.0
-        for section_index, (section_title, rows) in enumerate(sections):
-            if section_index > 0:
-                line_y = y - section_gap * 0.45
-                rl.draw_line_ex(
-                    rl.Vector2(panel_x + pad_x, line_y),
-                    rl.Vector2(panel_x + panel_w - pad_x, line_y),
-                    1.0,
-                    rl_color(theme.faint),
+        summary_x = panel_x + 16.0
+        summary_y = panel_y + 8.0
+        summary_w = 474.0
+        summary_h = panel_h - 16.0
+        system_x = summary_x + summary_w + 10.0
+        system_y = summary_y
+        system_w = panel_x + panel_w - 16.0 - system_x
+        system_h = summary_h
+        self._rounded_rect(summary_x, summary_y, summary_w, summary_h, 10.0, card_bg, card_outline, 1.2)
+
+        self._draw_text(self._text("trip_summary"), summary_x + 18.0, summary_y + 31.0, 22.0, muted)
+        self._draw_text(self._text("time"), summary_x + 18.0, summary_y + 82.0, 19.0, muted)
+        self._draw_text(
+            self._trip_format_time(report.duration_s),
+            summary_x + summary_w - 18.0,
+            summary_y + 82.0,
+            35.0,
+            (255, 177, 105),
+            anchor="right",
+        )
+        rl.draw_line_ex(
+            rl.Vector2(summary_x + 18.0, summary_y + 114.0),
+            rl.Vector2(summary_x + summary_w - 18.0, summary_y + 114.0),
+            1.0,
+            rl_color(card_outline),
+        )
+        metric_w = (summary_w - 54.0) * 0.5
+        metric_left = summary_x + 18.0
+        metric_right = metric_left + metric_w + 18.0
+        report_speed_unit = speed_unit(self.is_metric)
+        self._draw_trip_metric(
+            metric_left,
+            summary_y + 138.0,
+            self._text("distance"),
+            self._trip_distance_text(report.distance_m),
+            metric_w,
+            text_color=text_color,
+            muted_color=muted,
+        )
+        self._draw_trip_metric(
+            metric_right,
+            summary_y + 138.0,
+            self._text("average_speed"),
+            f"{display_speed(report.average_speed_kph, self.is_metric):.1f}",
+            metric_w,
+            report_speed_unit,
+            text_color=text_color,
+            muted_color=muted,
+        )
+        self._draw_trip_metric(
+            metric_left,
+            summary_y + 218.0,
+            self._text("max_speed"),
+            f"{display_speed(report.max_speed_kph, self.is_metric):.1f}",
+            metric_w,
+            report_speed_unit,
+            text_color=text_color,
+            muted_color=muted,
+        )
+        self._draw_trip_metric(
+            metric_right,
+            summary_y + 218.0,
+            self._text("auto_drive"),
+            f"{report.auto_ratio_percent:.0f}",
+            metric_w,
+            "%",
+            text_color=text_color,
+            muted_color=muted,
+        )
+        self._draw_trip_metric(
+            metric_left,
+            summary_y + 298.0,
+            self._text("max_accel"),
+            f"{report.max_accel_mps2:+.2f}",
+            metric_w,
+            "m/s²",
+            text_color=text_color,
+            muted_color=muted,
+        )
+        self._draw_trip_metric(
+            metric_right,
+            summary_y + 298.0,
+            self._text("max_decel"),
+            f"{report.max_decel_mps2:+.2f}",
+            metric_w,
+            "m/s²",
+            text_color=text_color,
+            muted_color=muted,
+        )
+
+        event_y = summary_y + 390.0
+        event_w = (summary_w - 56.0) / 3.0
+        event_label_size = 16.0 if self.language == CLUSTER_LANGUAGE_KO else 13.0
+        for index, (label, count, color) in enumerate((
+            (self._text("hard_accel"), report.hard_accel_count, AMBER),
+            (self._text("hard_brake"), report.hard_brake_count, RED),
+            (self._text("hard_corner"), report.hard_corner_count, BLUE_SOFT),
+        )):
+            event_x = summary_x + 18.0 + index * (event_w + 10.0)
+            self._rounded_rect(event_x, event_y, event_w, 47.0, 7.0, theme.panel_bg, color, 1.2)
+            self._draw_text(label, event_x + 9.0, event_y + 23.5, event_label_size, muted)
+            self._draw_text(str(count), event_x + event_w - 9.0, event_y + 23.5, 23.0, color, anchor="right")
+
+        self._draw_system_health_card(
+            state,
+            stats,
+            system_x,
+            system_y,
+            system_w,
+            system_h,
+            panel_bg=card_bg,
+            panel_outline=card_outline,
+            text_color=text_color,
+            muted_color=muted,
+            target_fill=theme.panel_bg,
+        )
+
+    def _draw_system_health_card(
+        self,
+        state: ClusterUiState,
+        stats: SystemStats,
+        panel_x: float,
+        panel_y: float,
+        panel_w: float,
+        panel_h: float,
+        *,
+        panel_bg: tuple[int, ...] | None = None,
+        panel_outline: tuple[int, ...] | None = None,
+        text_color: tuple[int, ...] | None = None,
+        muted_color: tuple[int, ...] | None = None,
+        target_fill: tuple[int, ...] | None = None,
+    ) -> None:
+        theme = self._current_theme() if any(
+            value is None
+            for value in (panel_bg, panel_outline, text_color, muted_color, target_fill)
+        ) else None
+        if panel_bg is None:
+            assert theme is not None
+            panel_bg = theme.route_panel_bg
+        if panel_outline is None:
+            assert theme is not None
+            panel_outline = theme.faint
+        if text_color is None:
+            assert theme is not None
+            text_color = theme.text
+        if muted_color is None:
+            assert theme is not None
+            muted_color = theme.muted
+        if target_fill is None:
+            assert theme is not None
+            target_fill = theme.panel_bg
+
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 10.0, panel_bg, panel_outline, 1.2)
+        self._draw_text(self._text("system"), panel_x + 18.0, panel_y + 31.0, 22.0, muted_color)
+        cpu_percent = state.cpu_usage_percent if state.cpu_usage_percent is not None else stats.cpu_used_percent
+        memory_percent = (
+            state.memory_used_percent
+            if state.memory_used_percent is not None
+            else stats.memory_used_percent
+        )
+        disk_percent = (
+            state.disk_used_percent
+            if state.disk_used_percent is not None
+            else stats.disk_used_percent
+        )
+        system_metrics = (
+            ("CPU", self._percent_text(cpu_percent).strip(), cpu_percent, self._system_metric_color(cpu_percent)),
+            (
+                "TEMP",
+                "--°C" if state.cpu_temp_c is None else f"{state.cpu_temp_c:.0f}°C",
+                state.cpu_temp_c,
+                self._trip_temp_color(state.cpu_temp_c, muted_color),
+            ),
+            ("MEM", self._percent_text(memory_percent).strip(), memory_percent, self._system_metric_color(memory_percent)),
+            ("DISK", self._percent_text(disk_percent).strip(), disk_percent, self._system_metric_color(disk_percent)),
+        )
+        gauge_pad_x = 16.0
+        gauge_gap_x = 8.0
+        gauge_w = (panel_w - gauge_pad_x * 2.0 - gauge_gap_x) * 0.5
+        gauge_centers_y = (panel_y + 107.0, panel_y + 224.0)
+        for index, (label, value, percent, color) in enumerate(system_metrics):
+            column = index % 2
+            row = index // 2
+            center_x = panel_x + gauge_pad_x + gauge_w * 0.5 + column * (gauge_w + gauge_gap_x)
+            self._draw_system_gauge(
+                center_x,
+                gauge_centers_y[row],
+                label,
+                value,
+                percent,
+                color,
+                muted_color,
+                panel_outline,
+            )
+
+        rl.draw_line_ex(
+            rl.Vector2(panel_x + 18.0, panel_y + 282.0),
+            rl.Vector2(panel_x + panel_w - 18.0, panel_y + 282.0),
+            1.0,
+            rl_color(panel_outline),
+        )
+        self._draw_text(self._text("device_angle"), panel_x + 18.0, panel_y + 308.0, 18.0, muted_color)
+        pitch_deg: float | None = None
+        yaw_deg: float | None = None
+        calibration = state.camera_calibration_euler
+        if calibration is not None and len(calibration) >= 3:
+            candidate_pitch = math.degrees(calibration[1])
+            candidate_yaw = math.degrees(calibration[2])
+            if math.isfinite(candidate_pitch) and math.isfinite(candidate_yaw):
+                pitch_deg = candidate_pitch
+                yaw_deg = candidate_yaw
+        self._draw_device_angle_indicator(
+            panel_x + 14.0,
+            panel_y + 325.0,
+            panel_w - 28.0,
+            117.0,
+            pitch_deg,
+            yaw_deg,
+            muted_color,
+            panel_outline,
+            text_color=text_color,
+            target_fill=target_fill,
+        )
+
+    def _draw_system_gauge(
+        self,
+        center_x: float,
+        center_y: float,
+        label: str,
+        value_text: str,
+        percent: float | None,
+        value_color: tuple[int, int, int],
+        muted: tuple[int, int, int],
+        track_color: tuple[int, int, int],
+    ) -> None:
+        radius = 41.0
+        stroke_width = 5.0
+        start_angle = 135.0
+        sweep_angle = 270.0
+        segments = 24
+        rl.draw_ring(
+            rl.Vector2(center_x, center_y),
+            radius - stroke_width,
+            radius,
+            start_angle,
+            start_angle + sweep_angle,
+            segments,
+            rl_color(track_color),
+        )
+        if percent is not None and math.isfinite(percent):
+            ratio = clamp(percent, 0.0, 100.0) / 100.0
+            if ratio > 0.0:
+                end_angle = start_angle + sweep_angle * ratio
+                progress_color = BLUE_SOFT
+                rl.draw_ring(
+                    rl.Vector2(center_x, center_y),
+                    radius - stroke_width,
+                    radius,
+                    start_angle,
+                    end_angle,
+                    max(4, int(round(segments * ratio))),
+                    rl_color(progress_color),
                 )
-            if y + section_title_h * 0.5 > max_y:
-                break
-            self._draw_text(section_title, label_x, y + 8.0, 15, theme.muted)
-            y += section_title_h
-            for label, value in rows:
-                if y + row_h * 0.5 > max_y:
-                    break
-                self._draw_text(label, label_x, y + 8.0, 17, theme.muted)
-                value = self._ellipsize_text(value, 17, value_max_w)
-                self._draw_text(value, value_x, y + 8.0, 17, theme.text, anchor="right")
-                y += row_h
-            y += section_gap
+                cap_radius = stroke_width * 0.5
+                for angle in (start_angle, end_angle):
+                    angle_rad = math.radians(angle)
+                    cap_center = rl.Vector2(
+                        center_x + (radius - cap_radius) * math.cos(angle_rad),
+                        center_y + (radius - cap_radius) * math.sin(angle_rad),
+                    )
+                    rl.draw_circle_v(cap_center, cap_radius, rl_color(progress_color))
+
+        self._draw_text(label, center_x, center_y - 13.0, 13.0, muted, anchor="center")
+        self._draw_text(value_text, center_x, center_y + 9.0, 23.0, value_color, anchor="center")
+
+    @staticmethod
+    def _device_angle_target_offset(
+        pitch_deg: float,
+        yaw_deg: float,
+        radius: float,
+        max_angle_deg: float = 6.0,
+    ) -> tuple[float, float]:
+        usable_radius = radius * 0.68
+        scale = usable_radius / max_angle_deg
+        # Match the device settings convention: positive pitch points down and
+        # positive yaw points left.
+        return (
+            -clamp(yaw_deg, -max_angle_deg, max_angle_deg) * scale,
+            clamp(pitch_deg, -max_angle_deg, max_angle_deg) * scale,
+        )
+
+    def _draw_device_angle_indicator(
+        self,
+        x: float,
+        y: float,
+        width: float,
+        height: float,
+        pitch_deg: float | None,
+        yaw_deg: float | None,
+        muted: tuple[int, int, int],
+        outline: tuple[int, int, int],
+        *,
+        text_color: tuple[int, ...] = WHITE,
+        target_fill: tuple[int, ...] = (11, 18, 26, 235),
+    ) -> None:
+        center_x = x + 52.0
+        center_y = y + height * 0.5
+        radius = 31.0
+        rl.draw_circle_v(rl.Vector2(center_x, center_y), radius, rl_color(target_fill))
+        rl.draw_ring(
+            rl.Vector2(center_x, center_y),
+            radius - 1.2,
+            radius,
+            0.0,
+            360.0,
+            24,
+            rl_color(outline),
+        )
+        rl.draw_line_ex(
+            rl.Vector2(center_x - radius + 6.0, center_y),
+            rl.Vector2(center_x + radius - 6.0, center_y),
+            1.0,
+            rl_color(outline),
+        )
+        rl.draw_line_ex(
+            rl.Vector2(center_x, center_y - radius + 6.0),
+            rl.Vector2(center_x, center_y + radius - 6.0),
+            1.0,
+            rl_color(outline),
+        )
+        self._draw_text("P-", center_x, center_y - radius - 7.0, 9.0, muted, anchor="center")
+        self._draw_text("P+", center_x, center_y + radius + 7.0, 9.0, muted, anchor="center")
+        self._draw_text("Y+", center_x - radius - 8.0, center_y, 9.0, muted, anchor="center")
+        self._draw_text("Y-", center_x + radius + 8.0, center_y, 9.0, muted, anchor="center")
+        rl.draw_circle_v(rl.Vector2(center_x, center_y), 2.5, rl_color(muted))
+
+        valid_angles = (
+            pitch_deg is not None
+            and yaw_deg is not None
+            and math.isfinite(pitch_deg)
+            and math.isfinite(yaw_deg)
+        )
+        if valid_angles:
+            offset_x, offset_y = self._device_angle_target_offset(pitch_deg, yaw_deg, radius)
+            marker_x = center_x + offset_x
+            marker_y = center_y + offset_y
+            rl.draw_line_ex(
+                rl.Vector2(center_x, center_y),
+                rl.Vector2(marker_x, marker_y),
+                2.5,
+                rl_color(BLUE_SOFT),
+            )
+            rl.draw_circle_v(rl.Vector2(marker_x, marker_y), 6.0, rl_color(BLUE_SOFT))
+            rl.draw_circle_v(rl.Vector2(marker_x, marker_y), 2.2, rl_color(target_fill))
+
+        value_x = x + width * 0.45
+        pitch_text = "P  --°" if pitch_deg is None else f"P {pitch_deg:+.1f}°"
+        yaw_text = "Y  --°" if yaw_deg is None else f"Y {yaw_deg:+.1f}°"
+        self._draw_text(pitch_text, value_x, y + 36.0, 22.0, text_color)
+        self._draw_text(yaw_text, value_x, y + 69.0, 22.0, text_color)
+
+    def _draw_trip_metric(
+        self,
+        x: float,
+        y: float,
+        label: str,
+        value: str,
+        width: float,
+        unit: str = "",
+        *,
+        text_color: tuple[int, ...] | None = None,
+        muted_color: tuple[int, ...] | None = None,
+    ) -> None:
+        theme = self._current_theme() if text_color is None or muted_color is None else None
+        if text_color is None:
+            assert theme is not None
+            text_color = theme.text
+        if muted_color is None:
+            assert theme is not None
+            muted_color = theme.muted
+        self._draw_text(label, x, y, 18.0, muted_color)
+        self._draw_text(value, x, y + 32.0, 29.0, text_color)
+        if unit:
+            self._draw_text(unit, x + width, y + 32.0, 16.0, muted_color, anchor="right")
+
+    @staticmethod
+    def _trip_temp_color(
+        temp_c: float | None,
+        unavailable_color: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        if temp_c is None or not math.isfinite(temp_c):
+            return unavailable_color
+        if temp_c >= 90.0:
+            return RED
+        if temp_c >= 75.0:
+            return AMBER
+        return GREEN
+
+    @staticmethod
+    def _trip_format_time(duration_s: float) -> str:
+        total_seconds = max(0, int(round(duration_s)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _trip_distance_text(self, distance_m: float) -> str:
+        return format_trip_distance(distance_m, self.is_metric)
+
+    def _draw_live_debug_panel(self, state: ClusterUiState) -> None:
+        sections = self._live_debug_sections(state)
+        theme = self._current_theme()
+        panel_x = self._information_panel_x(NAVI_LIVE_PANEL_X)
+        panel_y = NAVI_LIVE_PANEL_Y
+        panel_w = NAVI_LIVE_PANEL_W
+        panel_h = NAVI_LIVE_PANEL_H
+        card_pad_x = 16.0
+        card_pad_y = 8.0
+        card_gap = 10.0
+        card_w = (panel_w - card_pad_x * 2.0 - card_gap) * 0.5
+        card_h = (panel_h - card_pad_y * 2.0 - card_gap) * 0.5
+
+        self._rounded_rect(panel_x, panel_y, panel_w, panel_h, 12.0, theme.panel_bg, theme.faint, 1.5)
+        for index, (section_title, rows) in enumerate(sections):
+            column = index % 2
+            row = index // 2
+            card_x = panel_x + card_pad_x + column * (card_w + card_gap)
+            card_y = panel_y + card_pad_y + row * (card_h + card_gap)
+            content_x = card_x + 18.0
+            value_x = card_x + card_w - 18.0
+            value_max_w = card_w - 210.0
+
+            self._rounded_rect(card_x, card_y, card_w, card_h, 12.0, theme.route_panel_bg, theme.faint, 1.2)
+            self._draw_text(section_title, content_x, card_y + 30.0, 18.0, theme.muted)
+            for row_index, (label, value) in enumerate(rows):
+                text_y = card_y + 78.0 + row_index * 38.0
+                self._draw_text(label, content_x, text_y, 17.0, theme.muted)
+                value = self._ellipsize_text(value, 17.0, value_max_w)
+                self._draw_text(value, value_x, text_y, 17.0, theme.text, anchor="right")
 
     def _live_debug_sections(self, state: ClusterUiState) -> tuple[tuple[str, tuple[tuple[str, str], ...]], ...]:
-        sections: list[tuple[str, tuple[tuple[str, str], ...]]] = []
         live_debug = state.live_debug
-        if live_debug is not None:
-            if live_debug.live_delay_calibration_percent is not None or live_debug.live_delay_lateral_s is not None:
-                sections.append(
-                    (
-                        "LIVE DELAY",
-                        (
-                            (
-                                "CAL / LAT",
-                                f"{self._optional_percent_text(live_debug.live_delay_calibration_percent)} / "
-                                f"{self._optional_seconds_text(live_debug.live_delay_lateral_s, 2)}",
-                            ),
-                        ),
-                    )
-                )
-            if (
-                live_debug.live_torque_calibration_percent is not None
-                or live_debug.live_torque_valid is not None
-                or live_debug.live_torque_lat_accel_factor is not None
-                or live_debug.live_torque_friction is not None
-            ):
-                live_valid = "--" if live_debug.live_torque_valid is None else "ON" if live_debug.live_torque_valid else "OFF"
-                sections.append(
-                    (
-                        "LIVE TORQUE",
-                        (
-                            (
-                                "STATE",
-                                f"{live_valid} / {self._optional_percent_text(live_debug.live_torque_calibration_percent)}",
-                            ),
-                            (
-                                "FACT / FRIC",
-                                f"{self._optional_float_text(live_debug.live_torque_lat_accel_factor, 2)} / "
-                                f"{self._optional_float_text(live_debug.live_torque_friction, 2)}",
-                            ),
-                        ),
-                    )
-                )
-            if (
-                live_debug.live_steer_ratio is not None
-                or live_debug.custom_steer_ratio is not None
-                or live_debug.steer_actuator_delay_s is not None
-            ):
-                sections.append(
-                    (
-                        "STEERING",
-                        (
-                            (
-                                "SR LIVE / CUSTOM",
-                                f"{self._optional_float_text(live_debug.live_steer_ratio, 1)} / "
-                                f"{self._optional_float_text(live_debug.custom_steer_ratio, 1)}",
-                            ),
-                            ("SAD", self._optional_seconds_text(live_debug.steer_actuator_delay_s, 2)),
-                        ),
-                    )
-                )
-        if state.lateral_plan_debug_text:
-            sections.append(
+        live_valid = "--"
+        if live_debug is not None and live_debug.live_torque_valid is not None:
+            live_valid = "ON" if live_debug.live_torque_valid else "OFF"
+        lateral_plan_text = str(state.lateral_plan_debug_text) if state.lateral_plan_debug_text else "--"
+        return (
+            (
+                "LIVE DELAY",
                 (
-                    "LATERAL PLAN",
-                    (("DEBUG", str(state.lateral_plan_debug_text)),),
-                )
-            )
-        return tuple(sections)
+                    (
+                        "CAL / LAT",
+                        f"{self._optional_percent_text(live_debug.live_delay_calibration_percent if live_debug else None)} / "
+                        f"{self._optional_seconds_text(live_debug.live_delay_lateral_s if live_debug else None, 2)}",
+                    ),
+                ),
+            ),
+            (
+                "LIVE TORQUE",
+                (
+                    (
+                        "STATE",
+                        f"{live_valid} / "
+                        f"{self._optional_percent_text(live_debug.live_torque_calibration_percent if live_debug else None)}",
+                    ),
+                    (
+                        "FACT / FRIC",
+                        f"{self._optional_float_text(live_debug.live_torque_lat_accel_factor if live_debug else None, 2)} / "
+                        f"{self._optional_float_text(live_debug.live_torque_friction if live_debug else None, 2)}",
+                    ),
+                ),
+            ),
+            (
+                "STEERING",
+                (
+                    (
+                        "SR LIVE / CUSTOM",
+                        f"{self._optional_float_text(live_debug.live_steer_ratio if live_debug else None, 1)} / "
+                        f"{self._optional_float_text(live_debug.custom_steer_ratio if live_debug else None, 1)}",
+                    ),
+                    (
+                        "SAD",
+                        self._optional_seconds_text(live_debug.steer_actuator_delay_s if live_debug else None, 2),
+                    ),
+                ),
+            ),
+            (
+                "LATERAL PLAN",
+                (("DEBUG", lateral_plan_text),),
+            ),
+        )
 
     @staticmethod
     def _optional_percent_text(value: float | None) -> str:
@@ -3681,7 +7880,7 @@ class ClusterUiRenderer:
         if overlay is None or not overlay.panel_visible:
             return
         theme = self._current_theme()
-        panel_x = 1416
+        panel_x = self._information_panel_x(SYSTEM_PANEL_X)
         panel_y = 34
         panel_w = 476
         video_h = 244
@@ -3763,46 +7962,58 @@ class ClusterUiRenderer:
         for index, line in enumerate(overlay.data_lines[:6]):
             self._draw_text(line, x, y + 61 + index * 13, 11, theme.text)
 
-    def _draw_git_status(self, status: GitBranchStatus | None, network_address: str | None = None) -> None:
-        if status is None:
+    def _draw_git_status(
+        self,
+        status: GitBranchStatus | None,
+        network_address: str | None = None,
+        actual_fps: float | None = None,
+    ) -> None:
+        if status is None and network_address is None:
             return
 
         theme = self._current_theme()
-        color = self._git_status_color(status, theme)
-        text = status.branch if not status.detail else f"{status.branch} ({status.detail})"
         text_size = 20
-        text = self._ellipsize_text(text, text_size, GIT_STATUS_MAX_TEXT_W)
         spacing = max(1.0, text_size * 0.02)
-        _, text_height = self._measure_text(text, text_size, spacing)
+        _, text_height = self._measure_text("0", text_size, spacing)
         row_h = max(text_height, GIT_STATUS_DOT_RADIUS * 2)
-        center_y = DESIGN_HEIGHT - GIT_STATUS_MARGIN - row_h * 0.5
-        dot_center_x = GIT_STATUS_MARGIN + GIT_STATUS_DOT_RADIUS
+        center_y = DESIGN_HEIGHT - GIT_STATUS_BOTTOM_MARGIN - row_h * 0.5
         text_x = GIT_STATUS_MARGIN + GIT_STATUS_DOT_RADIUS * 2 + GIT_STATUS_DOT_TEXT_GAP
-        rl.draw_circle_v(rl.Vector2(dot_center_x, center_y), GIT_STATUS_DOT_RADIUS, rl_color(color))
-        self._draw_text(text, text_x, center_y, text_size, color)
+        if status is not None:
+            color = self._git_status_color(status, theme)
+            text = status.branch if not status.detail else f"{status.branch} ({status.detail})"
+            text = self._ellipsize_text(text, text_size, GIT_STATUS_MAX_TEXT_W)
+            dot_center_x = GIT_STATUS_MARGIN + GIT_STATUS_DOT_RADIUS
+            rl.draw_circle_v(rl.Vector2(dot_center_x, center_y), GIT_STATUS_DOT_RADIUS, rl_color(color))
+            self._draw_text_with_stroke(text, text_x, center_y, text_size, WHITE, (5, 9, 12), 2, cache=True)
         if network_address:
             network_text = self._ellipsize_text(network_address, text_size, GIT_STATUS_MAX_TEXT_W)
-            self._draw_text(network_text, text_x, center_y - row_h - 4.0, text_size, theme.muted)
+            network_y = center_y - row_h - 4.0
+            self._draw_text_with_stroke(
+                network_text,
+                text_x,
+                network_y,
+                text_size,
+                WHITE,
+                (5, 9, 12),
+                2,
+                cache=True,
+            )
+            network_width, _ = self._measure_text(network_text, text_size, spacing)
+            self._draw_actual_fps(actual_fps, text_x + network_width + 18.0, network_y)
 
-    def _draw_actual_fps(self, actual_fps: float | None) -> None:
+    def _draw_actual_fps(self, actual_fps: float | None, x: float, center_y: float) -> None:
         if actual_fps is None or not math.isfinite(actual_fps):
             return
 
-        theme = self._current_theme()
-        color = theme.muted
         text = f"FPS {actual_fps:.1f} Hz"
         text_size = 20
         text = self._ellipsize_text(text, text_size, FPS_STATUS_MAX_TEXT_W)
-        spacing = max(1.0, text_size * 0.02)
-        text_width, text_height = self._measure_text(text, text_size, spacing)
-        row_h = max(text_height, FPS_STATUS_DOT_RADIUS * 2)
-        center_y = FPS_STATUS_MARGIN + row_h * 0.5
-        text_x = DESIGN_WIDTH - FPS_STATUS_MARGIN
-        dot_center_x = text_x - text_width - FPS_STATUS_DOT_TEXT_GAP - FPS_STATUS_DOT_RADIUS
+        dot_center_x = x + FPS_STATUS_DOT_RADIUS
+        text_x = x + FPS_STATUS_DOT_RADIUS * 2 + FPS_STATUS_DOT_TEXT_GAP
         rl.draw_circle_v(rl.Vector2(dot_center_x, center_y), FPS_STATUS_DOT_RADIUS, rl_color(GREEN))
-        self._draw_text(text, text_x, center_y, text_size, color, anchor="right")
+        self._draw_text_with_stroke(text, text_x, center_y, text_size, WHITE, (5, 9, 12), 2)
 
-    def _draw_cluster_core_usage(self, text: str | None) -> None:
+    def _draw_cluster_core_usage(self, text: str | None, *, right_x: float = DESIGN_WIDTH) -> None:
         if not text:
             return
 
@@ -3811,7 +8022,7 @@ class ClusterUiRenderer:
         text = self._ellipsize_text(text, text_size, CLUSTER_CORE_USAGE_MAX_TEXT_W)
         spacing = max(1.0, text_size * 0.02)
         _, text_height = self._measure_text(text, text_size, spacing)
-        x = DESIGN_WIDTH - CLUSTER_CORE_USAGE_MARGIN
+        x = right_x - CLUSTER_CORE_USAGE_MARGIN
         y = DESIGN_HEIGHT - CLUSTER_CORE_USAGE_MARGIN - text_height * 0.5
         self._draw_text(text, x, y, text_size, theme.muted, anchor="right")
 
@@ -3826,7 +8037,8 @@ class ClusterUiRenderer:
         return theme.muted
 
     def _draw_drive_status(self, state: ClusterUiState) -> None:
-        theme = self._current_theme()
+        if clean_ui_enabled():
+            return  # EV6 HUD patch v6
         gear_text = (state.gear_text or "").strip().upper()
         if (
             not state.debug_ui_visible
@@ -3834,40 +8046,30 @@ class ClusterUiRenderer:
             and state.cruise_gap is None
             and not self._cruise_set_visible(state)
             and state.lfa_active is None
+            and not state.egpu_active
+            and not state.external_compute_label
         ):
             return
 
-        bottom_y = self._drive_status_bottom_y(state)
-        gear_display = gear_text[:2] if gear_text else "-"
-        gear_color = GREEN if gear_text and gear_text != "U" else theme.muted
-        self._draw_drive_status_box(
-            gear_display,
-            GEAR_STATUS_CENTER_X,
-            bottom_y - GEAR_STATUS_BOX_SIZE * 0.5,
-            GEAR_STATUS_BOX_SIZE,
-            GEAR_STATUS_FONT_SIZE,
-            gear_color,
-        )
+        self._draw_network_status(state, TOP_STATUS_CENTER_Y + WIFI_STATUS_ICON_SIZE * 0.5)
+        self._draw_egpu_status(state)
+        self._draw_lfa_status_icon(state, TOP_STATUS_CENTER_Y + LFA_STATUS_ICON_SIZE * 0.5)
 
-        self._draw_network_status(state, bottom_y)
-        self._draw_follow_gap_status(state, bottom_y)
-        self._draw_top_cruise_set(state, bottom_y)
-        self._draw_lfa_status_icon(state, bottom_y)
-
-    def _drive_status_bottom_y(self, state: ClusterUiState) -> float:
-        speed_text = self._cruise_set_speed_text(state)
-        speed_spacing = max(1.0, TOP_CRUISE_FONT_SIZE * 0.02)
-        unit_spacing = max(1.0, TOP_CRUISE_UNIT_FONT_SIZE * 0.02)
-        _, speed_h = self._measure_text(speed_text, TOP_CRUISE_FONT_SIZE, speed_spacing)
-        _, unit_h = self._measure_text("km/h", TOP_CRUISE_UNIT_FONT_SIZE, unit_spacing)
-        row_h = max(
-            GEAR_STATUS_BOX_SIZE,
-            FOLLOW_GAP_ICON_H,
-            LFA_STATUS_ICON_SIZE,
-            speed_h,
-            unit_h,
+    def _draw_egpu_status(self, state: ClusterUiState) -> None:
+        label = 'eGPU' if state.egpu_active else state.external_compute_label
+        if not label:
+            return
+        width = max(EGPU_STATUS_W, len(label) * EGPU_STATUS_FONT_SIZE * 0.7 + 16)
+        rect = rl.Rectangle(
+            EGPU_STATUS_CENTER_X - width * 0.5,
+            TOP_STATUS_CENTER_Y - EGPU_STATUS_H * 0.5,
+            width,
+            EGPU_STATUS_H,
         )
-        return TURN_SIGNAL_CENTER_Y - SPEED_LIMIT_SIGN_RADIUS + row_h
+        rl.draw_rectangle_rounded(rect, 0.35, 8, rl_color((0, 0, 0), 150))
+        rl.draw_rectangle_rounded_lines_ex(rect, 0.35, 8, 2.0, rl_color(GREEN))
+        self._draw_text(label, EGPU_STATUS_CENTER_X, TOP_STATUS_CENTER_Y + 1.0,
+                        EGPU_STATUS_FONT_SIZE, GREEN, anchor="center")
 
     def _draw_drive_status_box(
         self,
@@ -3922,9 +8124,9 @@ class ClusterUiRenderer:
 
     def _draw_network_status(self, state: ClusterUiState, bottom_y: float) -> None:
         theme = self._current_theme()
-        tint = GREEN if state.network_connected else theme.muted
+        tint = WHITE if state.network_connected else theme.muted
         alpha = 255 if state.network_connected else 130
-        if self._draw_bottom_aligned_texture_icon(
+        self._draw_outlined_bottom_aligned_texture_icon(
             self._wifi_texture,
             WIFI_STATUS_CENTER_X,
             bottom_y,
@@ -3932,10 +8134,7 @@ class ClusterUiRenderer:
             WIFI_STATUS_ICON_SIZE,
             tint,
             alpha,
-        ):
-            return
-        center_y = bottom_y - WIFI_STATUS_ICON_SIZE * 0.5
-        rl.draw_circle_lines(int(WIFI_STATUS_CENTER_X), int(center_y), WIFI_STATUS_ICON_SIZE * 0.32, rl_color(tint, alpha))
+        )
 
     def _draw_follow_vehicle_icon(self, x: float, y: float) -> None:
         texture = self._follow_vehicle_texture
@@ -3970,9 +8169,51 @@ class ClusterUiRenderer:
         rl.draw_texture_pro(texture, source, dest, origin, rotation_deg, rl_color(tint, alpha))
         return True
 
-    def _draw_top_cruise_set(self, state: ClusterUiState, bottom_y: float) -> None:
-        if state.external_nav_active:
-            self._draw_text("NAVI", TOP_CRUISE_CENTER_X, bottom_y - TOP_CRUISE_FONT_SIZE * 0.55, TOP_CRUISE_FONT_SIZE, GREEN, anchor="center")
+    def _draw_outlined_bottom_aligned_texture_icon(
+        self,
+        texture,
+        center_x: float,
+        bottom_y: float,
+        width: float,
+        height: float,
+        tint: tuple[int, int, int] | tuple[int, int, int, int],
+        alpha: int,
+        rotation_deg: float = 0.0,
+    ) -> bool:
+        if texture is None:
+            return False
+        outline_offset = 2.0
+        outline_alpha = max(150, min(245, alpha))
+        for dx, dy in (
+            (-outline_offset, 0.0),
+            (outline_offset, 0.0),
+            (0.0, -outline_offset),
+            (0.0, outline_offset),
+            (-outline_offset, -outline_offset),
+            (outline_offset, -outline_offset),
+            (-outline_offset, outline_offset),
+            (outline_offset, outline_offset),
+        ):
+            self._draw_bottom_aligned_texture_icon(
+                texture,
+                center_x + dx,
+                bottom_y + dy,
+                width,
+                height,
+                (5, 9, 12),
+                outline_alpha,
+                rotation_deg,
+            )
+        return self._draw_bottom_aligned_texture_icon(
+            texture,
+            center_x,
+            bottom_y,
+            width,
+            height,
+            tint,
+            alpha,
+            rotation_deg,
+        )
 
     def _draw_lfa_status_icon(self, state: ClusterUiState, bottom_y: float) -> None:
         theme = self._current_theme()
@@ -3981,7 +8222,7 @@ class ClusterUiRenderer:
         tint = WHITE if active else theme.muted
         alpha = 255 if active else 190
         rotation_deg = -float(state.steering_angle_deg or 0.0)
-        if self._draw_bottom_aligned_texture_icon(
+        drew_wheel = self._draw_bottom_aligned_texture_icon(
             texture,
             LFA_STATUS_CENTER_X,
             bottom_y,
@@ -3990,7 +8231,18 @@ class ClusterUiRenderer:
             tint,
             alpha,
             rotation_deg,
-        ):
+        )
+        if state.active_lane_line:
+            self._draw_bottom_aligned_texture_icon(
+                self._lfa_lane_texture,
+                LFA_STATUS_CENTER_X,
+                bottom_y - LFA_LANE_ICON_TOP_OFFSET,
+                LFA_STATUS_ICON_SIZE * LFA_LANE_ICON_WIDTH_SCALE,
+                LFA_STATUS_ICON_SIZE,
+                GREEN if active else theme.muted,
+                alpha,
+            )
+        if drew_wheel:
             return
 
         outline = GREEN if active else theme.muted
@@ -4013,12 +8265,23 @@ class ClusterUiRenderer:
             rl_color(outline, 210),
         )
 
-    def _draw_speed_block(self, state: ClusterUiState) -> None:
+    def _draw_speed_block(self, state: ClusterUiState, *, tpms_offset_x: float = 0.0) -> None:
         theme = self._current_theme()
         display_speed_kph = state.display_speed_kph if state.display_speed_kph is not None else state.speed_kph
-        speed_value = int(round(clamp(display_speed_kph, 0.0, MAX_SPEED_KPH)))
+        speed_value = int(round(display_speed(clamp(display_speed_kph, 0.0, MAX_SPEED_KPH), self.is_metric)))
         speed_text = str(speed_value)
         speed_font_size = SPEED_VALUE_FONT_SIZE if len(speed_text) <= 2 else SPEED_VALUE_FONT_SIZE * 0.86
+        if clean_ui_enabled():
+            self._draw_clean_speed(state, speed_value, theme)  # EV6 HUD patch v6
+            if tpms_offset_x:
+                rl.rl_push_matrix()
+                rl.rl_translatef(tpms_offset_x, 0.0, 0.0)
+            try:
+                self._draw_tpms_status(state)
+            finally:
+                if tpms_offset_x:
+                    rl.rl_pop_matrix()
+            return
         self._draw_speed_panel_bg()
         self._draw_text_with_stroke(
             speed_text,
@@ -4037,28 +8300,50 @@ class ClusterUiRenderer:
             cruise_text,
             CRUISE_SET_SPEED_CENTER_X,
             CRUISE_SPEED_CENTER_Y,
-            58,
+            CRUISE_SET_SPEED_FONT_SIZE,
             cruise_color,
             (0, 0, 0),
             2,
             anchor="center",
         )
+        self._draw_driving_mode_indicator(state)
+        self._draw_model_traffic_state(state.traffic_state)
+        self._draw_cruise_gap_badge(state.cruise_gap)
+        self._draw_speed_gear_badge(state)
+        self._draw_ev_mode_indicator(state)
+        tpms_translated = abs(tpms_offset_x) > 0.001
+        if tpms_translated:
+            rl.rl_push_matrix()
+            rl.rl_translatef(tpms_offset_x, 0.0, 0.0)
+        try:
+            self._draw_tpms_status(state)
+        finally:
+            if tpms_translated:
+                rl.rl_pop_matrix()
 
         if self._cruise_set_visible(state) and state.cruise_override_kph is not None:
             override_color = (
                 GREEN
                 if state.cruise_override_color_mode == 1
+                else AMBER
+                if state.cruise_override_color_mode == 4
+                else VEHICLE_NAVI
+                if state.cruise_override_color_mode == 3
                 else CRUISE_OVERRIDE_APPLY_COLOR
                 if state.cruise_override_color_mode == 2
                 else theme.text
             )
-            override_text = str(int(round(state.cruise_override_kph)))
+            override_text = str(int(round(display_speed(state.cruise_override_kph, self.is_metric))))
             override_label = state.cruise_override_label or ""
+            override_label_font_size = CRUISE_OVERRIDE_LABEL_FONT_SIZE * min(
+                1.0,
+                8.0 / max(8, len(override_label)),
+            )
             self._draw_text_with_stroke(
                 override_label,
                 CRUISE_OVERRIDE_SPEED_CENTER_X,
                 CRUISE_OVERRIDE_LABEL_CENTER_Y,
-                25,
+                override_label_font_size,
                 override_color,
                 (0, 0, 0),
                 2,
@@ -4068,7 +8353,7 @@ class ClusterUiRenderer:
                 override_text,
                 CRUISE_OVERRIDE_SPEED_CENTER_X,
                 CRUISE_OVERRIDE_SPEED_CENTER_Y,
-                52,
+                CRUISE_OVERRIDE_SPEED_FONT_SIZE,
                 override_color,
                 (0, 0, 0),
                 2,
@@ -4078,26 +8363,342 @@ class ClusterUiRenderer:
         if state.speed_limit_kph is not None or state.navi_debug is not None:
             center = rl.Vector2(SPEED_LIMIT_SIGN_CENTER_X, SPEED_LIMIT_SIGN_CENTER_Y)
             rl.draw_circle_v(center, SPEED_LIMIT_SIGN_RADIUS, rl_color(RED))
-            rl.draw_circle_v(center, SPEED_LIMIT_SIGN_RADIUS - 8.0, rl_color(WHITE))
-            limit_text = "--" if state.speed_limit_kph is None else str(state.speed_limit_kph)
+            rl.draw_circle_v(center, SPEED_LIMIT_SIGN_RADIUS - SPEED_LIMIT_SIGN_RING_WIDTH, rl_color(WHITE))
+            limit_text = (
+                "--"
+                if state.speed_limit_kph is None
+                else str(int(round(display_speed(state.speed_limit_kph, self.is_metric))))
+            )
+            limit_font_size = 42 if len(limit_text) <= 2 else 36
             self._draw_text(
                 limit_text,
                 SPEED_LIMIT_SIGN_CENTER_X,
-                SPEED_LIMIT_SIGN_CENTER_Y - 10,
-                39,
+                SPEED_LIMIT_SIGN_CENTER_Y,
+                limit_font_size,
                 TEXT,
                 anchor="center",
             )
-            source_label = speed_limit_source_label(state.speed_limit_source) if state.speed_limit_kph is not None else ""
-            if source_label:
-                self._draw_text(
-                    source_label,
-                    SPEED_LIMIT_SIGN_CENTER_X,
-                    SPEED_LIMIT_SIGN_CENTER_Y + 25,
-                    17,
-                    TEXT,
-                    anchor="center",
-                )
+
+    # ---- EV6 HUD patch v6: clean layout -------------------------------------------------
+    def _clean_text_colors(self, theme):
+        if theme.is_dark:
+            return WHITE, (0, 0, 0), (150, 160, 172)
+        return (26, 30, 36), (246, 247, 249), (92, 100, 110)
+
+    def _draw_clean_speed(self, state: ClusterUiState, speed_value: int, theme) -> None:
+        text_color, stroke, muted = self._clean_text_colors(theme)
+        limit_value = None
+        if state.speed_limit_kph is not None:
+            limit_value = int(round(display_speed(state.speed_limit_kph, self.is_metric)))
+            center = rl.Vector2(82.0, 128.0)
+            rl.draw_circle_v(center, 38.0, rl_color(RED))
+            rl.draw_circle_v(center, 32.0, rl_color(WHITE))
+            limit_text = str(limit_value)
+            self._draw_text(limit_text, 82.0, 129.0, 38.0 if len(limit_text) <= 2 else 31.0, (20, 22, 26), anchor="center")
+        if self._cruise_set_visible(state):
+            color = self._cruise_set_color(state, theme)
+            x, y, w, h = 140.0, 102.0, 156.0, 52.0
+            fill = (0, 0, 0, 110) if theme.is_dark else (255, 255, 255, 200)
+            self._rounded_rect(x, y, w, h, h * 0.5, fill, (*color[:3], 160), 2.0)
+            self._draw_text("SET", x + 22.0, y + h * 0.5, 18, muted, anchor="left")
+            self._draw_text_with_stroke(self._cruise_set_speed_text(state), x + w - 22.0, y + h * 0.5, 34, color,
+                                        stroke, 2, anchor="right")
+        chip_x = self._draw_clean_slowdown_badge(state, theme) or 140.0
+        self._draw_clean_safety_chip(state, theme, chip_x)  # EV6 HUD patch v7
+        if state.traffic_state in (1, 2):
+            texture = self._traffic_red_texture if state.traffic_state == 1 else self._traffic_green_texture
+            if texture is not None:
+                size = 44.0
+                source = rl.Rectangle(0.0, 0.0, float(texture.width), float(texture.height))
+                dest = rl.Rectangle(338.0 - size * 0.5, 128.0 - size * 0.5, size, size)
+                rl.draw_texture_pro(texture, source, dest, rl.Vector2(0.0, 0.0), 0.0, rl_color(WHITE))
+        self._ev6_draw_signal_assist_chip(theme)  # EV6 HUD patch v22
+        speed_color = text_color
+        if limit_value is not None and limit_value > 0 and speed_value > limit_value:
+            speed_color = RED if speed_value >= limit_value + display_speed(CLEAN_SPEED_OVER_RED_KPH, self.is_metric) else AMBER
+        self._draw_text_with_stroke(str(speed_value), 175.0, 300.0, 160, speed_color, stroke, 3, anchor="center")
+        self._draw_text("km/h" if self.is_metric else "mph", 175.0, 384.0, 24, muted, anchor="center")
+
+    def _ev6_draw_signal_assist_chip(self, theme) -> None:
+        # EV6 HUD patch v22: what the signal assist (SignalAssistMode 1/2) currently sees, as a two-lamp signal head:
+        # red lamp lit = red seen, green lamp lit = green seen, both = both; dimmed while it holds a previous reading.
+        # Nothing is drawn while the mode is 0 or nothing is recognised.
+        try:
+            from openpilot.selfdrive.carrot.signal_display import display_requested, signal_display_status
+
+            if not display_requested():
+                return
+            color, held, _ = signal_display_status()
+        except Exception:
+            return
+        if color not in (1, 2, 3):
+            return
+        x, y, w, h = 372.0, 106.0, 86.0, 44.0
+        fill = (0, 0, 0, 150) if theme.is_dark else (255, 255, 255, 215)
+        edge = (90, 98, 108, 200) if theme.is_dark else (170, 176, 184, 220)
+        self._rounded_rect(x, y, w, h, h * 0.5, fill, edge, 2.0)
+        lamp_off = (58, 62, 68) if theme.is_dark else (210, 213, 218)
+        for i, (bit, lit) in enumerate(((1, (255, 70, 70)), (2, (60, 230, 120)))):
+            cx, cy = x + 25.0 + i * 36.0, y + h * 0.5
+            on = bool(color & bit)
+            lamp = tuple(int(c * 0.45) for c in lit) if on and held else lit if on else lamp_off
+            rl.draw_circle_v(rl.Vector2(cx, cy), 13.0, rl_color(lamp))
+            if on and not held:
+                rl.draw_circle_lines(int(cx), int(cy), 16.0, rl_color((*lit, 120)))
+
+    def _draw_clean_slowdown_badge(self, state: ClusterUiState, theme) -> float | None:
+        # why openpilot is slowing down (carrotMan desiredSource) or a planned stop
+        _, stroke, muted = self._clean_text_colors(theme)
+        label = None
+        value = None
+        color = AMBER
+        if self._cruise_set_visible(state) and state.cruise_override_kph is not None:
+            source = (state.cruise_override_label or "").strip().lower()
+            label = CLEAN_SLOWDOWN_LABELS_KO.get(source, source[:6]) if self.language == CLUSTER_LANGUAGE_KO else source[:8]
+            value = str(int(round(display_speed(state.cruise_override_kph, self.is_metric))))
+            color = GREEN if state.cruise_override_color_mode == 1 else (196, 160, 255) if state.cruise_override_color_mode == 3 else AMBER
+        elif state.longitudinal_plan_should_stop and state.speed_kph > 3.0:
+            label = "정지 예정" if self.language == CLUSTER_LANGUAGE_KO else "STOP"
+        if not label:
+            return
+        x, y, h = 140.0, 168.0, 40.0
+        label_w, _ = self._measure_text(label, 18, 1.0)
+        value_w = 0.0 if value is None else self._measure_text(value, 26, 1.0)[0] + 12.0
+        w = max(96.0, label_w + value_w + 32.0)
+        fill = (0, 0, 0, 110) if theme.is_dark else (255, 255, 255, 200)
+        self._rounded_rect(x, y, w, h, h * 0.5, fill, (*color[:3], 170), 2.0)
+        self._draw_text(label, x + 16.0, y + h * 0.5, 18, color, anchor="left")
+        if value is not None:
+            self._draw_text_with_stroke(value, x + w - 16.0, y + h * 0.5, 26, color, stroke, 2, anchor="right")
+        return x + w + 10.0
+
+    @staticmethod
+    def _clean_distance_text(distance_m: float) -> str:
+        if distance_m >= 10000:
+            return f"{distance_m / 1000.0:.0f} km"
+        if distance_m >= 1000:
+            return f"{distance_m / 1000.0:.1f} km"
+        return f"{int(round(distance_m / 10.0) * 10)} m"
+
+    def _draw_clean_progress(self, x: float, y: float, w: float, progress: float, color, muted) -> None:
+        self._rounded_rect(x, y, w, 3.0, 1.5, (*muted[:3], 70))
+        if progress > 0.01:
+            self._rounded_rect(x, y, w * min(1.0, progress), 3.0, 1.5, (*color[:3], 230))
+
+    def _draw_clean_safety_chip(self, state: ClusterUiState, theme, x: float) -> None:
+        # EV6 HUD patch v7: speed camera distance, otherwise section control remaining distance + average speed
+        navi = state.navi_live
+        speed = navi.speed if navi is not None else None
+        if speed is None:
+            return
+        text_color, stroke, muted = self._clean_text_colors(theme)
+        sub = None
+        camera_m = speed.sdi_distance_m
+        if camera_m is not None and 0 < camera_m <= CLEAN_CAMERA_SHOW_M and (speed.sdi_speed_limit_kph or 0) > 0:
+            over = state.speed_kph - speed.sdi_speed_limit_kph
+            label = "카메라" if self.language == CLUSTER_LANGUAGE_KO else "CAM"
+            value = self._clean_distance_text(camera_m)
+            color = RED if over >= CLEAN_SPEED_OVER_RED_KPH else AMBER if over > 0 else BLUE
+            progress = 1.0 - camera_m / CLEAN_CAMERA_SHOW_M
+        elif speed.section_active and (speed.section_remaining_distance_m or 0) > 0:
+            limit = speed.section_speed_limit_kph or 0
+            average = speed.section_average_kph or 0.0
+            label = "구간" if self.language == CLUSTER_LANGUAGE_KO else "SECTION"
+            value = self._clean_distance_text(speed.section_remaining_distance_m)
+            if average > 0.0:
+                sub = f"평균 {average:.0f}" if self.language == CLUSTER_LANGUAGE_KO else f"avg {average:.0f}"
+            color = RED if limit and average >= limit + CLEAN_SPEED_OVER_RED_KPH else AMBER if limit and average > limit else None
+            progress = speed.section_progress or 0.0
+        else:
+            return
+        y, h = 168.0, 40.0
+        label_w, _ = self._measure_text(label, 18, 1.0)
+        value_w, _ = self._measure_text(value, 24, 1.0)
+        sub_w = self._measure_text(sub, 20, 1.0)[0] + 22.0 if sub else 0.0
+        w = 42.0 + label_w + value_w + sub_w + 16.0
+        edge = muted if color is None else color
+        fill = (0, 0, 0, 110) if theme.is_dark else (255, 255, 255, 200)
+        self._rounded_rect(x, y, w, h, h * 0.5, fill, (*edge[:3], 170), 2.0)
+        self._draw_text(label, x + 16.0, y + h * 0.5, 18, muted, anchor="left")
+        self._draw_text_with_stroke(value, x + 26.0 + label_w, y + h * 0.5, 24, text_color, stroke, 2, anchor="left")
+        if sub:
+            sx = x + 36.0 + label_w + value_w
+            rl.draw_line_ex(rl.Vector2(sx, y + 11.0), rl.Vector2(sx, y + h - 11.0), 1.5, rl_color(muted, 140))
+            self._draw_text_with_stroke(sub, sx + 12.0, y + h * 0.5, 20, text_color if color is None else color,
+                                        stroke, 2, anchor="left")
+        self._draw_clean_progress(x + 18.0, y + h - 5.0, w - 36.0, progress, edge, muted)
+
+    def _draw_clean_bar(self, center_x: float, value: float, color, value_text: str, label: str) -> None:
+        theme = self._current_theme()
+        _, stroke, muted = self._clean_text_colors(theme)
+        top, bottom, width = SIDE_GAUGE_TOP + 4.0, SIDE_GAUGE_BOTTOM - 4.0, 14.0
+        mid = (top + bottom) * 0.5
+        track = (255, 255, 255, 34) if theme.is_dark else (0, 0, 0, 30)
+        self._rounded_rect(center_x - width * 0.5, top, width, bottom - top, width * 0.5, track)
+        rl.draw_line_ex(rl.Vector2(center_x - 13.0, mid), rl.Vector2(center_x + 13.0, mid), 2.0, rl_color(muted))
+        span = abs(clamp(value, -1.0, 1.0)) * (mid - top)
+        if span >= 1.0:
+            y = mid - span if value > 0.0 else mid
+            self._rounded_rect(center_x - width * 0.5, y, width, span, width * 0.5, color)
+        active = span >= 1.0
+        self._draw_text_with_stroke(value_text, center_x, SIDE_GAUGE_VALUE_Y + 4.0, 18, color if active else muted,
+                                    stroke, 2, anchor="center")
+        self._draw_text(label, center_x, bottom + 20.0, 16, muted, anchor="center")
+
+    def _draw_clean_side_gauges(self, state: ClusterUiState) -> None:
+        theme = self._current_theme()
+        ko = self.language == CLUSTER_LANGUAGE_KO
+        accel = 0.0 if abs(state.accel_mps2) < 0.005 else state.accel_mps2
+        accel_color = GREEN if accel > 0 else RED if accel < 0 else theme.muted
+        self._draw_clean_bar(SIDE_GAUGE_LEFT_CENTER_X, accel / MAX_ACCEL_MPS2, accel_color, f"{accel:+.2f}",
+                             "가속" if ko else "ACCEL")
+        if (
+            state.steering_output is not None
+            and state.steering_output_normalized is not None
+            and state.steering_output_kind is not None
+        ):
+            value = float(state.steering_output)
+            normalized = clamp(float(state.steering_output_normalized), -1.0, 1.0)
+            if state.steering_output_kind == "angle":
+                value_text = f"{value:+.0f}%"
+            else:
+                value_text = f"{normalized * 100.0:+.0f}%" if abs(value) > 999.0 else f"{value:+.0f}"
+            color = BLUE if normalized > 0 else AMBER if normalized < 0 else theme.muted
+            self._draw_clean_bar(SIDE_GAUGE_LEFT_CENTER_X + SIDE_GAUGE_COLUMN_GAP, normalized, color, value_text,
+                                 "조향" if ko else "STEER")
+
+    def _draw_clean_tpms(self, state: ClusterUiState) -> None:
+        tpms = state.tpms
+        pressures = (tpms.fl, tpms.fr, tpms.rl, tpms.rr)
+        if not any(value is not None for value in pressures):
+            return
+        theme = self._current_theme()
+        text_color, stroke, muted = self._clean_text_colors(theme)
+        cx, cy = TPMS_STATUS_CENTER_X, TPMS_STATUS_CAR_CENTER_Y
+        body_w, body_h = 26.0, 52.0
+        outline = (*muted[:3], 230)
+        self._rounded_rect(cx - body_w * 0.5, cy - body_h * 0.5, body_w, body_h, 9.0, (0, 0, 0, 0), outline, 2.0)
+        rl.draw_line_ex(rl.Vector2(cx - body_w * 0.5 + 4.0, cy - 9.0), rl.Vector2(cx + body_w * 0.5 - 4.0, cy - 9.0),
+                        2.0, rl_color(outline))
+        for index, pressure in enumerate(pressures):
+            sx = -1.0 if index in (0, 2) else 1.0
+            sy = -1.0 if index in (0, 1) else 1.0
+            wheel_x = cx + sx * (body_w * 0.5 + 3.0)
+            wheel_y = cy + sy * 15.0
+            low = pressure is not None and pressure < TPMS_LOW_PRESSURE_PSI
+            wheel_color = RED if low else outline
+            rl.draw_line_ex(rl.Vector2(wheel_x, wheel_y - 7.0), rl.Vector2(wheel_x, wheel_y + 7.0), 4.0, rl_color(wheel_color))
+            value_text = "--" if pressure is None else f"{pressure:.0f}"
+            value_color = RED if low else (text_color if pressure is not None else muted)
+            self._draw_text_with_stroke(value_text, cx + sx * 44.0, wheel_y, 19, value_color, stroke, 2, anchor="center")
+
+    def _draw_driving_mode_indicator(self, state: ClusterUiState) -> None:
+        style = SPEED_DRIVING_MODE_STYLES.get(state.driving_mode)
+        if style is None:
+            return
+        text_key, color = style
+        text = self._text(text_key)
+        font_size = SPEED_DRIVING_MODE_FONT_SIZE if self.language == CLUSTER_LANGUAGE_KO else 22.0
+        self._draw_text_with_stroke(
+            text,
+            SPEED_DRIVING_MODE_CENTER_X,
+            SPEED_DRIVING_MODE_CENTER_Y,
+            font_size,
+            color,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=True,
+        )
+
+    def _draw_model_traffic_state(self, traffic_state: int) -> None:
+        from openpilot.selfdrive.carrot.signal_display import signal_display_status, display_requested
+        if display_requested():
+            color, held, _ = signal_display_status()
+            rgb = ((160, 165, 170), (255, 75, 75), (60, 255, 120), (255, 185, 40))[color]
+            if held:
+                rgb = tuple(int(c*.55) for c in rgb)
+            for offset in (2, 3, 4):
+                rl.draw_circle_lines(int(SPEED_MODEL_TRAFFIC_CENTER_X), int(SPEED_MODEL_TRAFFIC_CENTER_Y),
+                                     SPEED_MODEL_TRAFFIC_ICON_SIZE*.5+offset, rl_color(rgb))
+        if traffic_state not in (1, 2):
+            return
+        red_light = traffic_state == 1
+        texture = self._traffic_red_texture if red_light else self._traffic_green_texture
+        if texture is None:
+            return
+        size = SPEED_MODEL_TRAFFIC_ICON_SIZE
+        source = rl.Rectangle(0.0, 0.0, float(texture.width), float(texture.height))
+        destination = rl.Rectangle(
+            SPEED_MODEL_TRAFFIC_CENTER_X - size * 0.5,
+            SPEED_MODEL_TRAFFIC_CENTER_Y - size * 0.5,
+            size,
+            size,
+        )
+        rl.draw_texture_pro(texture, source, destination, rl.Vector2(0.0, 0.0), 0.0, rl_color(WHITE))
+
+    def _draw_cruise_gap_badge(self, cruise_gap: int | None) -> None:
+        if cruise_gap is None:
+            return
+        gap = int(clamp(float(cruise_gap), 1.0, 4.0))
+        self._draw_text_with_stroke(
+            str(gap),
+            SPEED_GAP_CENTER_X,
+            SPEED_GAP_CENTER_Y,
+            SPEED_GAP_FONT_SIZE,
+            WHITE,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=True,
+        )
+
+    def _draw_speed_gear_badge(self, state: ClusterUiState) -> None:
+        gear = (state.gear_text or "").strip().upper()[:2]
+        if not gear:
+            return
+        theme = self._current_theme()
+        color = WHITE if gear != "U" else theme.muted
+        outline = color if cluster_camera_view_is_road_camera(state.camera_view_mode) else (5, 9, 12, 245)
+        rect = rl.Rectangle(
+            SPEED_GEAR_CENTER_X - SPEED_GEAR_W * 0.5,
+            SPEED_GEAR_CENTER_Y - SPEED_GEAR_H * 0.5,
+            SPEED_GEAR_W,
+            SPEED_GEAR_H,
+        )
+        self._rounded_rect(rect.x, rect.y, rect.width, rect.height, 8.0, (0, 0, 0, 0), outline, 3.0)
+        self._draw_text_with_stroke(
+            gear,
+            SPEED_GEAR_CENTER_X,
+            SPEED_GEAR_CENTER_Y,
+            SPEED_GEAR_FONT_SIZE,
+            color,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=True,
+        )
+
+    def _draw_ev_mode_indicator(
+        self,
+        state: ClusterUiState,
+        center_x: float = SPEED_EV_CENTER_X,
+        center_y: float = SPEED_EV_CENTER_Y,
+        font_size: float = SPEED_EV_FONT_SIZE,
+    ) -> None:
+        if not (state.ev_mode_valid and state.ev_mode_active):
+            return
+        self._draw_text_with_stroke(
+            "EV",
+            center_x,
+            center_y,
+            font_size,
+            GREEN,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=True,
+        )
 
     def _draw_speed_panel_bg(self) -> None:
         texture = self._speed_bg_texture
@@ -4111,11 +8712,10 @@ class ClusterUiRenderer:
     def _cruise_set_visible(state: ClusterUiState) -> bool:
         return state.cruise_kph is not None and state.cruise_display_state != "off"
 
-    @staticmethod
-    def _cruise_set_speed_text(state: ClusterUiState) -> str:
+    def _cruise_set_speed_text(self, state: ClusterUiState) -> str:
         if state.cruise_display_state == "off" or state.cruise_kph is None:
             return "--"
-        return str(int(round(state.cruise_kph)))
+        return str(int(round(display_speed(state.cruise_kph, self.is_metric))))
 
     @staticmethod
     def _cruise_set_color(state: ClusterUiState, theme: ClusterTheme) -> tuple[int, int, int]:
@@ -4126,6 +8726,9 @@ class ClusterUiRenderer:
         return GREEN
 
     def _draw_accel_block(self, state: ClusterUiState) -> None:
+        if clean_ui_enabled():
+            self._draw_clean_side_gauges(state)  # EV6 HUD patch v6
+            return
         theme = self._current_theme()
         top = SIDE_GAUGE_TOP
         bottom = SIDE_GAUGE_BOTTOM
@@ -4138,7 +8741,8 @@ class ClusterUiRenderer:
         gauge_x = gauge_center_x - gauge_width * 0.5
         fill_x = gauge_x + 8
         fill_width = gauge_width - 16
-        self._rounded_rect(gauge_x, top, gauge_width, bottom - top, 18, theme.gauge_bg, theme.faint, 2)
+        outline = self._side_gauge_outline(state)
+        self._rounded_rect(gauge_x, top, gauge_width, bottom - top, 18, (0, 0, 0, 0), outline, 2)
         rl.draw_line_ex(
             rl.Vector2(gauge_x, center),
             rl.Vector2(gauge_x + gauge_width, center),
@@ -4153,8 +8757,28 @@ class ClusterUiRenderer:
                 self._rounded_rect(fill_x, center - fill_height, fill_width, fill_height, 13, fill_color)
             else:
                 self._rounded_rect(fill_x, center, fill_width, fill_height, 13, fill_color)
-        self._draw_text(accel_text, gauge_center_x, SIDE_GAUGE_VALUE_Y, accel_text_size, fill_color, anchor="center")
-        self._draw_text("accel", gauge_center_x, bottom + SIDE_GAUGE_LABEL_OFFSET, 17, theme.muted, anchor="center")
+        self._draw_text_with_stroke(
+            accel_text,
+            gauge_center_x,
+            SIDE_GAUGE_VALUE_Y,
+            accel_text_size,
+            fill_color,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=False,
+        )
+        self._draw_text_with_stroke(
+            "accel",
+            gauge_center_x,
+            bottom + SIDE_GAUGE_LABEL_OFFSET,
+            17,
+            WHITE,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=True,
+        )
 
         energy_value = state.fuel_gauge
         if energy_value is not None:
@@ -4166,14 +8790,18 @@ class ClusterUiRenderer:
                 clamp(energy_value, 0.0, 1.0),
                 state.energy_gauge_label,
                 GREEN if energy_value > 0.15 else RED,
+                outline,
             )
 
     def _draw_steering_output_block(self, state: ClusterUiState) -> None:
+        if clean_ui_enabled():
+            return  # EV6 HUD patch v6: drawn by _draw_clean_side_gauges
         theme = self._current_theme()
         gauge_center_x = SIDE_GAUGE_LEFT_CENTER_X + SIDE_GAUGE_COLUMN_GAP
         top = SIDE_GAUGE_TOP
         bottom = SIDE_GAUGE_BOTTOM
         gauge_width = SIDE_GAUGE_WIDTH
+        outline = self._side_gauge_outline(state)
         if (
             state.steering_output is not None
             and state.steering_output_normalized is not None
@@ -4187,9 +8815,29 @@ class ClusterUiRenderer:
             else:
                 value_text = f"{normalized * 100.0:+.0f}%" if abs(value) > 999.0 else f"{value:+.0f}"
             color = BLUE if normalized > 0 else AMBER if normalized < 0 else theme.muted
-            self._draw_bipolar_gauge(gauge_center_x, top, bottom, gauge_width, normalized, color)
-            self._draw_text(value_text, gauge_center_x, SIDE_GAUGE_VALUE_Y, 17, color, anchor="center")
-            self._draw_text("steer", gauge_center_x, bottom + SIDE_GAUGE_LABEL_OFFSET, 17, theme.muted, anchor="center")
+            self._draw_bipolar_gauge(gauge_center_x, top, bottom, gauge_width, normalized, color, outline)
+            self._draw_text_with_stroke(
+                value_text,
+                gauge_center_x,
+                SIDE_GAUGE_VALUE_Y,
+                17,
+                color,
+                (5, 9, 12),
+                2,
+                anchor="center",
+                cache=False,
+            )
+            self._draw_text_with_stroke(
+                "steer",
+                gauge_center_x,
+                bottom + SIDE_GAUGE_LABEL_OFFSET,
+                17,
+                WHITE,
+                (5, 9, 12),
+                2,
+                anchor="center",
+                cache=True,
+            )
 
         urea_value = state.urea_gauge
         if urea_value is not None:
@@ -4201,7 +8849,13 @@ class ClusterUiRenderer:
                 clamp(urea_value, 0.0, 1.0),
                 "DEF",
                 AMBER if urea_value <= 0.15 else BLUE,
+                outline,
             )
+
+    def _side_gauge_outline(self, state: ClusterUiState) -> tuple[int, int, int, int]:
+        if self._current_theme().is_dark or cluster_camera_view_is_road_camera(state.camera_view_mode):
+            return SIDE_GAUGE_OUTLINE
+        return (5, 9, 12, 235)
 
     def _draw_bipolar_gauge(
         self,
@@ -4211,13 +8865,14 @@ class ClusterUiRenderer:
         width: float,
         value: float,
         color: tuple[int, int, int],
+        outline: tuple[int, int, int, int],
     ) -> None:
         theme = self._current_theme()
         center_y = (top + bottom) * 0.5
         gauge_x = center_x - width * 0.5
         fill_x = gauge_x + 8
         fill_width = width - 16
-        self._rounded_rect(gauge_x, top, width, bottom - top, 18, theme.gauge_bg, theme.faint, 2)
+        self._rounded_rect(gauge_x, top, width, bottom - top, 18, (0, 0, 0, 0), outline, 2)
         rl.draw_line_ex(rl.Vector2(gauge_x, center_y), rl.Vector2(gauge_x + width, center_y), 3, rl_color(theme.gauge_midline))
         fill_height = abs(value) * ((bottom - top) * 0.5 - 8)
         if fill_height <= 0.0:
@@ -4234,15 +8889,27 @@ class ClusterUiRenderer:
         value: float,
         label: str,
         color: tuple[int, int, int],
+        outline: tuple[int, int, int, int],
     ) -> None:
-        theme = self._current_theme()
         gauge_x = center_x - width * 0.5
-        self._rounded_rect(gauge_x, top, width, bottom - top, 18, theme.gauge_bg, theme.faint, 2)
+        self._rounded_rect(gauge_x, top, width, bottom - top, 18, (0, 0, 0, 0), outline, 2)
         fill_height = value * (bottom - top - 16)
         if fill_height > 0.0:
             self._rounded_rect(gauge_x + 8, bottom - 8 - fill_height, width - 16, fill_height, 13, color)
-        self._draw_text(f"{value * 100:.0f}%", center_x, top - 16, 17, color, anchor="center")
-        self._draw_text(label, center_x, bottom + SIDE_GAUGE_LABEL_OFFSET, 17, theme.muted, anchor="center")
+        self._draw_text_with_stroke(
+            f"{value * 100:.0f}%", center_x, top - 16, 17, color, (5, 9, 12), 2, anchor="center"
+        )
+        self._draw_text_with_stroke(
+            label,
+            center_x,
+            bottom + SIDE_GAUGE_LABEL_OFFSET,
+            17,
+            WHITE,
+            (5, 9, 12),
+            2,
+            anchor="center",
+            cache=True,
+        )
 
     def _turn_signal_lights(self, state: ClusterUiState) -> tuple[bool, bool]:
         now = time.perf_counter()
@@ -4260,13 +8927,32 @@ class ClusterUiRenderer:
             self._turn_signal_lit("right", state.right_signal, now),
         )
 
-    @staticmethod
-    def _highlight_lane_lit(state: ClusterUiState, signal_lights: tuple[bool, bool]) -> bool:
+    def _highlight_lane_lit(self, state: ClusterUiState, signal_lights: tuple[bool, bool]) -> bool:
         left_signal_lit, right_signal_lit = signal_lights
-        if state.highlight_lane == "left":
-            return left_signal_lit
-        if state.highlight_lane == "right":
-            return right_signal_lit
+        side = state.highlight_lane if state.highlight_lane in ("left", "right") else None
+        if side is not None and state.highlight_lane_offset is not None:
+            now = time.perf_counter()
+            if side != self._lane_highlight_side or self._lane_highlight_started_at is None:
+                self._lane_highlight_side = side
+                self._lane_highlight_started_at = now
+
+            signal_active = state.left_signal if side == "left" else state.right_signal
+            signal_lit = left_signal_lit if side == "left" else right_signal_lit
+            signal_started_at = (
+                self._hazard_signal_started_at
+                if state.left_signal and state.right_signal
+                else self._left_turn_signal_started_at
+                if side == "left"
+                else self._right_turn_signal_started_at
+            )
+            if signal_started_at is not None:
+                self._lane_highlight_started_at = signal_started_at
+            if signal_active:
+                return signal_lit
+            return blink_visible(now, self._lane_highlight_started_at, float("inf"))
+
+        self._lane_highlight_side = None
+        self._lane_highlight_started_at = None
         if state.left_signal != state.right_signal:
             return left_signal_lit if state.left_signal else right_signal_lit
         return True
@@ -4291,12 +8977,20 @@ class ClusterUiRenderer:
             started_at = self._right_turn_signal_started_at
         return blink_visible(now, started_at, float("inf"))
 
-    def _draw_turn_signal(self, side: str, lit: bool, show_inactive: bool = False) -> None:
+    def _draw_turn_signal(
+        self,
+        side: str,
+        lit: bool,
+        show_inactive: bool = False,
+        center_x_offset: float = 0.0,
+    ) -> None:
         if not lit and not show_inactive:
             return
 
         theme = self._current_theme()
-        cx = LANE_TURN_SIGNAL_LEFT_CENTER_X if side == "left" else LANE_TURN_SIGNAL_RIGHT_CENTER_X
+        cx = (
+            LANE_TURN_SIGNAL_LEFT_CENTER_X if side == "left" else LANE_TURN_SIGNAL_RIGHT_CENTER_X
+        ) + center_x_offset
         cy = LANE_TURN_SIGNAL_CENTER_Y
         direction = -1 if side == "left" else 1
         fill = GREEN if lit else (*theme.muted, 42)
@@ -4371,8 +9065,11 @@ class ClusterUiRenderer:
         color: tuple[int, int, int],
         anchor: str = "left",
     ) -> None:
+        if not text:
+            return
+        font = self._font_for_text(text)
         spacing = max(1.0, size * 0.02)
-        text_width, text_height = self._measure_text(text, size, spacing)
+        text_width, text_height = self._measure_text(text, size, spacing, font)
         draw_x = x
         draw_y = y
         if anchor == "center":
@@ -4383,7 +9080,14 @@ class ClusterUiRenderer:
         elif anchor == "right":
             draw_x = x - text_width
             draw_y = y - text_height * 0.5
-        rl.draw_text_ex(self._font, text, rl.Vector2(draw_x, draw_y), size, spacing, rl_color(color))
+        rl.draw_text_ex(font, text, rl.Vector2(draw_x, draw_y), size, spacing, rl_color(color))
+
+    def _font_for_text(self, text: str):
+        if self._font is None:
+            self._font = rl.get_font_default()
+        if self._korean_font is not None and any(ord(char) > 0x7F for char in text):
+            return self._korean_font
+        return self._font
 
     def _draw_text_with_stroke(
         self,
@@ -4395,7 +9099,32 @@ class ClusterUiRenderer:
         stroke_color: tuple[int, int, int],
         stroke_width: int,
         anchor: str = "left",
+        cache: bool = False,
     ) -> None:
+        if not text:
+            return
+        if cache and stroke_width > 0 and self._stroked_text_texture_cache_enabled:
+            cached_text = self._stroked_text_texture(
+                text,
+                size,
+                color,
+                stroke_color,
+                stroke_width,
+            )
+            if cached_text is not None:
+                self._draw_cached_text_texture(cached_text, x, y, anchor)
+                return
+        if stroke_width > 0 and self._draw_stroked_text_raw(
+            text,
+            x,
+            y,
+            size,
+            color,
+            stroke_color,
+            stroke_width,
+            anchor,
+        ):
+            return
         if stroke_width > 0:
             for dx, dy in (
                 (-stroke_width, 0),
@@ -4409,6 +9138,229 @@ class ClusterUiRenderer:
             ):
                 self._draw_text(text, x + dx, y + dy, size, stroke_color, anchor)
         self._draw_text(text, x, y, size, color, anchor)
+
+    def _draw_stroked_text_raw(
+        self,
+        text: str,
+        x: float,
+        y: float,
+        size: float,
+        color: tuple[int, int, int],
+        stroke_color: tuple[int, int, int],
+        stroke_width: int,
+        anchor: str,
+    ) -> bool:
+        draw_text_ex = getattr(self, "_raw_draw_text_ex", None)
+        if not getattr(self, "_raw_stroked_text_enabled", False) or draw_text_ex is None:
+            return False
+
+        font = self._font_for_text(text)
+        spacing = max(1.0, size * 0.02)
+        text_width, text_height = self._measure_text(text, size, spacing, font)
+        encoded_text = text.encode("utf-8")
+        position = rl.Vector2(0.0, 0.0)
+        fill = rl_color(color)
+        stroke = rl_color(stroke_color)
+
+        def draw_at(draw_x: float, draw_y: float, draw_color: rl.Color) -> None:
+            if anchor == "center":
+                draw_x -= text_width * 0.5
+                draw_y -= text_height * 0.5
+            elif anchor == "left":
+                draw_y -= text_height * 0.5
+            elif anchor == "right":
+                draw_x -= text_width
+                draw_y -= text_height * 0.5
+            position.x = draw_x
+            position.y = draw_y
+            draw_text_ex(font, encoded_text, position, size, spacing, draw_color)
+
+        for dx, dy in (
+            (-stroke_width, 0),
+            (stroke_width, 0),
+            (0, -stroke_width),
+            (0, stroke_width),
+            (-stroke_width, -stroke_width),
+            (stroke_width, -stroke_width),
+            (-stroke_width, stroke_width),
+            (stroke_width, stroke_width),
+        ):
+            draw_at(x + dx, y + dy, stroke)
+        draw_at(x, y, fill)
+        return True
+
+    def _draw_cached_text_texture(
+        self,
+        cached_text: CachedTextTexture,
+        x: float,
+        y: float,
+        anchor: str,
+    ) -> None:
+        draw_x = x
+        draw_y = y
+        if anchor == "center":
+            draw_x -= cached_text.text_width * 0.5
+            draw_y -= cached_text.text_height * 0.5
+        elif anchor == "left":
+            draw_y -= cached_text.text_height * 0.5
+        elif anchor == "right":
+            draw_x -= cached_text.text_width
+            draw_y -= cached_text.text_height * 0.5
+        draw_x -= cached_text.padding_px
+        draw_y -= cached_text.padding_px
+        rl.draw_texture_pro(
+            cached_text.texture,
+            rl.Rectangle(
+                0.0,
+                0.0,
+                float(cached_text.texture_width),
+                float(cached_text.texture_height),
+            ),
+            rl.Rectangle(
+                draw_x,
+                draw_y,
+                float(cached_text.texture_width),
+                float(cached_text.texture_height),
+            ),
+            rl.Vector2(0.0, 0.0),
+            0.0,
+            rl_color(WHITE),
+        )
+
+    def _stroked_text_texture(
+        self,
+        text: str,
+        size: float,
+        color: tuple[int, int, int] | tuple[int, int, int, int],
+        stroke_color: tuple[int, int, int] | tuple[int, int, int, int],
+        stroke_width: int,
+    ) -> CachedTextTexture | None:
+        font = self._font_for_text(text)
+        render_size = float(size)
+        spacing = max(1.0, render_size * 0.02)
+        fill_key = rgba_key(color)
+        stroke_key = rgba_key(stroke_color)
+        cache_key = (
+            id(font),
+            text,
+            render_size,
+            spacing,
+            fill_key,
+            stroke_key,
+            int(stroke_width),
+        )
+        cached_text = self._stroked_text_texture_cache.get(cache_key)
+        if cached_text is not None:
+            self._stroked_text_texture_cache.move_to_end(cache_key)
+            return cached_text
+
+        # Texture upload inside an active target corrupts the miss frame on GLES.
+        self._pending_stroked_text_textures.setdefault(
+            cache_key,
+            PendingStrokedTextTexture(
+                font=font,
+                text=text,
+                render_size=render_size,
+                spacing=spacing,
+                fill_color=fill_key,
+                stroke_color=stroke_key,
+                stroke_width=int(stroke_width),
+            ),
+        )
+        return None
+
+    def _flush_pending_stroked_text_textures(self) -> None:
+        if not self._pending_stroked_text_textures:
+            return
+        if not self._stroked_text_texture_cache_enabled:
+            self._pending_stroked_text_textures.clear()
+            return
+
+        profile_stage = self._profile_start()
+        pending_textures = self._pending_stroked_text_textures
+        self._pending_stroked_text_textures = OrderedDict()
+        for cache_key, pending in pending_textures.items():
+            if cache_key in self._stroked_text_texture_cache:
+                continue
+            cached_text = self._create_stroked_text_texture(pending)
+            if cached_text is None:
+                continue
+            self._stroked_text_texture_cache[cache_key] = cached_text
+            while len(self._stroked_text_texture_cache) > STROKED_TEXT_TEXTURE_CACHE_LIMIT:
+                _, old_text = self._stroked_text_texture_cache.popitem(last=False)
+                rl.unload_texture(old_text.texture)
+        self._profile_add("stroked_text_texture_cache.flush", profile_stage)
+
+    def _create_stroked_text_texture(
+        self,
+        pending: PendingStrokedTextTexture,
+    ) -> CachedTextTexture | None:
+        text_width, text_height = self._measure_text(
+            pending.text,
+            pending.render_size,
+            pending.spacing,
+            pending.font,
+        )
+        padding_px = float(max(0, pending.stroke_width) + STROKED_TEXT_TEXTURE_PADDING_PX)
+        texture_width = max(1, int(math.ceil(text_width + padding_px * 2.0)))
+        texture_height = max(1, int(math.ceil(text_height + padding_px * 2.0)))
+        image = None
+        texture = None
+        try:
+            image = rl.gen_image_color(texture_width, texture_height, rl_color((0, 0, 0, 0)))
+            for dx, dy in (
+                (-pending.stroke_width, 0),
+                (pending.stroke_width, 0),
+                (0, -pending.stroke_width),
+                (0, pending.stroke_width),
+                (-pending.stroke_width, -pending.stroke_width),
+                (pending.stroke_width, -pending.stroke_width),
+                (-pending.stroke_width, pending.stroke_width),
+                (pending.stroke_width, pending.stroke_width),
+            ):
+                rl.image_draw_text_ex(
+                    image,
+                    pending.font,
+                    pending.text,
+                    rl.Vector2(padding_px + dx, padding_px + dy),
+                    pending.render_size,
+                    pending.spacing,
+                    rl_color(pending.stroke_color),
+                )
+            rl.image_draw_text_ex(
+                image,
+                pending.font,
+                pending.text,
+                rl.Vector2(padding_px, padding_px),
+                pending.render_size,
+                pending.spacing,
+                rl_color(pending.fill_color),
+            )
+            texture = rl.load_texture_from_image(image)
+            if hasattr(rl, "is_texture_valid") and not rl.is_texture_valid(texture):
+                rl.unload_texture(texture)
+                return None
+            rl.set_texture_filter(texture, rl.TextureFilter.TEXTURE_FILTER_BILINEAR)
+        except Exception:
+            if texture is not None:
+                try:
+                    rl.unload_texture(texture)
+                except Exception:
+                    pass
+            return None
+        finally:
+            if image is not None:
+                rl.unload_image(image)
+
+        cached_text = CachedTextTexture(
+            texture=texture,
+            text_width=text_width,
+            text_height=text_height,
+            texture_width=texture_width,
+            texture_height=texture_height,
+            padding_px=padding_px,
+        )
+        return cached_text
 
     def _draw_world_label_text(
         self,
@@ -4468,22 +9420,21 @@ class ClusterUiRenderer:
         size: float,
         color: tuple[int, int, int] | tuple[int, int, int, int],
     ) -> CachedTextTexture | None:
-        if self._font is None:
-            self._font = rl.get_font_default()
+        font = self._font_for_text(text)
         render_size = max(
             1.0,
             round(float(size) / WORLD_LABEL_TEXTURE_SIZE_GRID) * WORLD_LABEL_TEXTURE_SIZE_GRID,
         )
         spacing = max(1.0, render_size * 0.02)
         color_key = rgba_key(color)
-        cache_key = (id(self._font), text, render_size, spacing, color_key)
+        cache_key = (id(font), text, render_size, spacing, color_key)
         cached_text = self._world_label_texture_cache.get(cache_key)
         if cached_text is not None:
             self._world_label_texture_cache.move_to_end(cache_key)
             return cached_text
 
         profile_stage = self._profile_start()
-        text_width, text_height = self._measure_text(text, render_size, spacing)
+        text_width, text_height = self._measure_text(text, render_size, spacing, font)
         padding_px = float(WORLD_LABEL_TEXTURE_PADDING_PX)
         texture_width = max(1, int(math.ceil(text_width + padding_px * 2.0)))
         texture_height = max(1, int(math.ceil(text_height + padding_px * 2.0)))
@@ -4493,7 +9444,7 @@ class ClusterUiRenderer:
             image = rl.gen_image_color(texture_width, texture_height, rl_color((0, 0, 0, 0)))
             rl.image_draw_text_ex(
                 image,
-                self._font,
+                font,
                 text,
                 rl.Vector2(padding_px, padding_px),
                 render_size,
@@ -4530,17 +9481,23 @@ class ClusterUiRenderer:
         self._profile_add("world_label_texture_cache.miss", profile_stage)
         return cached_text
 
-    def _measure_text(self, text: str, size: float, spacing: float | None = None) -> tuple[float, float]:
-        if self._font is None:
-            self._font = rl.get_font_default()
+    def _measure_text(
+        self,
+        text: str,
+        size: float,
+        spacing: float | None = None,
+        font=None,
+    ) -> tuple[float, float]:
+        if font is None:
+            font = self._font_for_text(text)
         measure_spacing = max(1.0, size * 0.02) if spacing is None else spacing
-        key = (id(self._font), text, float(size), float(measure_spacing))
+        key = (id(font), text, float(size), float(measure_spacing))
         measured = self._text_measure_cache.get(key)
         if measured is not None:
             return measured
         if len(self._text_measure_cache) >= TEXT_MEASURE_CACHE_LIMIT:
             self._text_measure_cache.clear()
-        text_size = rl.measure_text_ex(self._font, text, size, measure_spacing)
+        text_size = rl.measure_text_ex(font, text, size, measure_spacing)
         measured = (float(text_size.x), float(text_size.y))
         self._text_measure_cache[key] = measured
         return measured

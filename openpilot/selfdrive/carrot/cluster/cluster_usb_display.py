@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import binascii
 import errno
-import sys
 import os
+import struct
+import sys
 import threading
 import time
+import zlib
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from cluster_utils import clamp
+from openpilot.common.usbgpu_bus_lock import usbgpu_bus_lock
 
+from cluster_utils import clamp
 
 VENDOR_ROOT = Path(__file__).resolve().parent / ".vendor" / "turing-smart-screen-python-main"
 VENDOR_LIBRARY = VENDOR_ROOT / "library"
@@ -21,13 +25,19 @@ TURZX_USB_PRODUCT_IDS = {
 }
 HUD_MODE_PRODUCT_IDS = {
     1: 0x0092,
-    2: 0x0123,
 }
 MAX_CONSECUTIVE_FRAME_ERRORS = 3
 USB_COMMAND_TIMEOUT_MS = 2000
 USB_FRAME_TIMEOUT_MS = 2000
 USB_COMMAND_GAP_S = 0.2
+USB_SETTING_SYNC_GAP_S = 0.020
+USB_H264_SETUP_GAPS_S = (0.020, 0.020, 0.080, 0.125, 0.360, 0.025)
+USB_H264_CLEAR_GAP_S = 0.070
+USB_H264_FRAME_RATE_GAP_S = 0.015
+USB_H264_STATUS_POLL_S = 0.080
 TURZX_BRIGHTNESS_COMMAND_MAX = 102
+TURZX_H264_OVERLAY_WIDTH = 464
+TURZX_H264_OVERLAY_HEIGHT = 1920
 USB_DISCONNECT_ERRNOS = {
     errno.ENODEV,
     errno.ENXIO,
@@ -50,8 +60,33 @@ CMD_GET_STREAM_STATUS = 122
 CMD_STOP_STREAM = 123
 DEFAULT_H264_CHUNK_SIZE = 202752
 MAX_H264_CHUNK_SIZE = 1024 * 1024
+USBGPU_H264_MAX_CHUNK_SIZE = 32 * 1024
+USBGPU_H264_CHUNK_GAP_S = 0.002
 _LIBUSB_DLL_DIR_HANDLE = None
 _LIBUSB_BACKEND = None
+
+
+def _png_chunk(kind: bytes, data: bytes) -> bytes:
+    crc = binascii.crc32(kind + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", crc)
+
+
+def _transparent_h264_overlay_png() -> bytes:
+    width = TURZX_H264_OVERLAY_WIDTH
+    height = TURZX_H264_OVERLAY_HEIGHT
+    rows = bytes(width * 4 + 1) * height
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return b"".join(
+        (
+            b"\x89PNG\r\n\x1a\n",
+            _png_chunk(b"IHDR", ihdr),
+            _png_chunk(b"sRGB", b"\x00"),
+            _png_chunk(b"gAMA", struct.pack(">I", 45455)),
+            _png_chunk(b"pHYs", struct.pack(">IIB", 3779, 3779, 1)),
+            _png_chunk(b"IDAT", zlib.compress(rows, 4)),
+            _png_chunk(b"IEND", b""),
+        )
+    )
 
 
 def _set_cluster_hud_connected(connected: bool) -> None:
@@ -64,6 +99,37 @@ def _set_cluster_hud_connected(connected: bool) -> None:
         pass
     except Exception as exc:
         print(f"Warning: failed to update ClusterHudConnected: {exc}", flush=True)
+
+
+def _usbgpu_transfer_active() -> bool:
+    """Return whether the driving model is actively using the shared USB eGPU."""
+    try:
+        from openpilot.common.params import Params
+
+        return Params().get_bool("UsbGpuActive")
+    except ModuleNotFoundError:
+        # PC replay runs may not have openpilot's compiled params extension.
+        return False
+    except Exception as exc:
+        print(f"Warning: failed to inspect eGPU state for TURZX pacing: {exc}", flush=True)
+        return False
+
+
+def _usbgpu_reset_protected() -> bool:
+    """Avoid resetting a shared USB path while the eGPU owns active transfers."""
+    try:
+        from openpilot.common.params import Params
+
+        params = Params()
+        return params.get_bool("UsbGpuLoading") or params.get_bool("UsbGpuActive")
+    except ModuleNotFoundError:
+        # PC replay runs may not have openpilot's compiled params extension.
+        return False
+    except Exception as exc:
+        print(f"Warning: failed to inspect eGPU state before USB reset: {exc}", flush=True)
+        # On-device uncertainty must fail safe: losing display recovery is less
+        # harmful than resetting an eGPU that may be running the driving model.
+        return True
 
 
 def product_id_for_hud_mode(hud_mode: int) -> int | None:
@@ -146,7 +212,8 @@ def find_supported_usb_product(expected_product_id: int | None = None) -> int | 
     product_ids = [expected_product_id] if expected_product_id is not None else list(TURZX_USB_PRODUCT_IDS)
     for product_id in product_ids:
         try:
-            dev = usb.core.find(idVendor=TURZX_USB_VENDOR_ID, idProduct=product_id, backend=_libusb_backend())
+            with usbgpu_bus_lock():
+                dev = usb.core.find(idVendor=TURZX_USB_VENDOR_ID, idProduct=product_id, backend=_libusb_backend())
         except Exception as exc:
             print(f"TURZX USB scan failed for pid=0x{product_id:04x}: {exc}", flush=True)
             return None
@@ -171,6 +238,7 @@ class TuringUsbDisplay:
         expected_product_id: int | None = None,
     ) -> None:
         self.brightness = int(clamp(brightness, 0, 100))
+        self.orientation = 0
         self.display_fps = int(clamp(display_fps, 0, 255))
         self.jpeg_quality = int(clamp(jpeg_quality, 1, 95))
         self.jpeg_encoder = jpeg_encoder
@@ -205,7 +273,9 @@ class TuringUsbDisplay:
         self._turbojpeg = None
         self._turbojpeg_unavailable = False
         self._jpeg_buffer = BytesIO()
-        self._usb_lock = threading.Lock()
+        self._h264_chunk_gap_s = 0.0
+        # Keep sync + setting atomic with frame writes.
+        self._usb_lock = threading.RLock()
         self.profile_enabled = os.environ.get("CLUSTER_PROFILE_USB") == "1"
         self._profile_samples: list[tuple[str, float]] = []
 
@@ -225,7 +295,7 @@ class TuringUsbDisplay:
         if self.profile_enabled:
             self._profile_samples.append((name, (time.perf_counter() - start_time) * 1000.0))
 
-    def open(self) -> None:
+    def _load_protocol_helpers(self) -> None:
         if not VENDOR_LIBRARY.exists():
             raise RuntimeError(f"TURZX vendor library not found: {VENDOR_LIBRARY}")
         self._add_libusb_search_path()
@@ -259,6 +329,9 @@ class TuringUsbDisplay:
         self._cmd_play_h264_chunk = CMD_PLAY_H264_CHUNK
         self._cmd_get_stream_status = CMD_GET_STREAM_STATUS
         self._cmd_stop_stream = CMD_STOP_STREAM
+
+    def open(self) -> None:
+        self._load_protocol_helpers()
         self._connect_device()
         try:
             self._initialize_device()
@@ -284,7 +357,8 @@ class TuringUsbDisplay:
         try:
             import usb.util
 
-            usb.util.dispose_resources(self.dev)
+            with usbgpu_bus_lock():
+                usb.util.dispose_resources(self.dev)
         except Exception:
             pass
 
@@ -300,7 +374,20 @@ class TuringUsbDisplay:
             return False
         self.brightness = next_brightness
         if self.dev is not None:
-            self._send_brightness(self.brightness, "brightness")
+            value = int(self.brightness / 100 * TURZX_BRIGHTNESS_COMMAND_MAX)
+            self._send_display_setting(14, "brightness", {8: value})
+            return True
+        return False
+
+    def set_orientation(self, orientation: int, *, force: bool = False) -> bool:
+        if orientation not in (0, 2):
+            return False
+        next_orientation = orientation
+        if next_orientation == self.orientation and not force:
+            return False
+        self.orientation = next_orientation
+        if self.dev is not None:
+            self._send_orientation(self.orientation)
             return True
         return False
 
@@ -317,7 +404,8 @@ class TuringUsbDisplay:
         dev = None
         dev_pid = None
         for product_id in product_ids:
-            dev = usb.core.find(idVendor=TURZX_USB_VENDOR_ID, idProduct=product_id, backend=backend)
+            with usbgpu_bus_lock():
+                dev = usb.core.find(idVendor=TURZX_USB_VENDOR_ID, idProduct=product_id, backend=backend)
             if dev is not None:
                 dev_pid = product_id
                 break
@@ -328,13 +416,15 @@ class TuringUsbDisplay:
 
         if sys.platform.startswith("linux"):
             try:
-                if dev.is_kernel_driver_active(0):
-                    dev.detach_kernel_driver(0)
+                with usbgpu_bus_lock():
+                    if dev.is_kernel_driver_active(0):
+                        dev.detach_kernel_driver(0)
             except usb.core.USBError as exc:
                 print("Warning: detach_kernel_driver failed:", exc)
 
         try:
-            dev.set_configuration()
+            with usbgpu_bus_lock():
+                dev.set_configuration()
         except usb.core.USBError as exc:
             if getattr(exc, "errno", None) == errno.EACCES:
                 raise _windows_usb_access_help(exc) from exc
@@ -343,7 +433,8 @@ class TuringUsbDisplay:
             raise
 
         try:
-            usb.util.claim_interface(dev, 0)
+            with usbgpu_bus_lock():
+                usb.util.claim_interface(dev, 0)
         except usb.core.USBError as exc:
             if getattr(exc, "errno", None) == errno.EACCES:
                 raise _windows_usb_access_help(exc) from exc
@@ -367,7 +458,15 @@ class TuringUsbDisplay:
         if self.dev is None:
             raise RuntimeError("USB display is not open")
 
-        self._send_command(10, "sync")
+        if _usbgpu_transfer_active():
+            self._send_optional_command(
+                10,
+                "sync",
+                no_ack_gap_s=0.0,
+                no_ack_drain_attempts=0,
+            )
+        else:
+            self._send_command(10, "sync")
         time.sleep(USB_COMMAND_GAP_S)
         if self.display_fps > 0:
             self._send_frame_rate(self.display_fps)
@@ -402,6 +501,34 @@ class TuringUsbDisplay:
             no_ack_gap_s=0.0,
             no_ack_drain_attempts=0,
         )
+
+    def _send_orientation(self, orientation: int) -> None:
+        if orientation in (0, 2):
+            self._send_display_setting(13, "orientation", {8: orientation})
+
+    def _send_display_setting(
+        self,
+        command_id: int,
+        name: str,
+        fields: dict[int, int],
+    ) -> None:
+        with self._usb_lock:
+            self._send_optional_command(
+                10,
+                "sync",
+                log=False,
+                no_ack_gap_s=0.0,
+                no_ack_drain_attempts=0,
+            )
+            time.sleep(USB_SETTING_SYNC_GAP_S)
+            self._send_optional_command(
+                command_id,
+                name,
+                fields,
+                log=False,
+                no_ack_gap_s=0.0,
+                no_ack_drain_attempts=0,
+            )
 
     def _send_command(
         self,
@@ -466,12 +593,21 @@ class TuringUsbDisplay:
         import usb.util
 
         if self.dev is not None:
+            if _usbgpu_reset_protected():
+                print(
+                    "Skipping TURZX USB device reset while eGPU is loading or active; "
+                    "reconnecting without reset",
+                    flush=True,
+                )
+            else:
+                try:
+                    with usbgpu_bus_lock():
+                        self.dev.reset()
+                except Exception as exc:
+                    print(f"USB reset failed: {exc}")
             try:
-                self.dev.reset()
-            except Exception as exc:
-                print(f"USB reset failed: {exc}")
-            try:
-                usb.util.dispose_resources(self.dev)
+                with usbgpu_bus_lock():
+                    usb.util.dispose_resources(self.dev)
             except Exception:
                 pass
         time.sleep(1.5)
@@ -541,21 +677,61 @@ class TuringUsbDisplay:
         if self.dev is None:
             raise RuntimeError("USB display is not open")
 
-        for command_id, name in (
-            (111, "video-setup-111"),
-            (112, "video-setup-112"),
-            (13, "video-setup-13"),
-            (41, "video-setup-41"),
-        ):
+        brightness_raw = int(self.brightness / 100 * TURZX_BRIGHTNESS_COMMAND_MAX)
+        setup = (
+            (10, "sync", None),
+            (111, "video-setup-111", None),
+            (112, "video-setup-112", None),
+            (13, "video-setup-13", {8: self.orientation}),
+            (14, "brightness", {8: brightness_raw}),
+            (52, "video-setup-52", None),
+        )
+        setup_summary = " ".join(
+            (
+                f"TURZX H264 captured setup: orientation={self.orientation},",
+                f"brightness={self.brightness}%, display_fps={self.display_fps}",
+            )
+        )
+        print(setup_summary, flush=True)
+        for (command_id, name, fields), gap_s in zip(setup, USB_H264_SETUP_GAPS_S, strict=True):
             self._send_optional_command(
                 command_id,
                 name,
+                fields,
                 log=False,
-                no_ack_gap_s=0.05,
-                no_ack_drain_attempts=1,
+                no_ack_gap_s=0.0,
+                no_ack_drain_attempts=0,
             )
+            time.sleep(gap_s)
+
+        self._send_frame_no_ack(
+            self._cmd_upload_png,
+            _transparent_h264_overlay_png(),
+            drain_input=True,
+        )
+        time.sleep(USB_H264_CLEAR_GAP_S)
+        if self.display_fps > 0:
+            self._send_optional_command(
+                15,
+                "frame-rate",
+                {8: self.display_fps},
+                log=False,
+                no_ack_gap_s=0.0,
+                no_ack_drain_attempts=0,
+            )
+            time.sleep(USB_H264_FRAME_RATE_GAP_S)
 
         chunk_size = self._h264_chunk_size(requested_chunk_size)
+        self._h264_chunk_gap_s = 0.0
+        if getattr(self, "uses_host_usb", True) and _usbgpu_transfer_active():
+            negotiated_chunk_size = chunk_size
+            chunk_size = min(chunk_size, USBGPU_H264_MAX_CHUNK_SIZE)
+            self._h264_chunk_gap_s = USBGPU_H264_CHUNK_GAP_S
+            print(
+                f"TURZX H264 eGPU coexistence pacing: chunk {negotiated_chunk_size}->{chunk_size} bytes, "
+                f"gap={self._h264_chunk_gap_s * 1000.0:.1f} ms",
+                flush=True,
+            )
         print(f"TURZX H264 stream chunk size: {chunk_size} bytes", flush=True)
         return chunk_size
 
@@ -566,9 +742,17 @@ class TuringUsbDisplay:
             self._cmd_stop_stream,
             "stop-stream",
             log=False,
-            no_ack_gap_s=0.0,
+            no_ack_gap_s=USB_H264_STATUS_POLL_S,
             no_ack_drain_attempts=1,
         )
+        for _ in range(2):
+            self._send_optional_command(
+                self._cmd_get_stream_status,
+                "h264-stream-status",
+                log=False,
+                no_ack_gap_s=USB_H264_STATUS_POLL_S,
+                no_ack_drain_attempts=1,
+            )
 
     def send_h264_chunk(
         self,
@@ -599,6 +783,8 @@ class TuringUsbDisplay:
                     self._h264_flow_control(target_queue_depth=3)
             else:
                 self._send_h264_chunk_no_ack(chunk, is_last=is_last, drain_input=not self.fast_write)
+            if self._h264_chunk_gap_s > 0.0:
+                time.sleep(self._h264_chunk_gap_s)
         except Exception as exc:
             raise RuntimeError(f"TURZX USB H264 chunk upload failed: {exc}") from exc
 
@@ -685,26 +871,29 @@ class TuringUsbDisplay:
     def _cache_out_endpoint(self) -> None:
         import usb.util
 
-        cfg = self.dev.get_active_configuration()
-        intf = usb.util.find_descriptor(cfg, bInterfaceNumber=0)
+        with usbgpu_bus_lock():
+            cfg = self.dev.get_active_configuration()
+            intf = usb.util.find_descriptor(cfg, bInterfaceNumber=0)
         if intf is None:
             raise RuntimeError("USB interface 0 not found")
-        self._ep_out = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda endpoint: usb.util.endpoint_direction(
-                endpoint.bEndpointAddress
+        with usbgpu_bus_lock():
+            self._ep_out = usb.util.find_descriptor(
+                intf,
+                custom_match=lambda endpoint: usb.util.endpoint_direction(
+                    endpoint.bEndpointAddress
+                )
+                == usb.util.ENDPOINT_OUT,
             )
-            == usb.util.ENDPOINT_OUT,
-        )
         if self._ep_out is None:
             raise RuntimeError("Could not find USB OUT endpoint")
-        self._ep_in = usb.util.find_descriptor(
-            intf,
-            custom_match=lambda endpoint: usb.util.endpoint_direction(
-                endpoint.bEndpointAddress
+        with usbgpu_bus_lock():
+            self._ep_in = usb.util.find_descriptor(
+                intf,
+                custom_match=lambda endpoint: usb.util.endpoint_direction(
+                    endpoint.bEndpointAddress
+                )
+                == usb.util.ENDPOINT_IN,
             )
-            == usb.util.ENDPOINT_IN,
-        )
         if self._ep_in is None:
             raise RuntimeError("Could not find USB IN endpoint")
 
@@ -713,7 +902,8 @@ class TuringUsbDisplay:
             return
         for _ in range(attempts):
             try:
-                self._ep_in.read(512, timeout_ms)
+                with usbgpu_bus_lock():
+                    self._ep_in.read(512, timeout_ms)
             except Exception:
                 return
 
@@ -724,7 +914,8 @@ class TuringUsbDisplay:
             if endpoint is None:
                 continue
             try:
-                self.dev.clear_halt(endpoint.bEndpointAddress)
+                with usbgpu_bus_lock():
+                    self.dev.clear_halt(endpoint.bEndpointAddress)
             except Exception:
                 pass
 
@@ -738,10 +929,12 @@ class TuringUsbDisplay:
             self._profile_add("usb.write_checked.prepare", profile_stage)
             try:
                 profile_stage = self._profile_start()
-                self._ep_out.write(payload, timeout_ms)
+                with usbgpu_bus_lock():
+                    self._ep_out.write(payload, timeout_ms)
                 self._profile_add("usb.write_checked.write", profile_stage)
                 profile_stage = self._profile_start()
-                response = bytes(self._ep_in.read(512, timeout_ms))
+                with usbgpu_bus_lock():
+                    response = bytes(self._ep_in.read(512, timeout_ms))
                 self._profile_add("usb.write_checked.read_ack", profile_stage)
                 return response
             except Exception as exc:
@@ -757,7 +950,8 @@ class TuringUsbDisplay:
             self._profile_add("usb.write_no_ack.prepare", profile_stage)
             try:
                 profile_stage = self._profile_start()
-                self._ep_out.write(payload, timeout_ms)
+                with usbgpu_bus_lock():
+                    self._ep_out.write(payload, timeout_ms)
                 self._profile_add("usb.write_no_ack.write", profile_stage)
             except Exception as exc:
                 self._raise_usb_error(error_message, exc)
@@ -809,10 +1003,12 @@ class TuringUsbDisplay:
             payload = self._build_frame_payload(command_id, frame)
             self._profile_add("usb.frame_fast.payload", profile_stage)
             profile_stage = self._profile_start()
-            self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
+            with usbgpu_bus_lock():
+                self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
             self._profile_add("usb.frame_fast.write", profile_stage)
             profile_stage = self._profile_start()
-            response = bytes(self._ep_in.read(512, USB_FRAME_TIMEOUT_MS))
+            with usbgpu_bus_lock():
+                response = bytes(self._ep_in.read(512, USB_FRAME_TIMEOUT_MS))
             self._profile_add("usb.frame_fast.read_ack", profile_stage)
             return response
 
@@ -838,12 +1034,19 @@ class TuringUsbDisplay:
             payload = self._build_frame_payload(command_id, frame)
             self._profile_add("usb.frame_no_ack.payload", profile_stage)
             profile_stage = self._profile_start()
-            self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
+            with usbgpu_bus_lock():
+                self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
             self._profile_add("usb.frame_no_ack.write", profile_stage)
 
     def _h264_chunk_size(self, requested_chunk_size: int) -> int:
         if requested_chunk_size > 0:
             return int(clamp(requested_chunk_size, 1, MAX_H264_CHUNK_SIZE))
+
+        # The response can block a shared xHCI bus for the full command timeout.
+        # eGPU coexistence already caps the actual transfer size below this
+        # default, so negotiation has no value while the driving model is active.
+        if _usbgpu_transfer_active():
+            return DEFAULT_H264_CHUNK_SIZE
 
         try:
             response = self._send_command(
@@ -887,10 +1090,12 @@ class TuringUsbDisplay:
             self._profile_add("usb.h264.payload", profile_stage)
             try:
                 profile_stage = self._profile_start()
-                self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
+                with usbgpu_bus_lock():
+                    self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
                 self._profile_add("usb.h264.write", profile_stage)
                 profile_stage = self._profile_start()
-                response = bytes(self._ep_in.read(512, USB_FRAME_TIMEOUT_MS))
+                with usbgpu_bus_lock():
+                    response = bytes(self._ep_in.read(512, USB_FRAME_TIMEOUT_MS))
                 self._profile_add("usb.h264.read_ack", profile_stage)
                 return response
             except Exception as exc:
@@ -935,7 +1140,8 @@ class TuringUsbDisplay:
             self._profile_add("usb.h264_no_ack.payload", profile_stage)
             try:
                 profile_stage = self._profile_start()
-                self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
+                with usbgpu_bus_lock():
+                    self._ep_out.write(payload, USB_FRAME_TIMEOUT_MS)
                 self._profile_add("usb.h264_no_ack.write", profile_stage)
             except Exception as exc:
                 self._raise_usb_error("TURZX USB H264 chunk write failed", exc)

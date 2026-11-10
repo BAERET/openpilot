@@ -29,14 +29,17 @@ PUBLIC_URL_START_DELAY = float(os.environ.get("CARROT_SUPPORT_LINK_START_DELAY_S
 SUPPORT_GUEST_DIR = os.path.join(WEB_DIR, "support_terminal")
 SUPPORT_GUEST_HTML_PATH = os.path.join(SUPPORT_GUEST_DIR, "guest.html")
 SUPPORT_GUEST_ASSETS = {
+  "design-tokens.css": os.path.join(WEB_DIR, "css", "generated", "design-tokens.css"),
+  "design-system.css": os.path.join(WEB_DIR, "css", "generated", "design-system.css"),
   "tokens.css": os.path.join(WEB_DIR, "css", "tokens.css"),
   "layout_tokens.css": os.path.join(WEB_DIR, "css", "layout_tokens.css"),
   "base.css": os.path.join(WEB_DIR, "css", "base.css"),
   "layout.css": os.path.join(WEB_DIR, "css", "layout.css"),
   "components.css": os.path.join(WEB_DIR, "css", "components.css"),
-  "terminal.css": os.path.join(WEB_DIR, "css", "pages", "terminal.css"),
-  "guest.css": os.path.join(SUPPORT_GUEST_DIR, "guest.css"),
-  "guest.js": os.path.join(SUPPORT_GUEST_DIR, "guest.js"),
+  "terminal.css": os.path.join(WEB_DIR, "css", "generated", "terminal.css"),
+  "terminal_typing_indicator.js": os.path.join(WEB_DIR, "js", "generated", "terminal-shared.js"),
+  "guest.css": os.path.join(WEB_DIR, "css", "generated", "terminal-guest.css"),
+  "guest.js": os.path.join(WEB_DIR, "js", "generated", "terminal-guest.js"),
   "xterm.css": os.path.join(WEB_DIR, "css", "vendor", "xterm.css"),
   "xterm.js": os.path.join(WEB_DIR, "js", "vendor", "xterm.js"),
   "xterm-addon-shim.js": os.path.join(WEB_DIR, "js", "vendor", "xterm-addon-shim.js"),
@@ -536,7 +539,10 @@ class SupportTerminalManager:
         if typ == "typing":
           text = _sanitize_typing_text(data.get("text"))
           await self.broadcast_owner({"type": "guest_typing", "active": bool(data.get("active")), "text": text})
-        elif typ in {"disconnect", "close_session"}:
+        elif typ == "close_session":
+          await self.stop("guest")
+          break
+        elif typ == "disconnect":
           break
         elif typ == "control":
           if session.permission_mode == "allow_all" and ws is not session.controller_socket:

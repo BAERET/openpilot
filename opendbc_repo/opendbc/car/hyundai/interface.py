@@ -2,13 +2,17 @@ from opendbc.car import Bus, get_safety_config, structs
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, CANFD_RADAR_SCC_CAR, \
                                                    CANFD_UNSUPPORTED_LONGITUDINAL_CAR, \
-                                                   UNSUPPORTED_LONGITUDINAL_CAR, HyundaiSafetyFlags, HyundaiExtFlags
+                                                   UNSUPPORTED_LONGITUDINAL_CAR, HyundaiSafetyFlags, HyundaiExtFlags, \
+                                                   CANFD_HYBRID_STATUS_ADDR, CANFD_HYBRID_STATUS_DLC, \
+                                                   EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, bosch_mrrevo14f_bus
 from opendbc.car.hyundai.radar_interface import RADAR_START_ADDR
 from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.disable_ecu import disable_ecu
 from opendbc.car.hyundai.carcontroller import CarController
 from opendbc.car.hyundai.carstate import CarState
 from opendbc.car.hyundai.radar_interface import RadarInterface
+from opendbc.car.hyundai.values import PEDAL_INTERCEPTOR_PARAMS, get_pedal_interceptor_params
+from opendbc.car.pedal_interceptor import PEDAL_INTERCEPTOR_SENSOR_ADDR, PEDAL_INTERCEPTOR_BUS
 
 from openpilot.common.params import Params
 
@@ -37,10 +41,20 @@ class CarInterface(CarInterfaceBase):
 
     ret.brand = "hyundai"
 
+    if candidate == CAR.KIA_SORENTO:
+      ret.extFlags |= HyundaiExtFlags.RADAR_GROUP4.value
+
     cam_can = CanBus(None, fingerprint).CAM if camera_scc == 0 else 1
     hda2 = False #0x50 in fingerprint[cam_can] or 0x110 in fingerprint[cam_can]
     hda2 = hda2 or params.get_int("CanfdHDA2") > 0
     CAN = CanBus(None, fingerprint, hda2)
+
+    # Prefer the current camera wiring, while supporting recorded src=1 wiring.
+    bosch_bus = bosch_mrrevo14f_bus(candidate, ret.flags, fingerprint, (CAN.CAM, CAN.ACAN))
+    if bosch_bus is not None:
+      ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR.value
+      if bosch_bus == CAN.ACAN:
+        ret.extFlags |= HyundaiExtFlags.BOSCH_RADAR_BUS1.value
 
     if ret.flags & HyundaiFlags.CANFD:
       # Shared configuration for CAN-FD cars
@@ -51,7 +65,15 @@ class CarInterface(CarInterfaceBase):
       if 0x105 in fingerprint[CAN.ECAN]:
         ret.flags |= HyundaiFlags.HYBRID.value
 
-      if 203 in fingerprint[CAN.CAM]: # LFA_ALT
+      # Keep drivetrain/safety classification unchanged: this capability is display-only and requires both exact ECAN frames.
+      has_ev_mode_status = fingerprint[CAN.ECAN].get(CANFD_HYBRID_STATUS_ADDR) == CANFD_HYBRID_STATUS_DLC and \
+                           fingerprint[CAN.ECAN].get(EV_MODE_STATUS_ADDR) == EV_MODE_STATUS_DLC
+      if has_ev_mode_status:
+        ret.extFlags |= HyundaiExtFlags.EV_MODE_STATUS_230.value
+
+      # Tucson can broadcast LFA_ALT while using LFA torque steering.
+      # Keep its torque controller instead of inferring angle support from 0xCB alone.
+      if candidate != CAR.HYUNDAI_TUCSON_4TH_GEN and 0xCB in fingerprint[CAN.CAM]:  # LFA_ALT
         print("##### Anglecontrol detected (LFA_ALT)")
         ret.flags |= HyundaiFlags.ANGLE_CONTROL.value
 
@@ -69,6 +91,9 @@ class CarInterface(CarInterfaceBase):
       if all(fingerprint[CAN.ACAN].get(addr) == 32 for addr in range(0x180, 0x185)):
         ret.extFlags |= HyundaiExtFlags.CORNER_RADAR_OBJECTS_180.value
         print("##### Corner radar objects 0x180 group detected")
+      # The 0x430/0x440 layout is not validated as object data. Keep these
+      # frames available in raw logs for offline analysis, but do not advertise
+      # them as live corner-radar tracks.
 
       # detect HDA2 with ADAS Driving ECU
       if hda2:
@@ -121,6 +146,11 @@ class CarInterface(CarInterfaceBase):
       if CAN.ECAN >= 4:
         cfgs.insert(0, get_safety_config(structs.CarParams.SafetyModel.noOutput))
       ret.safetyConfigs = cfgs
+      from opendbc.car.hyundai.spas import compatible
+      if params.get_bool("CanfdBlinkerControl") and compatible(fingerprint, CAN.ECAN) and not ret.flags & HyundaiFlags.ENABLE_BLINKERS:
+        ret.flags |= HyundaiFlags.CANFD_SPAS_BLINKERS.value
+        ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_SPAS_BLINKERS.value
+
 
       if ret.flags & HyundaiFlags.CANFD_HDA2:
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_LKA_STEERING.value
@@ -130,6 +160,9 @@ class CarInterface(CarInterfaceBase):
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_ALT_BUTTONS.value
       if ret.flags & HyundaiFlags.CANFD_CAMERA_SCC:
         ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CAMERA_SCC.value
+        if params.get_bool("HyundaiCanfdClusterDirectTx"):
+          ret.flags |= HyundaiFlags.CANFD_CLUSTER_DIRECT_TX.value
+          ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CANFD_CLUSTER_DIRECT_TX.value
 
     else:
       # Shared configuration for non CAN-FD cars
@@ -229,6 +262,25 @@ class CarInterface(CarInterfaceBase):
     elif ret.flags & HyundaiFlags.FCEV:
       ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.FCEV_GAS.value
 
+    # Only explicitly configured, ACC-less classic-CAN adapters use the new
+    # protocol. The toggle leaves all existing vehicle paths unchanged otherwise.
+    pedal_interceptor_params = PEDAL_INTERCEPTOR_PARAMS.get(candidate)
+    if (ret.flags & HyundaiFlags.CC_ONLY_CAR and pedal_interceptor_params is not None and
+        params.get_bool("CommaPedalEnabled") and
+        not ret.flags & (HyundaiFlags.CANFD | HyundaiFlags.LEGACY | HyundaiFlags.CAMERA_SCC) and
+        fingerprint[PEDAL_INTERCEPTOR_BUS].get(PEDAL_INTERCEPTOR_SENSOR_ADDR) == 6 and
+        not any(addr in fingerprint[bus] for bus in (0, 2) for addr in (0x420, 0x421))):
+      ret.flags |= HyundaiFlags.PEDAL_INTERCEPTOR.value
+      ret.enableGasInterceptorDEPRECATED = True
+      ret.alphaLongitudinalAvailable = True
+      ret.openpilotLongitudinalControl = True
+      ret.pcmCruise = False
+      ret.radarUnavailable = True
+      ret.autoResumeSng = False
+      ret.minEnableSpeed = pedal_interceptor_params.min_enable_speed
+      ret.safetyConfigs[-1].safetyParam |= (HyundaiSafetyFlags.LONG | HyundaiSafetyFlags.PEDAL_INTERCEPTOR).value
+      ret.safetyConfigs[-1].safetyParam |= pedal_interceptor_params.safety_profile
+
     # Car specific configuration overrides
 
     if candidate == CAR.KIA_OPTIMA_G4_FL:
@@ -245,14 +297,16 @@ class CarInterface(CarInterfaceBase):
 
     Params().put_int('LongitudinalPersonalityMax', 4)
 
-    if CP.openpilotLongitudinalControl and not (CP.flags & HyundaiFlags.CANFD_CAMERA_SCC):
+    params = Params()
+    bosch_passive = bool(CP.extFlags & HyundaiExtFlags.BOSCH_RADAR) and params.get_int("EnableRadarTracks") > 0
+    pedal_interceptor = get_pedal_interceptor_params(CP) is not None
+    if CP.openpilotLongitudinalControl and not (CP.flags & HyundaiFlags.CANFD_CAMERA_SCC) and not pedal_interceptor and not bosch_passive:
       addr, bus = 0x7d0, 0
       if CP.flags & HyundaiFlags.CANFD_HDA2.value:
         addr, bus = 0x730, CanBus(CP).ECAN
       disable_ecu(can_recv, can_send, bus=bus, addr=addr, com_cont_req=b'\x28\x83\x01')
 
-    params = Params()
-    if params.get_int("EnableRadarTracks") > 0 and not CP.flags & HyundaiFlags.CANFD:
+    if params.get_int("EnableRadarTracks") > 0 and not CP.flags & HyundaiFlags.CANFD and not pedal_interceptor and not bosch_passive:
       result = enable_radar_tracks(CP, can_recv, can_send)
       params.put_bool("EnableRadarTracksResult", result)
 

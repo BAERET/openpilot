@@ -1,0 +1,200 @@
+# Understanding Lane Changes
+
+[한국어](../ko/lane-change.md)
+
+[View the Wiki guide](https://github.com/ajouatom/openpilot/wiki/Guide-Lane-Change)
+
+> [!IMPORTANT]
+> A turn signal tells other road users what you intend to do, but it is also a **lane-change request** to openpilot. Check the mirrors and blind spot and select a safe gap before signaling. If you signal first and check later, the maneuver may begin immediately depending on your settings.
+
+## Manual lane-change indicator (trial)
+
+Cruise CANCEL stops automatic indicator requests and releases an automatic hold. Parking maneuvers no longer trigger an indication until SET/RES or +/− clears the cruise cancel state. The stock lever and explicit Bluetooth indicator buttons remain available.
+
+`ManualLaneChangeIndicator` is a separate option, OFF by default, for Ioniq 5 PE with Jetson USB2CAN and AutoBlinkerControl 1 or 2. At 5km/h or above, same-direction steering is confirmed for 0.15s. Release or brief countersteer does not erase continued boundary approach: recent intent is retained for up to 1.5s. Approach stopping for over 0.3s, retreat exceeding 0.15m or a four-second episode limit cancels tracking. On the left, fresh OEM white-line classification excludes centre lines; yellow, unknown or stale classifications block requests. On the right, road-edge clearance beyond the approached boundary must be at least 2.5m both nearby and ahead. Outer-line probability, adjacent lane width and road-edge standard deviation are not admission conditions. A wide shoulder can also pass the distance condition.
+
+This feature's lamp feedback does not request an automatic lane change or turn. The driver steers the maneuver. Detection works during ATC preparation, but an executing automatic lane change or another indicator request takes precedence. Episode admission requires target-line confidence of at least 10% within the preceding second; continuous geometry/intent tracking lasts at most four seconds. Boundary jumps and invalid inputs block new requests. A request then tracks completion or return for at most 12 seconds. Another request requires at least three seconds since the previous hold ended, one continuous second with the lamps off, and fresh driver steering/boundary approach conditions. It does not repeat automatically every three seconds. Owned lamp feedback and synthesized lever counts remain excluded from automatic steering for at least 12 seconds after the latest hold and until extinction is confirmed. A quick opposite request preserves protection for the previous direction too.
+
+Switching OFF may leave an already requested OEM one-touch sequence flashing; its steering-request exclusion remains until extinction is confirmed. Physical lamps and real manual-crossing detection rates have not yet been validated. This option does not assess lane-change safety or replace use of the turn-signal lever.
+
+
+Measured boundary approach projects 0.3 seconds ahead to request indication earlier. The centre-to-boundary distance threshold advances from 0.9m to at most 1.2m; at least 0.15m of actual approach, driver intent and consistent movement of both boundaries remain required.
+
+Manual/model indication distinguishes its short one-touch echo only with matching request time, direction and stalk counters. Opposite input, a latched lever or receiver-detected driver intervention cancels. Lamp feedback preceding the completed-send response is remembered briefly; holding still requires the matching response. Same-direction physical input during the brief transmission interval cannot be uniquely distinguished from these fields alone.
+
+
+## Manual turn indicator (trial)
+
+`ManualTurnIndicator` is a separate option in the Lane Change (Auto Turn) settings group, OFF by default. It supports Ioniq 5 PE with a supported indicator adapter and `AutoBlinkerControl=1·2`. Driver observation operates independently of ATC, navigation and lateral-control activation. Its lamp feedback receives automatic-steering request isolation.
+
+Admission uses 5–60km/h, 0.15s of same-direction driver torque and up to 0.8s of remembered intent. The wheel must reach 42 degrees and increase by at least 22 degrees from intent onset. Same-direction vehicle rotation must reach 3 degrees/s and accumulate 1.5 degrees, followed by 0.10s confirmation. Each intent is tracked for at most four seconds. Recognized curved lane geometry agreeing with measured rotation suppresses admission.
+
+After a request, moving wheel return within ±15 degrees and rotation at most 3 degrees/s for 0.3s completes the indication. Opposite driver torque with the wheel crossing zero cancels it. A stop retains the hold, with a total 30s limit. Disabling the option, stale inputs, physical stalk intervention, opposite lamps or an executing lane change also ends the request. A subsequent manual turn requires two seconds since the previous automatic indication last renewed its hold and one second with both lamps continuously off. The intervals run concurrently. Only fresh steering evidence after both intervals can trigger the next request.
+
+The comma display labels the source as a manual driver turn. Existing USB HUD bundles receive the compatible driver-boundary category with the turning reason. Parking aisles, ramps and parking entry can also trigger. Unmarked bends and evasive movements can produce false indications. Recorded-input replay and physical lamp validation require separate evaluation. Apply with Git Pull and a full comma restart. Physical vehicle validation remains pending.
+
+## Model indication (trial)
+
+`ModelDesireIndicator` and `ModelPathIndicator` are separate default-off options for Ioniq 5 PE with Jetson USB2CAN and `AutoBlinkerControl=1` or `2`. Initiation requires active lateral control. Their lamp feedback is not reused as a new automatic steering request. At 30 km/h or above, the two nearest model forecasts can also trigger an indication when both predict the same lane change with at least 65% probability and both measured lane boundaries show the vehicle approaching that side. A forecast alone does not light the indicator or request steering. After forecast-based initiation, widening lane lines at a fork do not end the hold while the model and measured motion still indicate the same direction. Fading or opposite intent ends the fork hold; cruise CANCEL releases it immediately.
+
+- Model desire: repeatedly confirms a turn/lane-change probability of at least 50%, dominant over straight and opposite predictions. Turns require 10km/h; lane changes require 30km/h.
+- Model path: at 30km/h or above, compares the 1–3 second prediction with curved boundaries at identical forward positions. Requires target-line confidence of at least 10%, continued crossing, agreeing control curvature and at least four observations spanning 0.2 seconds within 0.4 seconds. Boundary jumps, left centre lines and nearby right road edges block initiation.
+
+Same-direction origins share a continuing signal. Alignment after crossing, return before crossing, driver intervention, invalid inputs or a bounded timeout ends the hold request. Ending a request does not guarantee immediate extinction of OEM one-touch flashing. Recorded-input replay is not physical lamp or road validation.
+
+## TBT turn indication
+
+The distance recorded at audioTurn and subsequent wheel-speed integration track through 30m past the turn. Once selected-side steering has exceeded 30 degrees and measured heading has rotated at least 20 degrees, returning the wheel within ±15 degrees while moving at least 1km/h ends the hold immediately, regardless of remaining distance. A straight wheel during approach or a pre-turn stop does not complete a turn. Distance remains a fallback, allowing at most another 30m during continued turning and a 300-second overall limit.
+
+A fresh audioTurn cue for a nearby next turn is handed over when the current turn completes. Same-direction continuation keeps the existing request without another tap; an opposite turn switches after completion. Ending the hold request does not guarantee immediate extinction of the OEM lamp.
+
+After steering at least 30 degrees toward the selected turn, opposite driver torque taking the wheel across zero into the opposite direction immediately cancels it. A left turn cancels at a negative angle and a right turn at a positive angle. Navigation cancellation/off-route status, invalid vehicle inputs and interrupted distance tracking cancel the hold request.
+
+## The key point
+
+After a lane change starts, its path, lateral motion, and steering shape are led by the predicted path generated by the comma driving model. The controller follows that path within the vehicle's steering limits. carrotpilot therefore has **no normal lane-change-specific setting that directly commands a target steering angle, lateral speed, or completion time.**
+
+carrotpilot mainly decides **when to send the lane-change request to the model**, not the shape of the maneuver. Its entry gates use the turn signal, configured delay, driver steering-torque confirmation, lane-marking type, the vehicle BSD signal, and available side-radar information.
+
+These gates are aids, not a replacement for the driver's safety judgment. openpilot does not use a rear-facing camera feed to observe traffic behind the vehicle, and BSD and side-object coverage vary by vehicle, installation, and conditions. The driver is always responsible for judging the distance and closing speed of traffic behind in the target lane.
+
+## Who decides what?
+
+The `AutoTurnControlRightLaneChange` distance under ATC details defaults to 0m (off), with 50m steps up to 500m. The former ON setting migrates to 250m at restart and OFF stays at 0m. It adds to `AutoTurnControl=1` or `2`. It is a TBT right-indicator trigger for the Ioniq 5 PE USB2CAN setup. It checks **10km/h or above AND within the configured distance of the right turn or right fork**, until the turn desire starts. Select 250m for the former distance or 300–400m to check conditions earlier. It requires `AutoBlinkerControl=2`, `LaneChangeNeedTorque=0`, active lateral control, a speed of at least 10km/h, a detected right lane and the existing right-side availability check. The additional rear gate uses fresh OEM BSD warnings only; corner distances and the former 20 m threshold are not used. Every front target in the right destination lane must be at least 5 m away now and satisfy `distance + relative speed × 3 seconds >= 5 m`. The full right-target list includes close objects omitted from the representative lead. Stale or faulty radar/BSD input blocks initiation. No detection or a constant-speed projection guarantees a safe gap; existing side-object admission remains in force.
+
+After one second of qualifying conditions, the existing physical-indicator path lights the right lamp. Signals started below 30km/h remain indication-only until they end. Feedback from starts at or above 30km/h enters the unchanged ordinary lane-change logic; no separate lane-change command is sent. A repeat requires observed completion, lamps off, two seconds of waiting and a fresh condition check. Steering before a request restarts the one-second confirmation. After a request, steering/manual intervention, lost inputs or a failed start cancels repetition in the current TBT window. Manual/remote admission is unchanged. Existing ATC turns/lane changes remain available. The add-on is inactive in mode 0 (off) and 3 (speed only). On restart, the retired mode 4 migrates to mode 1 with the add-on enabled, without newly enabling speed control. Desktop tests are not physical lamp or road acceptance.
+
+The right-turn distance option only supplies a physical right-indicator request. Existing ATC preparation, audio and DesireHelper lane-change decisions retain the implementation from before this add-on. The add-on may request its lamp during matching ATC right-lane or right-fork preparation when its conditions pass; it does not rewrite navigation commands, lane-change desires or existing ATC entry gates.
+
+| Participant | Responsibility | Not responsible for |
+|---|---|---|
+| Driver | Check mirrors, blind spot, and closing traffic; select a safe gap; signal; cancel or intervene when needed | Delegating the safety decision to the system |
+| carrotpilot entry gates | Wait before entry and evaluate configured torque, lane-line, BSD, and side-object conditions | Guaranteeing a safe gap or designing the lane-change angle |
+| comma driving model | Generate a scene-appropriate driving path after receiving the lane-change request | Guaranteeing blind-spot and rear-traffic safety for the driver |
+| Vehicle controller | Track the model path within vehicle and safety limits | Redesigning the path requested by the model |
+
+## What happens in order
+
+1. The driver checks mirrors and the blind spot and judges both distance and closing speed.
+2. After selecting a safe gap, the driver activates the turn signal. An ATC-requested lane change follows the same remaining process and still requires driver supervision.
+3. carrotpilot enters `preLaneChange` and evaluates the configured delay and entry gates.
+4. When the gates pass, it sends a left or right lane-change request to the model.
+5. The comma driving model generates the lane-change path and the vehicle controller tracks it.
+6. The driver continues supervising and immediately steers to cancel or take control if conditions become unsafe.
+
+The same maneuver can feel faster or slower with different scenes or installed model versions. That can be a difference in the model-generated path; `LaneChangeDelay` does not change the speed of a maneuver already in progress.
+
+## What the lane-change settings control
+
+### `LaneChangeNeedTorque` — entry confirmation
+
+| Value | Behavior |
+|---:|---|
+| `-1` | Disable automatic lane changes requested by the driver's turn signal |
+| `0` | Start when the other gates pass, without a separate driver steering-torque confirmation |
+| `1` | Require the driver to apply steering torque toward the target lane before starting |
+
+Value `1` can reduce unintended immediate entry for drivers who signal well in advance. Torque confirmation is not a safety-confirmation button; the driver must check again before nudging the wheel.
+
+### `LaneChangeDelay` — wait before entry
+
+The displayed value is multiplied by `0.1 seconds`. For example, `10` means 1.0 second.
+
+This setting changes only the wait **before the lane change starts**. It does not change the crossing speed, steering angle, or completion time. Expiration of the timer also does not mean the gap is safe.
+
+### `LaneChangeBsd` — vehicle BSD handling
+
+| Value | Behavior |
+|---:|---|
+| `-1` | Ignore the BSD signal in the entry gates |
+| `0` | Block automatic entry while BSD is active, but allow the driver to override by applying steering torque in the same direction |
+| `1` | Do not start while BSD is active, even with driver steering torque |
+
+Vehicle BSD is an assistive signal. It cannot cover every fast-closing vehicle, motorcycle, object outside its sensing area, adverse condition, or sensor fault. Never interpret the absence of a BSD warning as proof that no vehicle is behind you.
+
+### `ShareData` — ONNX lane and BSD detection
+
+Enable **Carrot Web → Settings → Driving → Steering → ONNX Lane & BSD → ONNX Lane and BSD Detection**. This setting runs the lane-type ONNX. Camera BSD has a separate `OnnxBsdEnabled` switch in the detail screen and defaults to off; an existing saved `ShareData` value is preserved. The service starts after onroad initialization and model/CAN/Panda readiness have settled for 0.5 seconds. Engaging cruise is not required. It stops offroad and waits again at the next onroad start.
+
+- **`ShareData` on:** the comma device continues lane-type classification. Inference does not run on the phone.
+- **`OnnxBsdEnabled` on:** the wide-camera BSD ONNX runs in addition to lane classification. It alternates across configured sides whose model-estimated lane width is at least 2 m; speed and lane-change direction do not gate detection.
+- **`OnnxBsdEnabled` off:** the BSD ONNX network is unloaded, so BSD inference and use of its result stop while lane classification continues. The visual service and camera subscription remain for lane detection and snapshots. Vehicle-provided BSD is unaffected.
+- **Off:** the vision service stops. Its last results expire after their validity period; vehicle-provided lane information and BSD remain available. The setting and mici status display update within a few seconds.
+
+The detail screen exposes these persistent device settings:
+
+| Setting | Range · default | Effect |
+|---|---:|---|
+| Vision BSD `OnnxBsdEnabled` | On/off · off | Independently enables wide-camera ONNX BSD inference |
+| Lane confidence `OnnxLaneThreshold` | 0–100% · 25% | Accept lane classifications at or above this confidence |
+| Lane interval `OnnxLaneIntervalMs` | 50–2000ms · 400ms | Shorter intervals update more often but may increase device load |
+| BSD confidence `OnnxBsdThreshold` | 0–100% · 94% | Activate camera BSD when the near-vehicle class reaches this confidence |
+| BSD hold time `OnnxBsdSmoothingMs` | 100–500ms · 200ms | Smooth confidence; once active, BSD clears 15 percentage points below the activation threshold |
+| BSD interval `OnnxBsdIntervalMs` | 50–1000ms · 250ms | Shorter intervals check more often but may increase device load |
+
+The ONNX detail screen keeps the feature toggle at the top and shows the wide-camera BSD detection-area editor in a separate card directly below it. Runtime state, lane/BSD tuning, and diagnostics open from the simple **Expand/Collapse advanced settings** text at the editor's lower right and are collapsed by default. The routine camera-waiting state is not shown beside that text. Select left or right above the image, then choose a point from the basic rectangular picker at the image's upper left, where entries use `1(L)` and `1(R)`, or tap its numbered label directly. Tap the selected point again or briefly tap an empty position to clear the selection; dragging anywhere in the editor while a point is selected moves only that point. Zoom, viewport panning, and whole-area dragging are omitted so they cannot compete with point movement. When no point is selected, a short tap on an empty position adds a new point without a separate mode. The selection state takes priority in the lower-left image status. Each newly received camera JPEG replaces the single last-frame copy in browser cache and current-session memory. If a new frame is unavailable, the editor shows that last frame, then a more strongly dimmed default road example when no cached frame exists. The example keeps the earlier compact editor height and fills the entire editor with the road graphic without an empty upper band. The point picker and real-image reminder overlay the detection graphic, while points, labels, and area lines remain on a separate crisp layer above the dim background. The example cannot be used to save an area. Saving is allowed only after receiving a real image in the current session; otherwise the editor asks the user to refresh the real image and set the area again. The invisible touch target remains generous. Use **Refresh image**, **Undo point**, **Reset points**, and **Save area** for the primary workflow. The two equal-width **View road camera** and **View wide camera** buttons directly below those actions open their images in pop-up dialogs. Mounting position and vehicle geometry affect the detection area; adjust it while parked and treat the result only as driver assistance.
+
+The mici VISION card shows left/right lane types and the latest processing time. When `OnnxBsdEnabled` is off, the BSD ONNX network is unloaded and camera BSD is in standby; lane detection and vehicle-provided BSD remain available. The visual service and wide-camera subscription remain active for lane detection and snapshots. When enabled, BSD distinguishes standby, no detection on the evaluated side, and detection. The card and warning indicators remain visible with the camera hidden. A BSD wall is amber for vehicle/OEM-only detection, blue for vision-only detection, and light red when both sources detect that side. Left and right are colored independently.
+
+OpenCV is included with the update and installed automatically during normal device startup. No separate pip command or internet connection while driving is required. Standby means BSD is not being evaluated; no detection does not guarantee that the entire blind spot is clear.
+
+The BSD classifier preserves the annotated area's aspect ratio by padding it to a square input. Its three outputs distinguish no nearby vehicle, a blind-spot threat, and a distant/rear vehicle; only the blind-spot-threat class activates camera BSD.
+
+### `LaneLineCheck` — lane-marking handling
+
+| Value | Behavior |
+|---:|---|
+| `0` | Use lane-color information supplied by the vehicle and block yellow markings |
+| `1` | Judge using broken/solid marking types |
+| `2` | Judge using marking types, but allow driver steering torque to override a solid-line block |
+
+The camera or vehicle can misclassify markings, and value `2` does not make crossing a solid line safe or legal. The driver must verify road markings and applicable traffic rules.
+
+### Turn-signal lever (Hyundai CAN-FD)
+
+Hyundai CAN-FD cars also read the lever itself (`0x3C1`), separate from the lamp: every press is counted and the lever position (released, one-touch, latched) is known, so a press made while the lamp is already flashing is seen.
+
+- A press after the car centre has crossed the line during a lane change (from the model lane lines) asks for the next change; a press before the crossing is ignored, so it never crosses two lanes at once. Without a detected crossing only a press in the finishing phase counts. The queued request keeps the turn signal on until the next change starts, which needs no steering torque but still passes the existing lane-line and BSD checks; if it stays blocked it is dropped after 5 flashes (about 4 s).
+- `BlinkerLatchedTurn` (km/h, `0` = off): at or below the set speed a one-touch press, then latching the lever after the lamp has lit, gone dark and lit again (about 0.8 s), is a left/right turn; a plain latch or a one-touch press is a lane change (a latch can hold the signal for the next lane); no lane change starts while the lever is still in the one-touch position (a latch passes through it for about 0.1 s). Above the set speed a latched lever is a lane change only. While the turn model is active, however it was started (lever or automatic turn), the cluster background flashes red, the same display as a held paddle.
+- `LaneChangeLeverWait` (default off): when a one-touch lane change is not approved at once (BSD, side vehicle, lane lines: the existing checks), the turn signal is held and the request waits for 5 flashes (about 4 s) from the press. If it clears in time the change starts; otherwise the request is dropped and the remaining flashes do not start it. A latched lever keeps waiting as before.
+
+## What these settings do not change
+
+- `LaneChangeDelay` delays **entry**; it does not make an active lane change slower.
+- There is no normal setting for a lane-change-specific angle, lateral speed, or path shape.
+- `CustomSteerDeltaUpLC` and `CustomSteerDeltaDownLC` are advanced vehicle-control values that alter steering-torque rate limits during lane changes on some torque-controlled vehicles. They do not specify the model's target path or maneuver speed, and incorrect tuning can reduce tracking performance and safety margin.
+- General steering settings such as `SteerActuatorDelay` and `LatSmoothSec` can affect overall path-tracking timing and response, but they are not lane-change shape controls.
+- `DynamicTFollowLC` permits bounded relief for the old lead after predicted clearance, only with confirmed lateral movement and selected-lead spacing. Base TF and normal selected-lead spacing remain intact. It does not change the lateral angle or crossing speed. `100` disables additional relief.
+
+The normally selected leadOne/leadTwo at lane-change entry form the reference pair. If either selected lead changes or disappears, additional acceleration relief stops for the rest of that maneuver. Braking uses only the currently selected leads; side radar candidates and stored entry vehicles never become additional braking obstacles.
+
+## Safer operation
+
+1. Check the rear-view mirror, side mirror, and blind spot before signaling.
+2. Check whether a vehicle is closing quickly, not only its current distance.
+3. With immediate entry (`LaneChangeNeedTorque=0` and a short delay), treat activation of the turn signal as permission for the maneuver to start.
+4. If you normally signal well in advance, use torque confirmation (`LaneChangeNeedTorque=1`) or an appropriate entry delay. Check again immediately before entry.
+5. Keep hold of the steering wheel throughout the maneuver and intervene if rear traffic accelerates or the adjacent-lane situation changes.
+6. If BSD or side-radar blocking repeatedly behaves unexpectedly, do not continue relying on it; verify vehicle support and inspect logs.
+
+## If a lane change felt too abrupt and endangered rear traffic
+
+Separate two questions:
+
+- **Was the crossing motion itself abnormal?** Use logs to investigate the model, path tracking, device mounting, and road conditions.
+- **Was the gap safe when entry began?** Even a normal model path can create a collision risk when started in front of fast-closing rear traffic.
+
+With immediate-entry settings, the sequence “signal first, then check behind” is especially dangerous. The system can chiefly control when entry is permitted; the driver must select the moment that is actually safe.
+
+Related: [Understanding Settings](settings.md) · [Cruise and Following Gap](cruise-gap.md)
+
+With this option enabled on supported vehicles, a separate observer logs `manualBoundaryObservation` at most once per second to compare manual boundary-approach detection. It briefly remembers driver steering and records approach, hypothetical indication, retreat and tracking failures; it never requests lamps or steering. Observer predictions do not replace the actual indication gates. Clearance uses a provisional 0.9 m half-width, not measured tire contact or confirmed lane-change intent.
+
+### ATC turn indication and straight-through cancellation
+
+ATC indication starts at audioTurn and persists through stops. A fresh cue can start at a full stop in Drive when lateral permission remains valid and steering is fault-free. After the receiver confirms send completion, both lamps staying off for 1.5 seconds permits one recovery attempt per turn, including an initially unlit request. Driver cancellation, communication failure or an unconfirmed send forbids retry. A fresh opposite-turn cue waits at most three seconds for physical completion of the preceding turn.
+
+When a usable TBT point and raw vehicle GPS are available, passage evidence supplements physical turn completion. Continuing straight sufficiently beyond a closely passed point cancels the indication without replaying the same audioTurn. Accuracy, continuity and direction checks disable this location-based cancellation for poor GPS, missing points or curved approaches. Fresh navigation status reporting guidance ended or off-route also releases automatic indication. Physical lamps and road behavior still need validation.
+
+
+A TBT hold with confirmed transmission and illumination continues through a receiver `driver_override` status until normal completion or the driver steering cancellation. A missing initial transmission acknowledgement or invalid communication/vehicle input prevents hold output.

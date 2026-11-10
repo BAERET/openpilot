@@ -40,8 +40,31 @@ assert arch in [
   "Darwin",   # macOS arm64 (x86 not supported)
 ]
 
-pkg_names = ['bzip2', 'capnproto', 'eigen', 'ffmpeg', 'libjpeg', 'libyuv', 'ncurses', 'zeromq', 'zstd']
+pkg_names = ['acados', 'bzip2', 'capnproto', 'eigen', 'ffmpeg', 'json11', 'libjpeg', 'libyuv', 'ncurses', 'zeromq', 'zstd']
+if GetOption('extras'):
+  pkg_names.append('catch2')
+if arch == "larch64":
+  # AGNOS 19 no longer ships comma's legacy bzip2/libyuv Python wrappers.
+  # Neither dependency is used by an on-device target: bzip2 is replay-only,
+  # and the libyuv-backed FFmpeg encoder is excluded below on larch64.
+  pkg_names = [name for name in pkg_names if name not in ('bzip2', 'libyuv')]
+
 pkgs = [importlib.import_module(name) for name in pkg_names]
+acados = pkgs[pkg_names.index('acados')]
+
+ffmpeg = pkgs[pkg_names.index('ffmpeg')]
+# Newer comma FFmpeg packages use shared libraries, while older AGNOS/device
+# environments can still provide static archives with extra link dependencies.
+_ffmpeg_lib_names = os.listdir(ffmpeg.LIB_DIR) if os.path.isdir(ffmpeg.LIB_DIR) else []
+ffmpeg_shared = any(
+  name.startswith('libavcodec.so') or (name.startswith('libavcodec') and name.endswith('.dylib'))
+  for name in _ffmpeg_lib_names
+)
+ffmpeg_libs = ['avformat', 'avcodec', 'swresample', 'avutil']
+if not ffmpeg_shared:
+  ffmpeg_libs += ['x264', 'z']
+  if arch != "Darwin":
+    ffmpeg_libs += ['va', 'va-drm', 'drm']
 
 
 # ***** enforce a whitelist of system libraries *****
@@ -82,13 +105,22 @@ def _libflags(target, source, env, for_signature):
   return _stripixes(env['LIBLINKPREFIX'], libs, env['LIBLINKSUFFIX'],
                     env['LIBPREFIXES'], env['LIBSUFFIXES'], env, env['LIBLITERALPREFIX'])
 
+scons_python_paths = [
+  Dir("#").abspath,
+]
+if external_pythonpath := os.environ.get("PYTHONPATH"):
+  scons_python_paths += [
+    path for path in external_pythonpath.split(os.pathsep)
+    if path and path not in scons_python_paths
+  ]
+
 env = Environment(
   ENV={
     "PATH": os.environ['PATH'],
-    "PYTHONPATH": Dir("#").abspath + ':' + Dir(f"#third_party/acados").abspath,
-    "ACADOS_SOURCE_DIR": Dir("#third_party/acados").abspath,
-    "ACADOS_PYTHON_INTERFACE_PATH": Dir("#third_party/acados/acados_template").abspath,
-    "TERA_PATH": Dir("#").abspath + f"/third_party/acados/{arch}/t_renderer"
+    "PYTHONPATH": os.pathsep.join(scons_python_paths),
+    "ACADOS_SOURCE_DIR": acados.DIR,
+    "ACADOS_PYTHON_INTERFACE_PATH": acados.TEMPLATE_DIR,
+    "TERA_PATH": acados.TERA_PATH,
   },
   CCFLAGS=[
     "-g",
@@ -111,30 +143,30 @@ env = Environment(
     "#msgq",
     "#openpilot/cereal/gen/cpp",
     "#third_party",
-    "#third_party/json11",
     "#third_party/linux/include",
-    "#third_party/acados/include",
-    "#third_party/acados/include/blasfeo/include",
-    "#third_party/acados/include/hpipm/include",
-    "#third_party/catch2/include",
+    os.path.join(acados.INCLUDE_DIR, "blasfeo", "include"),
+    os.path.join(acados.INCLUDE_DIR, "hpipm", "include"),
     [x.INCLUDE_DIR for x in pkgs],
   ],
   LIBPATH=[
     "#openpilot/common",
     "#msgq_repo",
-    "#third_party",
     "#openpilot/selfdrive/pandad",
     "#rednose/helpers",
-    f"#third_party/acados/{arch}/lib",
     [x.LIB_DIR for x in pkgs],
   ],
-  RPATH=[],
+  RPATH=[ffmpeg.LIB_DIR] if ffmpeg_shared else [],
   CYTHONCFILESUFFIX=".cpp",
   COMPILATIONDB_USE_ABSPATH=True,
   REDNOSE_ROOT="#",
   tools=["default", "cython", "compilation_db", "rednose_filter"],
   toolpath=["#site_scons/site_tools", "#rednose_repo/site_scons/site_tools"],
 )
+# SCons' Darwin linker tool does not expand RPATH by default.
+if arch == "Darwin":
+  env["RPATHPREFIX"] = "-Wl,-rpath,"
+  env["RPATHSUFFIX"] = ""
+  env["_RPATH"] = "${_concat(RPATHPREFIX, RPATH, RPATHSUFFIX, __env__)}"
 if arch != "larch64":
   env['_LIBFLAGS'] = _libflags
 
@@ -204,10 +236,21 @@ else:
 np_version = SCons.Script.Value(np.__version__)
 Export('envCython', 'np_version')
 
-Export('env', 'arch')
+Export('env', 'arch', 'acados', 'ffmpeg_libs')
 
 # Setup cache dir
-cache_dir = '/data/scons_cache' if arch == "larch64" else '/tmp/scons_cache'
+cache_dir = os.environ.get('SCONS_CACHE_DIR') or ('/data/scons_cache' if arch == "larch64" else '/tmp/scons_cache')
+# Hold a stable, external guard for the entire SCons process, including clean,
+# so cooperating builds and cleanup cannot overlap. Builds wait for each other.
+# atexit retains the handle even after this SConstruct scope is discarded.
+import atexit
+from pathlib import Path
+from openpilot.common.scons_cache_lock import acquire_cache_lock
+try:
+  _cache_guard = acquire_cache_lock(Path(cache_dir), os.environ.get("SCONS_CACHE_LOCK_FD"), timeout=300)
+except (OSError, RuntimeError, ValueError) as exc:
+  raise SCons.Errors.UserError(str(exc)) from exc
+atexit.register(_cache_guard.close)
 CacheDir(cache_dir)
 Clean(["."], cache_dir)
 
@@ -247,8 +290,9 @@ SConscript([
 if arch == "larch64":
   SConscript(['openpilot/system/camerad/SConscript'])
 
-# Build openpilot
-SConscript(['third_party/SConscript'])
+# Passive camera timing checks do not require the device-only camerad target.
+if GetOption('extras'):
+  SConscript(['openpilot/system/camerad/test/SConscript'])
 
 # Build selfdrive
 SConscript([
@@ -258,6 +302,12 @@ SConscript([
   'openpilot/selfdrive/locationd/SConscript',
   'openpilot/selfdrive/modeld/SConscript',
   'openpilot/selfdrive/ui/SConscript',
+  'openpilot/system/ui/lib/native/SConscript',
+  'openpilot/selfdrive/carrot/realtime/SConscript',
+  'openpilot/selfdrive/carrot/cluster/SConscript',
+  'openpilot/selfdrive/carrot/radar_motion/SConscript',
+  'openpilot/selfdrive/navigation/SConscript',
+  'opendbc_repo/opendbc/can/SConscript',
 ])
 
 # Build tools
@@ -265,7 +315,11 @@ if arch != "larch64":
   SConscript([
     'openpilot/tools/replay/SConscript',
     'openpilot/tools/cabana/SConscript',
+    'openpilot/tools/jotpluggler/SConscript',
   ])
 
 
-env.CompilationDatabase('compile_commands.json')
+# Compilation database generation can end a clean without removing outputs.
+# Skip this build-only step when cleaning.
+if not GetOption('clean'):
+  env.CompilationDatabase('compile_commands.json')

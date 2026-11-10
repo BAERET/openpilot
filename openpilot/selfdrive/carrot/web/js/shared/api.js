@@ -7,11 +7,33 @@ async function bulkGet(names) {
   return j.values || {};
 }
 
-async function setParam(name, value) {
-  const j = await postJson("/api/param_set", { name, value });
-  window.dispatchEvent(new CustomEvent("carrot:paramchange", {
-    detail: { name, value: j.value ?? value },
-  }));
+// Every parameter write in the app goes through here, so this is where the
+// shared commit rules live: the value the server reports back is the one that
+// wins, and each write says where it came from so the change history can tell
+// a mis-tap apart from a profile apply or a steering-wheel button.
+let paramCommitter = null;
+
+function getParamCommitter() {
+  if (!paramCommitter) {
+    paramCommitter = window.CarrotParamCommit.create({
+      postJson,
+      dispatchEvent: (result) => {
+        window.dispatchEvent(new CustomEvent("carrot:paramchange", {
+          detail: { name: result.name, value: result.value, source: result.source },
+        }));
+      },
+    });
+  }
+  return paramCommitter;
+}
+
+async function setParam(name, value, options) {
+  if (name === "DriverMonitoringMode" && Number(value) === 1) {
+    const accepted = await appConfirm(getUIText("dm_experimental_warning",
+      "Experimental driver monitoring may violate applicable law. Use only for experiments in a controlled test environment. Public-road legality and safety are not assured. Enable for experimental use only?"));
+    if (!accepted) throw new Error(getUIText("dm_experimental_cancelled", "Experimental mode was not enabled."));
+  }
+  await getParamCommitter().commit(name, value, options);
   return true;
 }
 

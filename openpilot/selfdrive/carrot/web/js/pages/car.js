@@ -3,20 +3,21 @@
 // Car page + Drive-page record FAB + currentCar status (cross-cutting with setting page).
 
 const CURRENT_CAR_CACHE_KEY = "carrot_web_current_car_label";
-const CURRENT_CAR_PROMPT_SESSION_KEY = "carrot_web_missing_car_prompted";
 const CURRENT_CAR_RETRY_DELAYS_MS = [350, 800, 1500, 2500, 4000];
 const RECORD_STATE_POLL_MS = 1200;
 
 let recordStateIsOn = false;
 let recordTogglePending = false;
 let recordStatePollTimer = null;
+let recordStartedAtMs = 0;
+let recordServerOffsetMs = 0;
+let recordElapsedTimer = null;
 let currentCarRetryTimer = null;
 let currentCarRetryIndex = 0;
 let currentCarLastKnownLabel = "";
 let currentCarLoadPromise = null;
 let currentCarLoadedAt = 0;
 let currentCarHasSnapshot = false;
-let currentCarPromptActive = false;
 let recordStateLoadPromise = null;
 let recordStateLoadedAt = 0;
 let carsLoadPromise = null;
@@ -25,23 +26,11 @@ let carPickerCloseTimer = null;
 let carPickerMode = "makers";
 let carPickerMaker = null;
 
-function updateSettingCarEntryState(label) {
-  if (!settingCarRow) return;
-  const text = String(label || "").trim();
-  const isEmpty = !text || text === "-";
-  settingCarRow.classList.toggle("is-empty", isEmpty);
-  settingCarRow.setAttribute("aria-label", isEmpty
-    ? getUIText("open_car_select", "Open car select")
-    : getUIText("open_car_select_named", "Open car select for {name}", { name: text }));
-}
-
 function applyCurrentCarLabel(label, { persist = true, blank = false } = {}) {
   const text = String(label || "").trim();
   if (text) {
     currentCarLastKnownLabel = text;
     if (curCarLabelCar) curCarLabelCar.textContent = text;
-    if (curCarLabelSetting) curCarLabelSetting.textContent = text;
-    updateSettingCarEntryState(text);
     if (persist) {
       try {
         localStorage.setItem(CURRENT_CAR_CACHE_KEY, text);
@@ -52,15 +41,11 @@ function applyCurrentCarLabel(label, { persist = true, blank = false } = {}) {
 
   if (currentCarLastKnownLabel) {
     if (curCarLabelCar) curCarLabelCar.textContent = currentCarLastKnownLabel;
-    if (curCarLabelSetting) curCarLabelSetting.textContent = currentCarLastKnownLabel;
-    updateSettingCarEntryState(currentCarLastKnownLabel);
     return;
   }
 
   if (blank) {
     if (curCarLabelCar) curCarLabelCar.textContent = "-";
-    if (curCarLabelSetting) curCarLabelSetting.textContent = "-";
-    updateSettingCarEntryState("-");
   }
 }
 
@@ -97,7 +82,6 @@ function resolveCurrentCarLabel(values) {
 }
 
 restoreCurrentCarLabelFromCache();
-updateSettingCarEntryState(curCarLabelSetting?.textContent || curCarLabelCar?.textContent || "-");
 
 function parseRecordStateValue(value) {
   return (
@@ -121,21 +105,104 @@ function stopRecordStatePolling() {
   if (recordStatePollTimer === null) return;
   window.clearInterval(recordStatePollTimer);
   recordStatePollTimer = null;
+  stopRecordElapsedTicker();
+}
+
+function parseRecordingStartEpoch(name) {
+  const match = String(name || "").match(/^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})/);
+  if (!match) return 0;
+  const parsed = new Date(
+    Number(match[1]),
+    Number(match[2]) - 1,
+    Number(match[3]),
+    Number(match[4]),
+    Number(match[5]),
+    Number(match[6]),
+  ).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatRecordElapsed(ms) {
+  const total = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = (value) => String(value).padStart(2, "0");
+  return hours > 0 ? `${hours}:${pad(minutes)}:${pad(seconds)}` : `${minutes}:${pad(seconds)}`;
+}
+
+function recordElapsedSuffix() {
+  if (!recordStateIsOn || !recordStartedAtMs) return "";
+  // Follow the device clock: the browser clock/timezone must not skew the
+  // elapsed timer.
+  const now = Date.now() + recordServerOffsetMs;
+  return ` ${formatRecordElapsed(now - recordStartedAtMs)}`;
+}
+
+async function syncRecordStartedAt() {
+  // The newest in-progress recording carries the device-side start time, so
+  // the elapsed timer stays on the device clock even if the browser timezone
+  // or clock differs.
+  try {
+    const fetchJson = typeof getJson === "function"
+      ? getJson
+      : (url) => fetch(url).then((response) => response.json());
+    const json = await fetchJson("/api/screenrecord/videos?limit=1");
+    const newest = (json?.videos || [])[0];
+    if (Number(json?.now) > 0) {
+      recordServerOffsetMs = Number(json.now) * 1000 - Date.now();
+    } else {
+      recordServerOffsetMs = 0;
+    }
+    const modified = Number(newest?.modifiedEpoch || 0);
+    const deviceNow = Date.now() + recordServerOffsetMs;
+    const fresh = newest && modified > 0 && (deviceNow / 1000 - modified) < 10;
+    if (fresh) {
+      const started = Number(newest?.startEpoch) > 0
+        ? Number(newest.startEpoch) * 1000
+        : parseRecordingStartEpoch(newest?.name);
+      if (started) {
+        recordStartedAtMs = started;
+        return;
+      }
+    }
+  } catch {}
+  if (!recordStartedAtMs) recordStartedAtMs = Date.now() + recordServerOffsetMs;
+}
+
+function startRecordElapsedTicker() {
+  if (recordElapsedTimer !== null) return;
+  recordElapsedTimer = window.setInterval(() => {
+    if (!recordStateIsOn) {
+      stopRecordElapsedTicker();
+      return;
+    }
+    applyRecordFabState(true);
+  }, 250);
+}
+
+function stopRecordElapsedTicker() {
+  if (recordElapsedTimer === null) return;
+  window.clearInterval(recordElapsedTimer);
+  recordElapsedTimer = null;
 }
 
 function applyRecordFabState(isOn = recordStateIsOn) {
   recordStateIsOn = Boolean(isOn);
   if (!btnRecordToggle) return;
 
+  const elapsed = recordElapsedSuffix();
   btnRecordToggle.classList.toggle("active", recordStateIsOn);
-  btnRecordToggle.textContent = getUIText("record", "Record");
+  btnRecordToggle.textContent = `${getUIText("record", "Record")}${elapsed}`;
   btnRecordToggle.dataset.state = recordStateIsOn ? "on" : "off";
+  if (recordStateIsOn) startRecordElapsedTicker();
+  else stopRecordElapsedTicker();
   if (typeof btnHome !== "undefined" && btnHome) {
     btnHome.classList.toggle("recording", recordStateIsOn);
     btnHome.setAttribute("data-record-badge", recordStateIsOn ? "REC" : "");
   }
   const label = recordStateIsOn
-    ? getUIText("record_on", getUIText("record", "Recording"))
+    ? `${getUIText("record_on", getUIText("record", "Recording"))}${elapsed}`
     : getUIText("record_off", getUIText("record", "Idle"));
   btnRecordToggle.setAttribute("aria-label", label);
   btnRecordToggle.title = label;
@@ -167,17 +234,9 @@ async function loadCurrentCar(options = {}) {
         cancelCurrentCarRetry();
         currentCarRetryIndex = 0;
         applyCurrentCarLabel(label);
-        if (isMissingCarSelectionValues(values)) {
-          window.setTimeout(() => {
-            promptMissingCurrentCarSelection(values).catch(() => {});
-          }, 350);
-        }
       } else {
         applyCurrentCarLabel("", { blank: !currentCarLastKnownLabel });
         scheduleCurrentCarRetry();
-        window.setTimeout(() => {
-          promptMissingCurrentCarSelection(values).catch(() => {});
-        }, 350);
       }
       currentCarHasSnapshot = true;
       currentCarLoadedAt = Date.now();
@@ -227,6 +286,12 @@ async function loadRecordState(options = {}) {
     try {
       const values = await bulkGet(["ScreenRecord"]);
       applyRecordFabState(parseRecordStateValue(values["ScreenRecord"]));
+      if (recordStateIsOn) {
+        await syncRecordStartedAt();
+        applyRecordFabState(true);
+      } else {
+        recordStartedAtMs = 0;
+      }
       recordStateLoadedAt = Date.now();
       return recordStateIsOn;
     } catch (e) {
@@ -247,14 +312,35 @@ async function toggleRecord() {
   recordTogglePending = true;
   try {
     await setParam("ScreenRecord", next);
-    await waitMs(650);
-    recordTogglePending = false;
-    await loadRecordState({ force: true });
   } catch (e) {
+    // A disconnected response can be ambiguous: the device may have accepted
+    // the write before the browser saw the failure. Confirm the stored value
+    // once before reporting a false recording error.
+    recordTogglePending = false;
+    try {
+      const observed = await loadRecordState({ force: true });
+      if (observed === next) return;
+    } catch {}
     applyRecordFabState(prev);
     showAppToast((UI_STRINGS[LANG].record || "Failed to toggle record: ") + e.message, { tone: "error" });
-  } finally {
-    recordTogglePending = false;
+    return;
+  }
+
+  // The parameter write is authoritative. A transient follow-up read must not
+  // turn a recording that already started into an error in the web UI.
+  applyRecordFabState(next);
+  recordStartedAtMs = 0;
+  if (next) {
+    syncRecordStartedAt().then(() => applyRecordFabState(true)).catch(() => {});
+  }
+  recordStateLoadedAt = Date.now();
+  await waitMs(650);
+  recordTogglePending = false;
+  try {
+    await loadRecordState({ force: true });
+  } catch {
+    applyRecordFabState(next);
+    recordStateLoadedAt = Date.now();
   }
 }
 
@@ -301,7 +387,7 @@ function closeCarPicker(immediate = false) {
 
 function syncCarPickerChrome() {
   if (!appCarPickerTitle || !appCarPickerMeta || !appCarPickerClose) return;
-  const currentLabel = String(curCarLabelSetting?.textContent || curCarLabelCar?.textContent || "").trim() || "-";
+  const currentLabel = String(curCarLabelCar?.textContent || "").trim() || "-";
   if (carPickerMode === "models" && carPickerMaker) {
     appCarPickerTitle.textContent = carPickerMaker;
     const arr = (CARS?.makers && CARS.makers[carPickerMaker]) ? CARS.makers[carPickerMaker] : [];
@@ -387,6 +473,15 @@ window.openCarPickerFlow = () => {
     appAlert(e?.message || String(e), { title: getUIText("error", "Error") });
   });
 };
+
+window.CarrotCurrentCar = Object.freeze({
+  getLabel() {
+    return String(currentCarLastKnownLabel || document.getElementById("curCarLabelCar")?.textContent || "").trim();
+  },
+  refresh(options = {}) {
+    return loadCurrentCar(options);
+  },
+});
 
 if (appCarPickerBackdrop) appCarPickerBackdrop.onclick = () => closeCarPicker();
 if (appCarPickerClose) {
@@ -496,8 +591,7 @@ async function onSelectCar(maker, modelOnly, fullLine) {
 
   if (typeof applyCurrentCarLabel === "function") applyCurrentCarLabel(modelOnly);
   else {
-    curCarLabelCar.textContent = modelOnly;
-    curCarLabelSetting.textContent = modelOnly;
+    if (curCarLabelCar) curCarLabelCar.textContent = modelOnly;
   }
   closeCarPicker(true);
 

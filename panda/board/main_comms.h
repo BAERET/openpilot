@@ -15,6 +15,7 @@ static int get_health_pkt(void *dat) {
   // Use the GPIO pin to determine ignition or use a CAN based logic
   health->ignition_line_pkt = (uint8_t)(current_board->check_ignition());
   health->ignition_can_pkt = ignition_can;
+  health->wake_on_can_pkt = wake_on_can;
 
   health->controls_allowed_pkt = controls_allowed;
   health->safety_tx_blocked_pkt = safety_tx_blocked;
@@ -215,10 +216,10 @@ int comms_control_handler(ControlPacket_t *req, uint8_t *resp) {
       if (current_board->harness_config->has_harness) {
         if (req->param1 == 1U) {
           // Enable OBD CAN
-          current_board->set_can_mode(CAN_MODE_OBD_CAN2);
+          can_set_mode(CAN_MODE_OBD_CAN2);
         } else {
           // Disable OBD CAN
-          current_board->set_can_mode(CAN_MODE_NORMAL);
+          can_set_mode(CAN_MODE_NORMAL);
         }
       }
       break;

@@ -7,6 +7,8 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.structs import CarParams
 from opendbc.car.docs_definitions import CarFootnote, CarHarness, CarDocs, CarParts, Column
 from opendbc.car.fw_query_definitions import FwQueryConfig, Request, p16
+from opendbc.car.hyundai.pedal_interceptor import RAY_PEDAL_INTERCEPTOR_PARAMS
+from opendbc.car.pedal_interceptor import PedalInterceptorParams
 
 Ecu = CarParams.Ecu
 
@@ -83,6 +85,10 @@ class HyundaiSafetyFlags(IntFlag):
   CANFD_LKA_STEERING_ALT = 128
   FCEV_GAS = 256
   ALT_LIMITS_2 = 512
+  CANFD_CLUSTER_DIRECT_TX = 2048
+  CANFD_SPAS_BLINKERS = 4096
+  PEDAL_INTERCEPTOR = 8192
+  PEDAL_INTERCEPTOR_RAY = 16384
 
 
 class HyundaiFlags(IntFlag):
@@ -137,6 +143,11 @@ class HyundaiFlags(IntFlag):
   FCEV = 2 ** 25
 
   ALT_LIMITS_2 = 2 ** 26
+  CANFD_CLUSTER_DIRECT_TX = 2 ** 27
+
+  CANFD_SPAS_BLINKERS = 2 ** 28
+
+  PEDAL_INTERCEPTOR = 2 ** 29
 
   CC_ONLY_CAR = 2 ** 31
 
@@ -149,6 +160,11 @@ class HyundaiExtFlags(IntFlag):
   RADAR_GROUP3 = 2 ** 11  # 0x400-0x41D radar object group
   CORNER_RADAR_OBJECTS_235 = 2 ** 12  # 0x230 status + 0x235-0x248 raw corner radar objects
   CORNER_RADAR_OBJECTS_180 = 2 ** 13  # 0x180-0x184 bus 1 two-slot raw corner/front radar objects
+  CORNER_RADAR_OBJECTS_430 = 2 ** 14  # 0x430-0x437 left + 0x440-0x447 right IONIQ 9 corner radar bins
+  RADAR_GROUP4 = 2 ** 15  # 0x500-0x507 Denso DNMWR006 stable radar tracks
+  EV_MODE_STATUS_230 = 2 ** 16  # ECAN 0x230/DLC32 exposes the hybrid power-flow mode used for the EV indicator
+  BOSCH_RADAR = 2 ** 17  # passive Bosch MRRevo14F 0x601-0x612 receive provider (see BOSCH_MRREVO14F_CAR)
+  BOSCH_RADAR_BUS1 = 2 ** 18  # Observed receive src=1; otherwise use LKAS camera CAN (src=2)
 
 class Footnote(Enum):
   CANFD = CarFootnote(
@@ -355,6 +371,13 @@ class CAR(Platforms):
   HYUNDAI_STARIA_4TH_GEN = HyundaiCanFDPlatformConfig(
     [HyundaiCarDocs("Hyundai Staria 2023", "All", car_parts=CarParts.common([CarHarness.hyundai_k]))],
     CarSpecs(mass=2205, wheelbase=3.273, steerRatio=11.94),  # https://www.hyundai.com/content/dam/hyundai/au/en/models/staria-load/premium-pip-update-2023/spec-sheet/STARIA_Load_Spec-Table_March_2023_v3.1.pdf
+  )
+  HYUNDAI_STARIA_EV = HyundaiCanFDPlatformConfig(
+    [HyundaiCarDocs("Hyundai Staria EV 2026", car_parts=CarParts.common([CarHarness.hyundai_k]))],
+    # Korean Lounge 7/11-seat curb weight and wheelbase; see docs/staria_ev_registration.md.
+    # Steering ratio remains the existing Staria baseline pending EV-specific measurement.
+    HYUNDAI_STARIA_4TH_GEN.specs.override(mass=2590, wheelbase=3.275),
+    flags=HyundaiFlags.EV,
   )
   HYUNDAI_TUCSON = HyundaiPlatformConfig(
     [
@@ -639,6 +662,13 @@ class CAR(Platforms):
       HyundaiCarDocs("Kia EV6 PE (with HDA II) 2025", "Highway Driving Assist II", car_parts=CarParts.common([CarHarness.hyundai_p]))
     ],
     CarSpecs(mass=2055, wheelbase=2.9, steerRatio=16, tireStiffnessFactor=0.65),
+    flags=HyundaiFlags.EV | HyundaiFlags.ANGLE_CONTROL,
+  )
+  KIA_EV5 = HyundaiCanFDPlatformConfig(
+    [
+      HyundaiCarDocs("Kia EV5 (with HDA II) 2026", "Highway Driving Assist II", car_parts=CarParts.common([CarHarness.hyundai_p]))
+    ],
+    CarSpecs(mass=2095, wheelbase=2.75, steerRatio=16, tireStiffnessFactor=0.65),
     flags=HyundaiFlags.EV | HyundaiFlags.ANGLE_CONTROL,
   )
   KIA_CARNIVAL_4TH_GEN = HyundaiCanFDPlatformConfig(
@@ -1007,11 +1037,21 @@ CAN_GEARS = {
   # which message has the gear. hybrid and EV use ELECT_GEAR
   "use_cluster_gears": CAR.with_flags(HyundaiFlags.CLUSTER_GEARS),
   "use_tcu_gears": CAR.with_flags(HyundaiFlags.TCU_GEARS),
-  "send_mdps12": {CAR.GENESIS_G90, CAR.GENESIS_G90_2019, CAR.KIA_K9, CAR.KIA_K7},
+  # K7 PE also needs camera-side MDPS feedback to avoid LKAS/FCA faults during external steering.
+  "send_mdps12": {CAR.GENESIS_G90, CAR.GENESIS_G90_2019, CAR.KIA_K9, CAR.KIA_K7, CAR.KIA_K7_PE},
 }
 
 CANFD_CAR = CAR.with_flags(HyundaiFlags.CANFD)
 CANFD_RADAR_SCC_CAR = CAR.with_flags(HyundaiFlags.RADAR_SCC)  # TODO: merge with UNSUPPORTED_LONGITUDINAL_CAR
+
+CANFD_HYBRID_STATUS_ADDR = 0xFA
+CANFD_HYBRID_STATUS_DLC = 32
+
+EV_MODE_STATUS_ADDR = 0x230
+EV_MODE_STATUS_DLC = 32
+EV_MODE_STATUS_MSG = "HCU_STATUS_230"
+EV_MODE_STATUS_SIGNAL = "HYBRID_POWER_FLOW_MODE"
+EV_MODE_ACTIVE_VALUES = frozenset((1, 2, 6))
 
 CANFD_UNSUPPORTED_LONGITUDINAL_CAR = CAR.with_flags(HyundaiFlags.CANFD_NO_RADAR_DISABLE)  # TODO: merge with UNSUPPORTED_LONGITUDINAL_CAR
 
@@ -1027,7 +1067,39 @@ LEGACY_SAFETY_MODE_CAR = CAR.with_flags(HyundaiFlags.LEGACY)
 #       HyundaiFlags.CANFD_RADAR_SCC | HyundaiFlags.CANFD_NO_RADAR_DISABLE | )
 UNSUPPORTED_LONGITUDINAL_CAR = CAR.with_flags(HyundaiFlags.LEGACY) | CAR.with_flags(HyundaiFlags.UNSUPPORTED_LONGITUDINAL)
 
+# Non-CAN-FD platforms reported to use the Bosch MRRevo14F front radar. Only HYUNDAI_ELANTRA (Elantra AD) is
+# vehicle-validated; the others are candidates and enable the passive receiver only when the full object set is seen.
+BOSCH_MRREVO14F_CAR = {CAR.HYUNDAI_ELANTRA, CAR.HYUNDAI_ELANTRA_GT_I30, CAR.HYUNDAI_KONA, CAR.HYUNDAI_KONA_EV,
+                       CAR.HYUNDAI_KONA_EV_2022, CAR.KIA_FORTE}
+BOSCH_MRREVO14F_OBJECT_ADDRS = range(0x601, 0x613)
+
+
+def bosch_mrrevo14f_bus(candidate, flags: int, fingerprint: dict, buses) -> int | None:
+  """First bus in `buses` on which every 0x601-0x612 object message is seen with 8 bytes, else None.
+
+  Bosch streams its objects on a rewired radar/camera bus, so the receive bus is selected from observation;
+  Panda connector names must not be treated as src IDs.
+  """
+  if candidate not in BOSCH_MRREVO14F_CAR or flags & HyundaiFlags.CANFD:
+    return None
+  for bus in buses:
+    if all(fingerprint.get(bus, {}).get(addr) == 8 for addr in BOSCH_MRREVO14F_OBJECT_ADDRS):
+      return bus
+  return None
+
+
 DBC = CAR.create_dbc_map()
+
+# Calibration availability is separate from road-validation status. Other
+# vehicle adapters can supply their own profile without changing the protocol.
+PEDAL_INTERCEPTOR_PARAMS: dict[str, PedalInterceptorParams] = {
+  CAR.KIA_RAY_EV: RAY_PEDAL_INTERCEPTOR_PARAMS,
+}
+
+
+def get_pedal_interceptor_params(CP) -> PedalInterceptorParams | None:
+  required_flags = HyundaiFlags.CC_ONLY_CAR | HyundaiFlags.PEDAL_INTERCEPTOR
+  return PEDAL_INTERCEPTOR_PARAMS.get(CP.carFingerprint) if CP.flags & required_flags == required_flags else None
 
 if __name__ == "__main__":
   cars = []

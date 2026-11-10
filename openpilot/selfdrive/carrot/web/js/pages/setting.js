@@ -2,177 +2,137 @@
 
 // Setting page — groups, items, value cache, search, screen layout.
 
-let settingsLoadPromise = null;
-let settingValueWarmupTimer = null;
-let settingValueWarmupPromise = null;
+let settingsEntryViewPromise = null;
+let settingInitialLoadingTimer = null;
 let settingRestoreRefreshTimer = null;
-const SETTING_VALUES_TTL_MS = 60000;
-const settingValueCache = new Map();
-const settingGroupValueCache = new Map();
-const settingGroupValuePromises = new Map();
-const settingPopularValuesState = {
-  loaded: false,
-  loadPromise: null,
-  carKey: "",
-  values: {},
-  fetchedAt: 0,
-};
+const SETTING_INITIAL_SKELETON_ROWS = 5;
+const SETTING_INITIAL_SKELETON_DELAY_MS = 140;
+const carrotSettingsRuntime = window.CarrotSettingsRuntime;
+if (
+  !carrotSettingsRuntime?.aux ||
+  !carrotSettingsRuntime?.catalog ||
+  !carrotSettingsRuntime?.derived ||
+  !carrotSettingsRuntime?.docs ||
+  !carrotSettingsRuntime?.context ||
+  !carrotSettingsRuntime?.entry ||
+  !carrotSettingsRuntime?.view ||
+  !carrotSettingsRuntime?.values
+) {
+  throw new Error("CarrotSettingsRuntime is unavailable");
+}
+// Row markup, step behaviour and segment keyboard support all come from the
+// shared UI bundle. Fail here rather than at the first render of every row.
+if (!window.CarrotUI?.settingRow?.createControl || !window.CarrotUI?.numericStepper?.create) {
+  throw new Error("Carrot setting row components are unavailable");
+}
+const settingAuxState = carrotSettingsRuntime.aux;
+const settingCatalogState = carrotSettingsRuntime.catalog;
+const settingDerivedRuntime = carrotSettingsRuntime.derived;
+const settingDocumentationRuntime = carrotSettingsRuntime.docs;
+const settingContextRuntime = carrotSettingsRuntime.context;
+const settingEntryRuntime = carrotSettingsRuntime.entry;
+const settingViewRuntime = carrotSettingsRuntime.view;
+const settingValueRepository = carrotSettingsRuntime.values;
+const SETTING_VALUES_TTL_MS = settingValueRepository.defaultTtlMs;
 
-const SETTING_FAVORITES_GROUP = "__setting_favorites__";
-const SETTING_PROFILES_DIVIDER = "__setting_profiles_divider__";
-const SETTING_PROFILE_GROUP_PREFIX = "__setting_profile__:";
-const SETTING_CATEGORY_DIVIDER_PREFIX = "__setting_category__:";
+const SETTING_FAVORITES_GROUP = settingDerivedRuntime.ids.favoritesGroup;
+const SETTING_INLINE_SEARCH_GROUP = settingDerivedRuntime.ids.searchGroup;
+const settingSearchRuntime = carrotSettingsRuntime.search;
+// Retired overlay search panel (hamburger menu / profile card). Its entry
+// points are hidden and openSettingSearchPanel() is a no-op while false; the
+// implementation stays for profile-scoped search parity. Flip to true to
+// restore the entries.
+const SETTING_OVERLAY_SEARCH_ENABLED = false;
+let settingInlineSearchQuery = "";
+let settingSearchTitlesFirst = false;
+let phoneSearchResults = null;
+let settingInlineSearchPreviousGroup = null;
+// Field behaviour (debounce, IME, clear button, slot mounting, labels) lives in
+// features/settings/search/inline.js; the page keeps the navigation that
+// onApply triggers (search group, history, screen transitions).
+const settingInlineSearchView = settingSearchRuntime.createInline({
+  elements: {
+    form: document.getElementById("settingInlineSearch"),
+    input: document.getElementById("settingInlineSearchInput"),
+    clear: document.getElementById("settingInlineSearchClear"),
+    status: document.getElementById("settingInlineSearchStatus"),
+  },
+  // The visible title/hint were removed; the label only names the field for
+  // assistive tech.
+  getLabels: () => ({
+    label: getUIText("setting_inline_search", "Find settings"),
+    placeholder: getUIText("setting_inline_search_placeholder", "e.g. deceleration, TF"),
+    clear: getUIText("setting_inline_search_clear", "Clear search"),
+  }),
+  getStatusText: () => (settingInlineSearchQuery ? getSettingInlineSearchCountLabel() : ""),
+  onApply: (query) => applySettingInlineSearch(query),
+  onError: (error) => showAppToast(error?.message || String(error), { tone: "error" }),
+});
 const SETTING_FAVORITES_LONG_PRESS_MS = 620;
 const SETTING_FAVORITES_MOVE_TOLERANCE = 10;
-const settingFavoritesState = {
-  names: [],
-  loaded: false,
-  loadPromise: null,
-};
-const settingProfilesState = {
-  profiles: [],
-  loaded: false,
-  loadPromise: null,
-};
 const settingProfileSectionExpandedState = new Map();
+const settingProfileMenuActions = new WeakMap();
+const settingProfileMenuControllers = new Map();
 let settingSoundSampleAudio = null;
+
+function getSettingDerivedModel() {
+  return settingDerivedRuntime.getModel({
+    catalog: SETTINGS,
+    favorites: settingAuxState.favorites.get(),
+    profiles: settingAuxState.profiles.get(),
+    language: LANG,
+    labels: {
+      favorites: getSettingFavoritesLabel(),
+      profiles: getSettingProfilesLabel(),
+    },
+  });
+}
 
 function isSettingFavoritesGroup(group) {
   return group === SETTING_FAVORITES_GROUP;
 }
 
-function isSettingProfilesDivider(entry) {
-  return entry?.group === SETTING_PROFILES_DIVIDER || entry === SETTING_PROFILES_DIVIDER;
-}
-
-function isSettingCategoryDivider(entry) {
-  return String(entry?.group || "").startsWith(SETTING_CATEGORY_DIVIDER_PREFIX);
-}
-
-function isSettingAnyDivider(entry) {
-  return isSettingProfilesDivider(entry) || isSettingCategoryDivider(entry);
-}
-
 // 대>중>소 노드(카테고리/그룹/섹션)의 현재 언어 라벨. ko/en/zh 직접 보유 노드용.
 function settingNodeLabel(node) {
-  if (!node) return "";
-  if (LANG === "zh") return node.zh || node.en || node.ko || "";
-  if (LANG === "ko") return node.ko || node.en || node.zh || "";
-  return node.en || node.ko || node.zh || "";
+  return settingDerivedRuntime.localizedNodeLabel(node, LANG);
 }
 
-// /api/settings 의 categories(대>중>소)가 있으면 groups/items_by_group 를
-// 중-group id 키 기준으로 정규화한다. 각 항목엔 소-섹션 라벨을 __section 으로 부착.
-// categories 가 없으면(구버전) 아무것도 바꾸지 않아 기존 평면 UI 로 폴백.
-function normalizeSettingCategories(j) {
-  if (!j || !Array.isArray(j.categories) || !j.categories.length) return;
-  const idx = {};
-  Object.values(j.items_by_group || {}).forEach((list) => {
-    (list || []).forEach((it) => { if (it && it.name) idx[it.name] = it; });
-  });
-  const flatGroups = [];
-  const newItemsByGroup = {};
-  j.categories.forEach((cat) => {
-    (cat.groups || []).forEach((g) => {
-      flatGroups.push({ group: g.id, ko: g.ko, en: g.en, zh: g.zh, count: g.count, category: cat.id });
-      const items = [];
-      (g.sections || []).forEach((sec) => {
-        // 라벨이 없어도(단일 직속 섹션) 카드는 만들도록 항상 객체로 둔다.
-        const secLabel = { id: sec.id, ko: sec.ko, en: sec.en, zh: sec.zh };
-        (sec.items || []).forEach((name) => {
-          const def = idx[name];
-          if (def) items.push(Object.assign({}, def, { __section: secLabel }));
-        });
-      });
-      newItemsByGroup[g.id] = items;
-    });
-  });
-  j.groups = flatGroups;
-  j.items_by_group = newItemsByGroup;
+// A parameter item stores its title in title/etitle/ctitle, not ko/en/zh, so
+// it needs the item text resolver, not the node label one.
+function settingItemTitle(item, fallback = "") {
+  return settingDerivedRuntime.localizedItemText(item, "title", "etitle", fallback, LANG);
 }
 
 function settingProfileGroup(profileId) {
-  return SETTING_PROFILE_GROUP_PREFIX + String(profileId || "");
+  return getSettingDerivedModel().profileGroup(profileId);
 }
 
 function isSettingProfileGroup(group) {
-  return String(group || "").startsWith(SETTING_PROFILE_GROUP_PREFIX);
-}
-
-function getSettingProfileIdFromGroup(group) {
-  return isSettingProfileGroup(group) ? String(group).slice(SETTING_PROFILE_GROUP_PREFIX.length) : "";
+  return getSettingDerivedModel().isProfileGroup(group);
 }
 
 function getSettingProfileById(profileId) {
-  const id = String(profileId || "");
-  return settingProfilesState.profiles.find((profile) => profile?.id === id) || null;
+  return getSettingDerivedModel().getProfileById(profileId);
 }
 
 function getSettingProfileByGroup(group) {
-  return getSettingProfileById(getSettingProfileIdFromGroup(group));
-}
-
-function normalizeSettingFavoriteNames(names) {
-  const out = [];
-  const seen = new Set();
-  (Array.isArray(names) ? names : []).forEach((item) => {
-    const name = String(item || "").trim();
-    if (!name || seen.has(name)) return;
-    seen.add(name);
-    out.push(name);
-  });
-  return out;
+  return getSettingDerivedModel().getProfileByGroup(group);
 }
 
 function findSettingItemByName(name) {
-  const target = String(name || "").trim();
-  if (!target || !SETTINGS?.items_by_group) return null;
-
-  for (const [group, list] of Object.entries(SETTINGS.items_by_group)) {
-    const item = (list || []).find((entry) => entry?.name === target);
-    if (item) return { group, item };
-  }
-  return null;
-}
-
-function getFavoriteSettingEntries() {
-  return settingFavoritesState.names
-    .map((name) => findSettingItemByName(name))
-    .filter(Boolean);
-}
-
-function getSettingGroupOrderIndex(group) {
-  const groups = SETTINGS?.groups || [];
-  const index = groups.findIndex((entry) => entry?.group === group);
-  return index >= 0 ? index : 9999;
-}
-
-function getSettingItemOrderIndex(group, name) {
-  const list = SETTINGS?.items_by_group?.[group] || [];
-  const index = list.findIndex((entry) => entry?.name === name);
-  return index >= 0 ? index : 9999;
+  return getSettingDerivedModel().findItemByName(name);
 }
 
 function getProfileSettingEntries(profile) {
-  const values = profile?.values || {};
-  return Object.keys(values)
-    .map((name) => findSettingItemByName(name))
-    .filter(Boolean)
-    .sort((a, b) => {
-      const groupDelta = getSettingGroupOrderIndex(a.group) - getSettingGroupOrderIndex(b.group);
-      if (groupDelta) return groupDelta;
-      const itemDelta = getSettingItemOrderIndex(a.group, a.item.name) - getSettingItemOrderIndex(b.group, b.item.name);
-      if (itemDelta) return itemDelta;
-      return String(a.item.name).localeCompare(String(b.item.name));
-    });
+  return getSettingDerivedModel().getProfileEntries(profile);
 }
 
 function getValidSettingFavoriteNames() {
-  return getFavoriteSettingEntries().map((entry) => entry.item.name).filter(Boolean);
+  return getSettingDerivedModel().getValidFavoriteNames();
 }
 
 function isSettingFavorite(name) {
-  return settingFavoritesState.names.includes(String(name || "").trim());
+  return settingAuxState.favorites.get().includes(String(name || "").trim());
 }
 
 function getSettingFavoritesLabel() {
@@ -184,118 +144,40 @@ function getSettingProfilesLabel() {
 }
 
 function getSettingGroupsForDisplay() {
-  const out = [
-    {
-      group: SETTING_FAVORITES_GROUP,
-      count: getFavoriteSettingEntries().length,
-      virtual: true,
-    },
-  ];
-  const cats = SETTINGS?.categories;
-  if (Array.isArray(cats) && cats.length) {
-    cats.forEach((cat) => {
-      out.push({
-        group: SETTING_CATEGORY_DIVIDER_PREFIX + (cat.id || ""),
-        label: settingNodeLabel(cat),
-        divider: true,
-        virtual: true,
-      });
-      (cat.groups || []).forEach((g) => {
-        out.push({ group: g.id, ko: g.ko, en: g.en, zh: g.zh, count: g.count, category: cat.id });
-      });
-    });
-  } else {
-    out.push(...(SETTINGS?.groups || []));
-  }
-  const profiles = settingProfilesState.profiles || [];
-  if (profiles.length) {
-    out.push({
-      group: SETTING_PROFILES_DIVIDER,
-      label: getSettingProfilesLabel(),
-      divider: true,
-      virtual: true,
-    });
-    profiles.forEach((profile) => {
-      out.push({
-        group: settingProfileGroup(profile.id),
-        count: getProfileSettingEntries(profile).length,
-        label: profile.name,
-        profile,
-        virtual: true,
-      });
-    });
-  }
-  return out;
+  const groups = getSettingDerivedModel().getGroupsForDisplay();
+  // Search leads the menu; favorites follows directly below it.
+  groups.unshift({ group: SETTING_INLINE_SEARCH_GROUP, virtual: true });
+  return groups;
 }
 
 function getSettingItemEntriesForGroup(group) {
-  if (isSettingFavoritesGroup(group)) return getFavoriteSettingEntries();
-  const profile = getSettingProfileByGroup(group);
-  if (profile) return getProfileSettingEntries(profile);
-  return (SETTINGS?.items_by_group?.[group] || []).map((item) => ({ group, item }));
+  if (group === SETTING_INLINE_SEARCH_GROUP) return getSettingInlineSearchResults().entries;
+  return getSettingDerivedModel().getItemEntriesForGroup(group);
 }
 
-function normalizeSettingPopularValues(payload) {
-  const values = payload?.popular_values;
-  return values && typeof values === "object" && !Array.isArray(values) ? values : {};
+function getSettingDetailEntries(group, name) {
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    const entry = findSettingItemByName(name);
+    if (!entry) return [];
+    return entry.item.detail_parent ? [entry] : getSettingDerivedModel().getDetailEntries(entry.group, name);
+  }
+  return getSettingDerivedModel().getDetailEntries(group, name);
 }
 
 async function loadSettingPopularValues(force = false) {
-  if (!force && settingPopularValuesState.loaded) return settingPopularValuesState.values;
-  if (!force && settingPopularValuesState.loadPromise) return settingPopularValuesState.loadPromise;
-
-  settingPopularValuesState.loadPromise = getJson("/api/setting_popular_values")
-    .then((payload) => {
-      settingPopularValuesState.loaded = true;
-      settingPopularValuesState.carKey = String(payload?.car_key || "");
-      settingPopularValuesState.fetchedAt = Number(payload?.fetched_at || 0);
-      settingPopularValuesState.values = normalizeSettingPopularValues(payload);
-      return settingPopularValuesState.values;
-    })
-    .catch(() => {
-      settingPopularValuesState.loaded = true;
-      settingPopularValuesState.carKey = "";
-      settingPopularValuesState.fetchedAt = 0;
-      settingPopularValuesState.values = {};
-      return settingPopularValuesState.values;
-    })
-    .finally(() => {
-      settingPopularValuesState.loadPromise = null;
-    });
-
-  return settingPopularValuesState.loadPromise;
+  return settingAuxState.popular.load(force);
 }
 
 function getSettingPopularValue(name) {
-  const entry = settingPopularValuesState.values?.[String(name || "")];
-  return entry && typeof entry === "object" ? entry : null;
+  return settingAuxState.popular.getValue(name);
 }
 
 async function loadSettingFavorites(force = false) {
-  if (!force && settingFavoritesState.loaded) return settingFavoritesState.names;
-  if (!force && settingFavoritesState.loadPromise) return settingFavoritesState.loadPromise;
-
-  settingFavoritesState.loadPromise = getJson("/api/setting_favorites")
-    .then((payload) => {
-      settingFavoritesState.loaded = true;
-      settingFavoritesState.names = normalizeSettingFavoriteNames(payload?.favorites || []);
-      return settingFavoritesState.names;
-    })
-    .catch(() => {
-      settingFavoritesState.loaded = true;
-      settingFavoritesState.names = [];
-      return settingFavoritesState.names;
-    })
-    .finally(() => {
-      settingFavoritesState.loadPromise = null;
-    });
-
-  return settingFavoritesState.loadPromise;
+  return settingAuxState.favorites.load(force);
 }
 
 function invalidateSettingFavoriteRenderState() {
-  settingGroupValueCache.delete(SETTING_FAVORITES_GROUP);
-  settingGroupValuePromises.delete(SETTING_FAVORITES_GROUP);
+  settingValueRepository.invalidateGroup(SETTING_FAVORITES_GROUP);
   const itemsBox = document.getElementById("items");
   if (itemsBox?.dataset.renderedGroup === SETTING_FAVORITES_GROUP) {
     delete itemsBox.dataset.renderedGroup;
@@ -313,13 +195,18 @@ function renderSettingFavoriteMark(name) {
   `;
 }
 
-function updateSettingFavoriteRowMarks(root = document.getElementById("items")) {
-  if (!root) return;
-  root.querySelectorAll(".setting[data-setting-name]").forEach((row) => {
-    const active = isSettingFavorite(row.dataset.settingName);
-    row.classList.toggle("is-favorite", active);
-    const mark = row.querySelector(".setting-favorite-mark");
-    if (mark) mark.classList.toggle("is-active", active);
+function updateSettingFavoriteRowMarks(root = null) {
+  const roots = root
+    ? [root]
+    : [document.getElementById("items"), document.getElementById("settingInlineSearchResults")];
+  roots.forEach((box) => {
+    if (!box) return;
+    box.querySelectorAll(".setting[data-setting-name]").forEach((row) => {
+      const active = isSettingFavorite(row.dataset.settingName);
+      row.classList.toggle("is-favorite", active);
+      const mark = row.querySelector(".setting-favorite-mark");
+      if (mark) mark.classList.toggle("is-active", active);
+    });
   });
 }
 
@@ -331,24 +218,24 @@ function refreshSettingFavoriteChrome(options = {}) {
 }
 
 async function persistSettingFavorites(nextNames) {
+  const normalized = settingAuxState.favorites.normalize(nextNames);
   const payload = await postJson("/api/setting_favorites", {
-    favorites: normalizeSettingFavoriteNames(nextNames),
+    favorites: normalized,
   });
-  settingFavoritesState.names = normalizeSettingFavoriteNames(payload?.favorites || nextNames);
-  return settingFavoritesState.names;
+  return settingAuxState.favorites.replace(payload?.favorites || normalized);
 }
 
 async function toggleSettingFavorite(name) {
   const cleanName = String(name || "").trim();
   if (!cleanName || !findSettingItemByName(cleanName)) return;
 
-  const previous = settingFavoritesState.names.slice();
+  const previous = settingAuxState.favorites.get().slice();
   const exists = previous.includes(cleanName);
   const next = exists
     ? previous.filter((entry) => entry !== cleanName)
     : [...previous, cleanName];
 
-  settingFavoritesState.names = normalizeSettingFavoriteNames(next);
+  settingAuxState.favorites.replace(next);
   invalidateSettingFavoriteRenderState();
   refreshSettingFavoriteChrome({ animateGroups: false });
 
@@ -370,7 +257,7 @@ async function toggleSettingFavorite(name) {
       ? getUIText("setting_favorite_removed", "Removed from favorites")
       : getUIText("setting_favorite_added", "Added to favorites"));
   } catch (e) {
-    settingFavoritesState.names = previous;
+    settingAuxState.favorites.replace(previous);
     invalidateSettingFavoriteRenderState();
     refreshSettingFavoriteChrome({ animateGroups: false });
     if (isSettingFavoritesGroup(CURRENT_GROUP)) {
@@ -381,6 +268,12 @@ async function toggleSettingFavorite(name) {
 }
 
 function getSettingGroupParamNames(group) {
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    const entries = CURRENT_SETTING_DETAIL
+      ? getSettingDetailEntries(group, CURRENT_SETTING_DETAIL)
+      : getSettingItemEntriesForGroup(group);
+    return entries.map((entry) => entry.item.name);
+  }
   if (isSettingFavoritesGroup(group)) return getValidSettingFavoriteNames();
   const profile = getSettingProfileByGroup(group);
   if (profile) return getProfileSettingEntries(profile).map((entry) => entry.item.name).filter(Boolean);
@@ -389,28 +282,12 @@ function getSettingGroupParamNames(group) {
 }
 
 function cacheSettingValue(name, value, group = null) {
-  if (!name) return;
-  const loadedAt = Date.now();
-  settingValueCache.set(name, { value, loadedAt });
-  if (!group) return;
-  const cachedGroup = settingGroupValueCache.get(group);
-  if (!cachedGroup) return;
-  cachedGroup.values[name] = value;
-  cachedGroup.loadedAt = loadedAt;
+  settingValueRepository.setValue(name, value, group);
 }
 
-function primeSettingGroupValueCache(group, values) {
-  if (!group) return;
-  const loadedAt = Date.now();
-  const snapshot = { values: { ...(values || {}) }, loadedAt };
-  settingGroupValueCache.set(group, snapshot);
-  Object.entries(snapshot.values).forEach(([name, value]) => {
-    settingValueCache.set(name, { value, loadedAt });
-  });
-}
-
-function applyRestoredSettingValuesToRenderedItems(values) {
+function applyRestoredSettingValuesToRenderedItems(values, options = {}) {
   if (!values || typeof values !== "object") return false;
+  const animate = options.animate !== false;
   let updated = false;
   document.querySelectorAll(".setting[data-setting-name]").forEach((row) => {
     const name = row.dataset.settingName;
@@ -418,8 +295,10 @@ function applyRestoredSettingValuesToRenderedItems(values) {
     const valueButton = row.querySelector(".val");
     if (!valueButton) return;
     syncSettingControlState(row, values[name]);
-    row.classList.add("is-restored-live");
-    window.setTimeout(() => row.classList.remove("is-restored-live"), 900);
+    if (animate) {
+      row.classList.add("is-restored-live");
+      window.setTimeout(() => row.classList.remove("is-restored-live"), 900);
+    }
     updated = true;
   });
   return updated;
@@ -429,252 +308,202 @@ async function fetchSettingGroupValues(group, options = {}) {
   if (!group) return {};
   const profile = getSettingProfileByGroup(group);
   if (profile) return { ...(profile.values || {}) };
-  const force = options.force === true;
-  const ttlMs = Number.isFinite(options.ttlMs) ? options.ttlMs : SETTING_VALUES_TTL_MS;
   const names = getSettingGroupParamNames(group);
-  if (!names.length) {
-    primeSettingGroupValueCache(group, {});
-    return {};
+  const loadOptions = {
+    names,
+    force: options.force === true,
+    ttlMs: Number.isFinite(options.ttlMs) ? options.ttlMs : SETTING_VALUES_TTL_MS,
+    fetchMissing: bulkGet,
+  };
+  const cached = options.force !== true
+    ? settingValueRepository.peekValues?.(names)
+    : null;
+  if (cached?.complete) {
+    settingValueRepository.loadGroup(group, loadOptions).then((freshValues) => {
+      if (CURRENT_GROUP === group && isCarrotSettingTabActive()) {
+        const latest = settingValueRepository.peekValues?.(names);
+        applyRestoredSettingValuesToRenderedItems(
+          latest?.complete ? latest.values : freshValues,
+          { animate: false },
+        );
+      }
+    }).catch(() => {});
+    return { ...cached.values };
   }
+  return settingValueRepository.loadGroup(group, loadOptions);
+}
 
-  const cachedGroup = settingGroupValueCache.get(group);
-  if (!force && cachedGroup && hasFreshPageData(cachedGroup.loadedAt, ttlMs)) {
-    return { ...cachedGroup.values };
+function commitSettingsCatalog(catalog, snapshot = null) {
+  if (!catalog || typeof catalog !== "object") return null;
+  const prepared = settingCatalogState.commit(catalog, snapshot);
+  if (prepared.changed || SETTINGS !== prepared.catalog) {
+    SETTINGS = prepared.catalog;
+    UNIT_CYCLE = SETTINGS.unit_cycle || UNIT_CYCLE;
+    settingValueRepository.clear();
+    rebuildSettingSearchEntries();
   }
-
-  if (!force && settingGroupValuePromises.has(group)) {
-    return settingGroupValuePromises.get(group);
-  }
-
-  const assembledValues = {};
-  const missingNames = [];
-  names.forEach((name) => {
-    const cachedValue = settingValueCache.get(name);
-    if (!force && cachedValue && hasFreshPageData(cachedValue.loadedAt, ttlMs)) {
-      assembledValues[name] = cachedValue.value;
-    } else {
-      missingNames.push(name);
-    }
+  settingValueRepository.applyValues({
+    ...(snapshot?.values || {}),
+    ...(snapshot?.device_values || {}),
   });
-
-  if (!missingNames.length) {
-    primeSettingGroupValueCache(group, assembledValues);
-    return assembledValues;
-  }
-
-  const loadPromise = (async () => {
-    const fetchedValues = await bulkGet(missingNames);
-    const nextValues = { ...assembledValues, ...(fetchedValues || {}) };
-    primeSettingGroupValueCache(group, nextValues);
-    return { ...nextValues };
-  })().finally(() => {
-    settingGroupValuePromises.delete(group);
-  });
-
-  settingGroupValuePromises.set(group, loadPromise);
-  return loadPromise;
+  return SETTINGS;
 }
 
-async function warmupSettingGroupValues() {
-  if (!SETTINGS?.groups?.length) return;
-  const groups = SETTINGS.groups
-    .map((entry) => entry.group)
-    .filter(Boolean)
-    .filter((group) => group !== CURRENT_GROUP);
+const settingEntryController = settingEntryRuntime.createController({
+  snapshotStore: carrotSettingsRuntime.store,
+  getPreparedCatalog: () => SETTINGS,
+  loadLegacyCatalog: () => getJson("/api/settings"),
+  loadLegacyAuxiliary: (force) => Promise.allSettled([
+    loadSettingFavorites(force),
+    loadSettingProfiles(force),
+    loadSettingPopularValues(force),
+  ]),
+  commitCatalog: commitSettingsCatalog,
+});
 
-  for (const group of groups) {
-    try {
-      await fetchSettingGroupValues(group, { ttlMs: SETTING_VALUES_TTL_MS });
-    } catch {}
-    await new Promise((resolve) => window.setTimeout(resolve, 24));
-  }
-}
+function scheduleSettingInitialLoadingState() {
+  if (SETTINGS || settingInitialLoadingTimer) return;
+  settingInitialLoadingTimer = window.setTimeout(() => {
+    settingInitialLoadingTimer = null;
+    if (SETTINGS || CURRENT_PAGE !== "setting") return;
 
-function scheduleSettingGroupValueWarmup(delay = 220) {
-  if (!SETTINGS?.groups?.length || settingValueWarmupTimer || settingValueWarmupPromise) return;
-  settingValueWarmupTimer = window.setTimeout(() => {
-    settingValueWarmupTimer = null;
-    requestIdleTask(() => {
-      settingValueWarmupPromise = warmupSettingGroupValues()
-        .catch(() => {})
-        .finally(() => {
-          settingValueWarmupPromise = null;
-        });
-    }, 1200);
-  }, Math.max(0, delay));
-}
+    const list = document.getElementById("groupList");
+    const page = document.getElementById("pageSetting");
+    if (!list || list.childElementCount) return;
 
-function isMissingCarSelectionLabel(label) {
-  const text = String(label || "").trim();
-  if (!text || text === "-") return true;
-  return text.toLowerCase().includes("mock");
-}
-
-function isMissingCarSelectionValues(values) {
-  const selected = String(values?.CarSelected3 || "").trim();
-  if (!selected) return true;
-  const carName = String(values?.CarName || "").trim();
-  return isMissingCarSelectionLabel(selected) || (carName && carName.toLowerCase().includes("mock"));
-}
-
-function highlightSettingCarEntry() {
-  if (!settingCarRow) return;
-  settingCarRow.scrollIntoView({ behavior: "smooth", block: "center" });
-  try {
-    settingCarRow.focus({ preventScroll: true });
-  } catch {
-    settingCarRow.focus();
-  }
-  settingCarRow.classList.remove("is-attention");
-  void settingCarRow.offsetWidth;
-  settingCarRow.classList.add("is-attention");
-  window.setTimeout(() => {
-    settingCarRow.classList.remove("is-attention");
-  }, 3600);
-}
-
-async function promptMissingCurrentCarSelection(values = null) {
-  if (currentCarPromptActive) return false;
-  try {
-    if (sessionStorage.getItem(CURRENT_CAR_PROMPT_SESSION_KEY) === "1") return false;
-  } catch {}
-
-  let snapshot = values;
-  if (!snapshot) {
-    try {
-      snapshot = await bulkGet(["CarSelected3", "CarName"]);
-    } catch {
-      return false;
+    const fragment = document.createDocumentFragment();
+    for (let index = 0; index < SETTING_INITIAL_SKELETON_ROWS; index += 1) {
+      const row = document.createElement("div");
+      row.className = "setting-group-skeleton";
+      row.setAttribute("aria-hidden", "true");
+      const line = document.createElement("span");
+      line.className = "setting-group-skeleton__line";
+      row.appendChild(line);
+      fragment.appendChild(row);
     }
-  }
-
-  if (!isMissingCarSelectionValues(snapshot)) return false;
-
-  currentCarPromptActive = true;
-  try {
-    sessionStorage.setItem(CURRENT_CAR_PROMPT_SESSION_KEY, "1");
-  } catch {}
-
-  try {
-    await appAlert(getUIText("missing_car_select", "No car is selected.\nPlease select a car in settings first."), {
-      title: getUIText("car_select", "Car Select"),
-    });
-
-    if (typeof showPage === "function") {
-      showPage("setting", true, typeof getSwipeTransition === "function" ? getSwipeTransition(CURRENT_PAGE, "setting") : null);
-    }
-    if (typeof showSettingScreen === "function") {
-      CURRENT_GROUP = null;
-      showSettingScreen("groups", false);
-    }
-    window.setTimeout(highlightSettingCarEntry, 260);
-  } finally {
-    currentCarPromptActive = false;
-  }
-  return true;
+    list.dataset.settingsLoading = "true";
+    list.appendChild(fragment);
+    page?.setAttribute("aria-busy", "true");
+  }, SETTING_INITIAL_SKELETON_DELAY_MS);
 }
-async function loadSettings(options = {}) {
-  const background = options.background === true;
-  const force = options.force === true;
+
+function clearSettingInitialLoadingState() {
+  if (settingInitialLoadingTimer) {
+    window.clearTimeout(settingInitialLoadingTimer);
+    settingInitialLoadingTimer = null;
+  }
+
+  const list = document.getElementById("groupList");
+  if (list?.dataset.settingsLoading === "true") {
+    list.replaceChildren();
+    delete list.dataset.settingsLoading;
+  }
+  document.getElementById("pageSetting")?.removeAttribute("aria-busy");
+}
+
+async function presentSettingsEntry(catalog, options = {}) {
+  const reusePreparedData = options.reusePreparedData === true;
+  const animateOnEnter = options.animateOnEnter === true;
   const meta = document.getElementById("settingsMeta");
 
-  if (SETTINGS && !force) {
-    await loadSettingFavorites();
-    await loadSettingProfiles();
-    await loadSettingPopularValues(true);
-    renderGroups({ animateGroups: false });
-    syncSettingSearchFabState();
-    if (!background && CURRENT_PAGE === "setting" && typeof syncSettingViewportLayout === "function") {
-      await syncSettingViewportLayout({ animateChrome: false, animateItems: false });
-    }
-    return SETTINGS;
+  if (meta) {
+    meta.textContent = `path: ${catalog.path} | has_params: ${catalog.has_params} | type_api: ${catalog.has_param_type}`;
+    meta.hidden = !DEBUG_UI;
+  }
+  if (!DEBUG_UI) {
+    const groupMeta = document.getElementById("groupMeta");
+    if (groupMeta) groupMeta.style.display = "none";
+    const carMeta = document.getElementById("carMeta");
+    if (carMeta) carMeta.style.display = "none";
   }
 
-  if (!force && settingsLoadPromise) return settingsLoadPromise;
-  if (!background && meta) meta.textContent = getUIText("loading", "Loading...");
+  clearSettingInitialLoadingState();
+  rebuildSettingSearchEntries();
+  syncSettingSearchFabState();
 
-  settingsLoadPromise = (async () => {
-    const j = await getJson("/api/settings");
-
-    normalizeSettingCategories(j);
-    SETTINGS = j;
-    UNIT_CYCLE = j.unit_cycle || UNIT_CYCLE;
-    settingValueCache.clear();
-    settingGroupValueCache.clear();
-    settingGroupValuePromises.clear();
-    await loadSettingFavorites(force);
-    await loadSettingProfiles(force);
-    await loadSettingPopularValues(force);
-    rebuildSettingSearchEntries();
-
-    if (meta) {
-      meta.textContent = `path: ${j.path} | has_params: ${j.has_params} | type_api: ${j.has_param_type}`;
-      if (!DEBUG_UI) {
-        meta.style.display = "none";
-      }
-    }
-
-    if (!DEBUG_UI) {
-      const gm = document.getElementById("groupMeta");
-      if (gm) gm.style.display = "none";
-      const cm = document.getElementById("carMeta");
-      if (cm) cm.style.display = "none";
-    }
-
-    renderGroups();
-    syncSettingSearchFabState();
-    scheduleSettingGroupValueWarmup(260);
-
-    if (!background || CURRENT_PAGE === "setting") {
-      CURRENT_GROUP = null;
-      if (isCompactLandscapeMode()) {
-        const initialGroup = getLandscapeDefaultSettingGroup();
-        if (initialGroup) await activateSettingGroup(initialGroup, false);
-        else showSettingScreen("groups", false);
-      } else {
-        showSettingScreen("groups", false);
-      }
-      if (settingSearchPanel && !settingSearchPanel.hidden) {
-        renderSettingSearchResults(settingSearchInput?.value || "");
-      }
-    }
-
-    return SETTINGS;
-  })().catch((e) => {
-    settingSearchEntries = [];
-    if (!background && meta) meta.textContent = "Failed: " + (e?.message || "unknown");
-    throw e;
-  }).finally(() => {
-    settingsLoadPromise = null;
+  if (CURRENT_GROUP && CURRENT_GROUP !== SETTING_INLINE_SEARCH_GROUP && !getSettingDerivedModel().getGroupMeta(CURRENT_GROUP)) {
+    CURRENT_GROUP = null;
+    CURRENT_SETTING_DETAIL = null;
+  }
+  const animateLayout = animateOnEnter || !reusePreparedData;
+  await syncSettingViewportLayout({
+    animateChrome: animateLayout,
+    animateItems: animateLayout,
   });
+  if (settingSearchPanelView.isOpen()) {
+    settingSearchPanelView.render();
+  }
 
-  return settingsLoadPromise;
+  if (reusePreparedData) {
+    // Popular values are already available from the snapshot. Refresh them
+    // after the re-entry paint and retain the prepared values on failure.
+    loadSettingPopularValues(true).catch(() => {});
+  }
+  return catalog;
+}
+
+function loadSettings(options = {}) {
+  if (settingsEntryViewPromise) return settingsEntryViewPromise;
+  const force = options.force === true;
+  const animateOnEnter = options.animateOnEnter === true;
+  const reusePreparedData = Boolean(SETTINGS) && !force;
+  if (!reusePreparedData) scheduleSettingInitialLoadingState();
+
+  const task = settingEntryController.prepare({ force })
+    .then(({ catalog }) => presentSettingsEntry(catalog, {
+      reusePreparedData,
+      animateOnEnter,
+    }))
+    .catch((e) => {
+      const meta = document.getElementById("settingsMeta");
+      settingSearchEntries = [];
+      clearSettingInitialLoadingState();
+      if (meta) {
+        meta.textContent = "Failed: " + (e?.message || "unknown");
+        meta.hidden = false;
+      }
+      throw e;
+    });
+
+  const tracked = task.finally(() => {
+    if (settingsEntryViewPromise === tracked) settingsEntryViewPromise = null;
+  });
+  settingsEntryViewPromise = tracked;
+  return tracked;
 }
 
 let settingOverflowSyncRaf = 0;
 let settingOverflowSyncTimer = 0;
 let settingOverflowResizeObserver = null;
 
-function measureSettingGroupButtonOverflow(button) {
-  if (!button) return;
-  const labelEl = button.querySelector(".setting-group-label");
-  if (!labelEl) return;
-  const buttonWidth = button.clientWidth || 0;
-  if (buttonWidth <= 0) return;
-  const shift = Math.min(0, buttonWidth - labelEl.scrollWidth - 8);
-  button.style.setProperty("--setting-label-shift", `${shift}px`);
-  button.classList.toggle("is-overflowing", shift < 0);
-}
-
 function syncSettingGroupLabelOverflow(root = document) {
   const scope = root && typeof root.querySelectorAll === "function" ? root : document;
+  let buttons;
   if (scope.matches?.("#groupList .groupBtn, #deviceGroupList .groupBtn")) {
-    measureSettingGroupButtonOverflow(scope);
+    buttons = [scope];
+  } else {
+    const selector = (scope.id === "groupList" || scope.id === "deviceGroupList")
+      ? ".groupBtn"
+      : "#groupList .groupBtn, #deviceGroupList .groupBtn";
+    buttons = Array.from(scope.querySelectorAll(selector));
   }
-  const selector = (scope.id === "groupList" || scope.id === "deviceGroupList")
-    ? ".groupBtn"
-    : "#groupList .groupBtn, #deviceGroupList .groupBtn";
-  scope.querySelectorAll(selector).forEach(measureSettingGroupButtonOverflow);
+  if (!buttons.length) return;
+
+  // Read every button's geometry first, then apply all writes, so a full group
+  // list settles in one reflow instead of one reflow per button (read/write
+  // interleaving previously thrashed layout ~18 times).
+  const writes = [];
+  for (const button of buttons) {
+    const labelEl = button.querySelector(".setting-group-label");
+    if (!labelEl) continue;
+    const buttonWidth = button.clientWidth || 0;
+    if (buttonWidth <= 0) continue;
+    writes.push([button, Math.min(0, buttonWidth - labelEl.scrollWidth - 8)]);
+  }
+  for (const [button, shift] of writes) {
+    button.style.setProperty("--setting-label-shift", `${shift}px`);
+    button.classList.toggle("is-overflowing", shift < 0);
+  }
 }
 
 function syncSettingOverflow(root = document) {
@@ -726,125 +555,243 @@ function initSettingOverflowObservers() {
 function renderGroups(options = {}) {
   const box = document.getElementById("groupList");
   const animateGroups = options.animateGroups !== false;
-  const groups = getSettingGroupsForDisplay();
-  const signature = groups.map((g) => isSettingAnyDivider(g) ? `div:${g.label || ""}` : `${g.group}:${g.count ?? ""}:${g.label || ""}`).join("|");
-
-  function setGroupButtonLabel(button, label, count) {
-    const text = Number.isFinite(Number(count)) ? `${label} (${count})` : label;
-    button.title = text;
-    button.innerHTML = `<span class="setting-group-label">${escapeHtml(text)}</span>`;
-    requestAnimationFrame(() => measureSettingGroupButtonOverflow(button));
-  }
-
-  if (!animateGroups && box.dataset.groupsSignature === signature && box.children.length === groups.length) {
-    Array.from(box.children).forEach((button, index) => {
-      const g = groups[index];
-      if (isSettingAnyDivider(g)) {
-        button.className = isSettingCategoryDivider(g) ? "setting-profile-divider setting-category-divider" : "setting-profile-divider";
-        button.innerHTML = `<span></span><strong>${escapeHtml(g.label || getSettingProfilesLabel())}</strong><span></span>`;
-        button.removeAttribute("data-group");
-        button.onclick = null;
-        return;
-      }
-      const label = getSettingGroupLabel(g.group);
-      button.className = "btn groupBtn";
-      if (isSettingFavoritesGroup(g.group)) button.classList.add("groupBtn--favorites");
-      if (isSettingProfileGroup(g.group)) button.classList.add("groupBtn--profile");
-      if (g.group === CURRENT_GROUP) button.classList.add("active");
-      button.dataset.group = g.group;
-      setGroupButtonLabel(button, label, g.count);
-      button.onclick = () => selectGroup(g.group);
+  if (!box) return;
+  if (box.dataset.settingGroupSelectionBound !== "1") {
+    box.dataset.settingGroupSelectionBound = "1";
+    box.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-group]");
+      if (!button || !box.contains(button)) return;
+      selectGroup(button.dataset.group);
     });
-    scheduleSettingOverflowSync(box);
-    return;
   }
 
-  box.innerHTML = "";
-  box.dataset.groupsSignature = signature;
-
-  groups.forEach(g => {
-    if (isSettingAnyDivider(g)) {
-      const divider = document.createElement("div");
-      const base = animateGroups ? "setting-profile-divider ui-stagger-item" : "setting-profile-divider";
-      divider.className = isSettingCategoryDivider(g) ? base + " setting-category-divider" : base;
-      if (animateGroups) divider.style.setProperty("--i", String(box.children.length));
-      divider.innerHTML = `<span></span><strong>${escapeHtml(g.label || getSettingProfilesLabel())}</strong><span></span>`;
-      box.appendChild(divider);
-      return;
-    }
-
-    const label = getSettingGroupLabel(g.group);
-
-    const b = document.createElement("button");
-    b.className = animateGroups ? "btn groupBtn ui-stagger-item" : "btn groupBtn";
-    if (isSettingFavoritesGroup(g.group)) b.classList.add("groupBtn--favorites");
-    if (isSettingProfileGroup(g.group)) b.classList.add("groupBtn--profile");
-    if (animateGroups) b.style.setProperty("--i", String(box.children.length));
-    if (g.group === CURRENT_GROUP) b.classList.add("active");
-    b.dataset.group = g.group;
-    setGroupButtonLabel(b, label, g.count);
-    b.onclick = () => selectGroup(g.group);
-    box.appendChild(b);
+  const plan = settingViewRuntime.createGroupPlan({
+    groups: getSettingGroupsForDisplay(),
+    currentGroup: CURRENT_GROUP,
+    ids: settingDerivedRuntime.ids,
+    profilesLabel: getSettingProfilesLabel(),
+    getGroupLabel: getSettingGroupLabel,
   });
+  const restoreSearchFocus = settingInlineSearchView.isFocused();
+  settingViewRuntime.renderGroupList(box, plan, { animate: animateGroups });
+  mountSettingInlineSearch();
+  if (restoreSearchFocus) settingInlineSearchView.focus();
   scheduleSettingOverflowSync(box);
 }
 
-function getSettingGroupMeta(group) {
-  if (isSettingFavoritesGroup(group)) {
-    return {
-      group,
-      egroup: "Favorites",
-      count: getFavoriteSettingEntries().length,
-      virtual: true,
-    };
-  }
-  const profile = getSettingProfileByGroup(group);
-  if (profile) {
-    return {
-      group,
-      egroup: profile.name,
-      count: getProfileSettingEntries(profile).length,
-      profile,
-      virtual: true,
-    };
-  }
-  const groups = SETTINGS?.groups || [];
-  return groups.find((entry) => entry.group === group) || null;
-}
-
 function getSettingGroupLabel(group) {
-  if (isSettingFavoritesGroup(group)) return getSettingFavoritesLabel();
-  const profile = getSettingProfileByGroup(group);
-  if (profile) return profile.name;
-  const meta = getSettingGroupMeta(group);
-  if (!meta) return group;
-  if (meta.ko || meta.en || meta.zh) return settingNodeLabel(meta);
-  if (LANG === "zh") return meta.cgroup || meta.egroup || meta.group;
-  if (LANG === "ko") return meta.group || meta.egroup || group;
-  return meta.egroup || meta.group || group;
+  if (group === SETTING_INLINE_SEARCH_GROUP) return getUIText("setting_search_results", "Search results");
+  return getSettingDerivedModel().getGroupLabel(group);
 }
 
-function getSettingItemContextLabel(group, item) {
-  const groupLabel = getSettingGroupLabel(group);
-  const sectionLabel = item?.__section ? settingNodeLabel(item.__section) : "";
-  if (!sectionLabel || sectionLabel === groupLabel) return groupLabel;
-  return `${groupLabel} > ${sectionLabel}`;
+function getSettingInlineSearchResults() {
+  return getSettingDerivedModel().searchItemEntries(settingInlineSearchQuery, { preferTitle: settingSearchTitlesFirst });
 }
 
-const SETTING_CONTROL_OVERRIDES = {
-  ShowPathMode: { kind: "select" },
-  ShowPathColor: { kind: "select" },
-  ShowPathColorCruiseOff: { kind: "select" },
-  ShowPathModeLane: { kind: "select" },
-  ShowPathColorLane: { kind: "select" },
-  ShowPlotMode: { kind: "select" },
-  ClusterHudScreenMode: { kind: "select" },
-  ClusterHudRadarInfo: { kind: "select" },
-  SoundLanguageSetting: { kind: "select" },
-};
+function getSettingInlineSearchCountLabel() {
+  const { entries, total } = getSettingInlineSearchResults();
+  return getUIText("setting_inline_search_count", "Showing {shown} of {total}")
+    .replace("{shown}", String(entries.length)).replace("{total}", String(total));
+}
+
+function mountSettingInlineSearch(screen = null) {
+  // The field always stays in the group-list slot: on phones the results render
+  // below it in place (#settingInlineSearchResults), so while typing it must
+  // never be reparented — moving a focused input drops the mobile keyboard.
+  const slot = document.querySelector(".setting-inline-search-slot");
+  if (!slot) return;
+  settingInlineSearchView.mount(slot, null);
+  settingInlineSearchView.refresh();
+}
+
+// In-place search surface for the single-column layouts. The wide (split)
+// layout keeps the results in the items pane, so everything below is a no-op
+// there.
+function getSettingInlineSearchResultsBox() {
+  let box = document.getElementById("settingInlineSearchResults");
+  if (box) return box;
+  const anchor = document.getElementById("groupList");
+  if (!anchor || !anchor.parentElement) return null;
+  box = document.createElement("div");
+  box.id = "settingInlineSearchResults";
+  box.className = "setting-inline-search-results";
+  anchor.insertAdjacentElement("afterend", box);
+  // Result rows reuse the item interactions; the earlier binding ran before
+  // this box existed, so bind it now.
+  bindSettingFavoriteLongPress();
+  bindSettingMarqueeDrag();
+  return box;
+}
+
+function isSettingInlineSearchSurfaceActive() {
+  if (isCompactLandscapeMode()) return isSettingItemsScreenActive();
+  const content = document.getElementById("carrotTabContent");
+  return Boolean(
+    content?.classList.contains("is-inline-search")
+    && screenGroups
+    && screenGroups.style.display !== "none"
+    && !screenGroups.classList.contains("hidden"),
+  );
+}
+
+function hasRenderedInlineSearchResults() {
+  const box = document.getElementById("settingInlineSearchResults");
+  if (!box) return false;
+  if (box.dataset.renderedSearchQuery !== settingInlineSearchQuery) return false;
+  return box.dataset.renderedGroup === SETTING_INLINE_SEARCH_GROUP
+    && !box.dataset.renderedDetail
+    && box.childElementCount > 0;
+}
+
+// Generic renders (params restored, live sync) must follow the surface that is
+// actually showing the search group; null keeps the default items screen.
+function getSettingItemRenderContainer(group = CURRENT_GROUP) {
+  if (group !== SETTING_INLINE_SEARCH_GROUP || isCompactLandscapeMode()) return null;
+  return isSettingInlineSearchSurfaceActive() ? document.getElementById("settingInlineSearchResults") : null;
+}
+
+async function showSettingInlineSearchResultsInGroups(options = {}) {
+  if (isCompactLandscapeMode()) return false;
+  const content = document.getElementById("carrotTabContent");
+  const box = getSettingInlineSearchResultsBox();
+  if (!content || !box) return false;
+  const entering = !content.classList.contains("is-inline-search");
+  CURRENT_GROUP = SETTING_INLINE_SEARCH_GROUP;
+  CURRENT_SETTING_DETAIL = null;
+  content.classList.add("is-inline-search");
+  if (isSettingItemsScreenActive()) {
+    // Back from a search-result detail: the results live on the group screen,
+    // one level below the items screen.
+    if (options.animate === false) {
+      settleSettingScreenVisibility("groups");
+    } else {
+      showSettingScreen("groups", false);
+    }
+    history.replaceState({
+      page: "setting",
+      screen: "items",
+      group: SETTING_INLINE_SEARCH_GROUP,
+      inlineSearchQuery: settingInlineSearchQuery,
+    }, "");
+    requestAnimationFrame(() => setSettingItemsScrollTop(getSavedSettingScrollPosition(SETTING_INLINE_SEARCH_GROUP)));
+  }
+  mountSettingInlineSearch();
+  if (!options.forceRender && hasRenderedInlineSearchResults()) {
+    scheduleSettingLiveRefresh(0);
+    return true;
+  }
+  if (entering) {
+    box.classList.remove("is-entering");
+    void box.offsetWidth;
+    box.classList.add("is-entering");
+  }
+  await renderItems(SETTING_INLINE_SEARCH_GROUP, {
+    container: box,
+    allowHidden: true,
+    animateItems: false,
+  });
+  return true;
+}
+
+function exitSettingInlineSearchSurface(options = {}) {
+  const content = document.getElementById("carrotTabContent");
+  content?.classList.remove("is-inline-search");
+  const box = document.getElementById("settingInlineSearchResults");
+  if (box) {
+    box.classList.remove("is-entering");
+    box.replaceChildren();
+    delete box.dataset.renderedGroup;
+    delete box.dataset.renderedDetail;
+    delete box.dataset.renderedSearchQuery;
+  }
+  if (options.keepFocus !== true) {
+    document.getElementById("settingInlineSearchInput")?.blur();
+  }
+  restoreSettingInlineSearch("");
+  settingInlineSearchPreviousGroup = null;
+}
+
+function restoreSettingInlineSearch(query = "") {
+  phoneSearchResults = null;
+  settingInlineSearchView.cancelPending();
+  settingInlineSearchQuery = String(query).trim();
+  settingInlineSearchView.setQuery(settingInlineSearchQuery);
+  settingValueRepository.invalidateGroup(SETTING_INLINE_SEARCH_GROUP);
+}
+
+async function applySettingInlineSearch(query = settingInlineSearchView.getQuery(), { preferTitle = false } = {}) {
+  settingInlineSearchView.cancelPending();
+  if (!SETTINGS || CURRENT_PAGE !== "setting" || !isCarrotSettingTabActive()) return;
+  const nextQuery = String(query || "").trim();
+  if (!preferTitle) phoneSearchResults = null;
+  const orderChanged = settingSearchTitlesFirst !== preferTitle;
+  settingSearchTitlesFirst = preferTitle;
+  if (orderChanged) {
+    const box = document.getElementById("settingInlineSearchResults");
+    if (box) delete box.dataset.renderedSearchQuery;
+  }
+  if (!orderChanged && nextQuery === settingInlineSearchQuery && CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP
+    && !CURRENT_SETTING_DETAIL && isSettingInlineSearchSurfaceActive()) return;
+  const wasSearching = CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP;
+  settingInlineSearchQuery = nextQuery;
+  // This virtual group's parameter set changes on each query and detail view.
+  settingValueRepository.invalidateGroup(SETTING_INLINE_SEARCH_GROUP);
+  ++settingRenderToken;
+
+  if (!nextQuery) {
+    if (wasSearching) {
+      const previous = getSettingDerivedModel().getGroupMeta(settingInlineSearchPreviousGroup)
+        ? settingInlineSearchPreviousGroup
+        : null;
+      exitSettingInlineSearchSurface({ keepFocus: true });
+      if (isCompactLandscapeMode()) {
+        const group = previous || SETTING_FAVORITES_GROUP;
+        await activateSettingGroup(group, false, { scrollMode: "restore", animateItems: false });
+      } else {
+        CURRENT_GROUP = previous;
+        renderGroups({ animateGroups: false });
+        history.replaceState({ page: "setting", screen: "groups" }, "");
+        requestAnimationFrame(() => setSettingItemsScrollTop(getSavedSettingScrollPosition(previous)));
+      }
+    }
+    mountSettingInlineSearch();
+    return;
+  }
+
+  if (!wasSearching) {
+    settingInlineSearchPreviousGroup = CURRENT_GROUP;
+    saveCurrentSettingScrollPosition();
+  }
+
+  if (!isCompactLandscapeMode()) {
+    if (!wasSearching) {
+      history.pushState({ page: "setting", screen: "items", group: SETTING_INLINE_SEARCH_GROUP }, "");
+    }
+    await showSettingInlineSearchResultsInGroups();
+    return;
+  }
+
+  // Wide (split) layout: the results own the right pane, as before.
+  CURRENT_GROUP = SETTING_INLINE_SEARCH_GROUP;
+  CURRENT_SETTING_DETAIL = null;
+  const restoreInputFocus = settingInlineSearchView.isFocused();
+  showSettingScreen("items", !wasSearching);
+  if (!wasSearching) renderGroups({ animateGroups: false });
+  mountSettingInlineSearch();
+  if (restoreInputFocus) settingInlineSearchView.focus();
+  history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP, inlineSearchQuery: nextQuery }, "");
+  await renderItems(SETTING_INLINE_SEARCH_GROUP, { animateItems: false });
+}
+
+settingInlineSearchView.bind();
+
+// Control kinds a parameter may declare via its "control" field.
+const SETTING_CONTROL_KINDS = ["toggle", "segmented", "select", "slider"];
 
 function getSettingControlConfig(p) {
-  const override = SETTING_CONTROL_OVERRIDES[p?.name] || {};
+  // A parameter pins its control with a "control" field in
+  // carrot_settings.json; otherwise the kind is inferred from its range below.
+  const override = SETTING_CONTROL_KINDS.includes(p?.control) ? { kind: p.control } : {};
   const min = Number(p?.min);
   const max = Number(p?.max);
   const unit = Math.max(1, Number(p?.unit) || 1);
@@ -871,65 +818,64 @@ const SETTING_DISPLAY_UNIT_TYPES = Object.freeze({
   speedKph: "km/h",
   distanceCm: "cm",
   timeSec: "s",
+  timeMs: "ms",
   timeMin: "min",
   percent: "%",
   degree: "deg",
 });
 
-const SETTING_PARAM_DISPLAY_TYPES = Object.freeze({
-  PathOffset: "distanceCm",
-  CruiseOnDist: "distanceCm",
-  CruiseEcoControl: "speedKph",
-  StopDistanceCarrot: "distanceCm",
-  TrafficStopDistanceAdjust: "distanceCm",
-  AutoTurnControlSpeedTurn: "speedKph",
-  CruiseSpeedUnit: "speedKph",
-  CruiseSpeedUnitBasic: "speedKph",
-  CruiseSpeed1: "speedKph",
-  CruiseSpeed2: "speedKph",
-  CruiseSpeed3: "speedKph",
-  CruiseSpeed4: "speedKph",
-  CruiseSpeed5: "speedKph",
-  AutoGasTokSpeed: "speedKph",
-  AutoGasCancelSpeed: "speedKph",
-  MaxTimeOffroadMin: "timeMin",
-  AutoSpeedUptoRoadSpeedLimit: "percent",
-  AutoRoadSpeedAdjust: "percent",
-  ApplyModelSpeed: "percent",
-  UseLaneLineSpeed: "speedKph",
-  UseLaneLineCurveSpeed: "speedKph",
-  AdjustLaneOffset: "distanceCm",
-  SoundVolumeAdjust: "percent",
-  SoundVolumeAdjustEngage: "percent",
-  AutoCurveSpeedLowerLimit: "speedKph",
-  AutoNaviSpeedCtrlEnd: "timeSec",
-  AutoNaviSpeedBumpTime: "timeSec",
-  AutoNaviSpeedBumpSpeed: "speedKph",
-  AutoRoadSpeedLimitOffset: "speedKph",
-  AutoCurveSpeedFactor: "percent",
-  MapTurnSpeedFactor: "percent",
-  AutoNaviSpeedSafetyFactor: "percent",
-  RadarReactionFactor: "percent",
-  SteerRatioRate: "percent",
-  DynamicTFollowLC: "percent",
-  TFollowDecelBoost: "percent",
-  ShowCustomBrightness: "percent",
-  ClusterHudBrightness: "percent",
-});
 
 function getSettingDisplayType(name) {
-  const key = String(name || "").trim();
-  return SETTING_PARAM_DISPLAY_TYPES[key] || "raw";
+  // The unit is declared by the parameter itself in carrot_settings.json, so
+  // adding a parameter no longer means editing a table in here as well.
+  const declared = findSettingItemByName(String(name || "").trim())?.item?.display_unit;
+  return declared && declared in SETTING_DISPLAY_UNIT_TYPES ? declared : "raw";
 }
 
 function getSettingDisplayUnit(name) {
   return SETTING_DISPLAY_UNIT_TYPES[getSettingDisplayType(name)] || "";
 }
 
+// A parameter can name its choices with an "options" block in
+// carrot_settings.json: { ko: [...], en: [...], zh: [...] } indexed from min.
+// Without it the raw number is shown, which is the behaviour for most
+// parameters.
+function getDeclaredSettingOptionLabel(name, value) {
+  const item = findSettingItemByName(String(name || "").trim())?.item;
+  const options = item?.options;
+  if (!options) return null;
+
+  const language = LANG === "zh" ? "zh" : (LANG === "ko" ? "ko" : "en");
+  const labels = options[language] || options.en || options.ko;
+  if (!Array.isArray(labels)) return null;
+
+  const index = Number(value) - Number(item.min ?? 0);
+  return Number.isInteger(index) ? (labels[index] ?? null) : null;
+}
+
+function normalizeSettingNumericValue(raw, p, previous = null) {
+  const text = String(raw).trim();
+  if (!text || !Number.isFinite(Number(text))) return null;
+  const min = Number(p.min);
+  const max = Number(p.max);
+  let next = Math.max(min, Math.min(max, Number(text)));
+  if (Number.isInteger(min) && Number.isInteger(max)) next = Math.round(next);
+  const nonzeroMin = Number(p.nonzero_min);
+  if (next > 0 && next < nonzeroMin) {
+    next = previous !== null && next < previous ? 0 : nonzeroMin;
+  }
+  return next;
+}
+
 function formatSettingDisplayValue(p, value) {
+  if (Number(value) === 0 && p?.zero_label) {
+    return p.zero_label[LANG] || p.zero_label.en;
+  }
   if (String(p?.name || "") === "SoundLanguageSetting") {
     return getSoundLanguageSettingOptionLabel(value);
   }
+  const declaredOptionLabel = getDeclaredSettingOptionLabel(p?.name, value);
+  if (declaredOptionLabel !== null) return declaredOptionLabel;
   const text = String(value);
   const unit = getSettingDisplayUnit(p?.name);
   return unit ? `${text}${unit}` : text;
@@ -938,6 +884,9 @@ function formatSettingDisplayValue(p, value) {
 function formatSettingRangeMeta(p) {
   if (String(p?.name || "") === "SoundLanguageSetting") {
     return "";
+  }
+  if (p?.options && getDeclaredSettingOptionLabel(p.name, p.default) !== null) {
+    return `${getUIText("default_value", "Default")}: ${formatSettingDisplayValue(p, p.default)}`;
   }
   return [
     `min=${formatSettingDisplayValue(p, p?.min)}`,
@@ -958,133 +907,57 @@ function formatSettingPopularValue(p, raw) {
   return formatSettingDisplayValue(p, raw);
 }
 
+// Popular-value maths (normalize / range / order / display entry) is pure and
+// lives in features/settings/popular/popular_values.js. These wrappers inject
+// the app's value formatter and locale.
+function popularCompareOptions(p) {
+  return {
+    formatValue: (raw) => formatSettingPopularValue(p, raw),
+    locale: LANG === "ko" ? "ko-KR" : undefined,
+  };
+}
+
 function normalizeSettingPopularNumericValue(p, raw) {
-  if (raw === null || raw === undefined || raw === "") return null;
-  const min = Number(p?.min);
-  const max = Number(p?.max);
-  const text = String(raw).trim().toLowerCase();
-  if (min === 0 && max === 1) {
-    if (text === "1" || text === "true" || text === "on") return 1;
-    if (text === "0" || text === "false" || text === "off") return 0;
-  }
-  const value = Number(raw);
-  return Number.isFinite(value) ? value : null;
+  return carrotSettingsRuntime.popular.normalizeNumeric(p, raw);
 }
 
 function isSettingPopularValueInRange(p, raw) {
-  const min = Number(p?.min);
-  const max = Number(p?.max);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return true;
-  const value = normalizeSettingPopularNumericValue(p, raw);
-  if (value === null) return false;
-  return value >= min && value <= max;
-}
-
-function compareSettingPopularValueItems(p, a, b, aIndex = 0, bIndex = 0) {
-  const aCount = Number(a?.count ?? 0);
-  const bCount = Number(b?.count ?? 0);
-  const safeACount = Number.isFinite(aCount) ? aCount : 0;
-  const safeBCount = Number.isFinite(bCount) ? bCount : 0;
-  if (safeACount !== safeBCount) return safeBCount - safeACount;
-
-  const aValue = normalizeSettingPopularNumericValue(p, a?.value);
-  const bValue = normalizeSettingPopularNumericValue(p, b?.value);
-  if (aValue !== null && bValue !== null && aValue !== bValue) return aValue - bValue;
-  if (aValue !== null && bValue === null) return -1;
-  if (aValue === null && bValue !== null) return 1;
-
-  const aText = formatSettingPopularValue(p, a?.value);
-  const bText = formatSettingPopularValue(p, b?.value);
-  const textOrder = aText.localeCompare(bText, LANG === "ko" ? "ko-KR" : undefined, { numeric: true, sensitivity: "base" });
-  if (textOrder !== 0) return textOrder;
-
-  return aIndex - bIndex;
+  return carrotSettingsRuntime.popular.isInRange(p, raw);
 }
 
 function getSettingPopularDisplayEntry(p, entry) {
-  if (!entry || typeof entry !== "object") return null;
-  const sample = Number(entry?.sample ?? entry?.sample_count ?? 0);
-  if (!Number.isFinite(sample) || sample < 1) return null;
-  if (!isSettingPopularValueInRange(p, entry?.value)) return null;
-  const topValues = Array.isArray(entry?.top_values)
-    ? entry.top_values.map((item, index) => ({ item, index })).filter(({ item }) => {
-      const count = Number(item?.count ?? 0);
-      return Number.isFinite(count) && count > 0 && isSettingPopularValueInRange(p, item?.value);
-    }).sort((a, b) => compareSettingPopularValueItems(p, a.item, b.item, a.index, b.index))
-      .slice(0, 10)
-      .map(({ item }) => item)
-    : [];
-  return { ...entry, top_values: topValues };
-}
-
-function getSettingPopularCarKeyLabel() {
-  return String(settingPopularValuesState.carKey || "").trim() || getUIText("setting_popular_value_my_model", "내 차종");
+  return carrotSettingsRuntime.popular.buildDisplayEntry(p, entry, popularCompareOptions(p));
 }
 
 function getSettingPopularPrimaryCount(entry) {
-  const values = Array.isArray(entry?.top_values) ? entry.top_values : [];
-  const count = Number(values[0]?.count ?? entry?.top_count ?? entry?.count ?? 0);
-  return Number.isFinite(count) ? count : 0;
+  return carrotSettingsRuntime.popular.primaryCount(entry);
 }
 
 function getSettingPopularSummaryValues(entry) {
-  const values = Array.isArray(entry?.top_values) ? entry.top_values : [];
-  if (!values.length) return [];
-
-  const topCount = getSettingPopularPrimaryCount(entry);
-  if (topCount < 2) return [];
-
-  const tiedValues = values.filter((item) => {
-    const count = Number(item?.count ?? 0);
-    return Number.isFinite(count) && count === topCount;
-  });
-
-  return tiedValues.length <= 2 ? tiedValues : [];
+  return carrotSettingsRuntime.popular.summaryValues(entry);
 }
 
-function hasSettingPopularClearTop(entry) {
-  return getSettingPopularSummaryValues(entry).length > 0;
+// Popular-value chip/detail rendering lives in
+// features/settings/popular/popular_render.js; these inject the app's value
+// formatter, translator, escape and the aux-derived title/updated strings.
+function popularRenderOptions(p) {
+  return {
+    formatValue: (raw) => formatSettingPopularValue(p, raw),
+    text: getUIText,
+    escape: escapeHtml,
+  };
 }
 
 function renderSettingPopularChipText(p, entry) {
-  const summaryValues = getSettingPopularSummaryValues(entry);
-  if (!summaryValues.length) return "";
-  const sample = getSettingPopularPrimaryCount(entry);
-  const values = summaryValues.map((item) => formatSettingPopularValue(p, item?.value)).filter(Boolean);
-  if (!sample || !values.length) return "";
-  const label = getUIText("setting_popular_value_chip_label", "내 차종 인기값");
-  if (values.length === 1) {
-    return getUIText("setting_popular_value_chip", "{label} ({sample}대) {value}", {
-      label,
-      sample,
-      value: values[0],
-    });
-  }
-  return getUIText("setting_popular_value_chip_tied", "{label} (각 {sample}대) {values}", {
-    label,
-    sample,
-    values: values.join(" · "),
-  });
+  return carrotSettingsRuntime.popular.renderChipText(entry, popularRenderOptions(p));
 }
 
 function renderSettingPopularChipHtml(p, entry) {
-  const summaryValues = getSettingPopularSummaryValues(entry);
-  if (!summaryValues.length) return "";
-  const sample = getSettingPopularPrimaryCount(entry);
-  const values = summaryValues.map((item) => formatSettingPopularValue(p, item?.value)).filter(Boolean);
-  if (!sample || !values.length) return "";
-  const sampleText = values.length === 1
-    ? getUIText("setting_popular_value_chip_sample", "{sample}대", { sample })
-    : getUIText("setting_popular_value_chip_each_sample", "각 {sample}대", { sample });
-  return `
-    <span class="setting-popular-value-chip__car">${escapeHtml(getUIText("setting_popular_value_chip_label", "내 차종 인기값"))}</span>
-    <span class="setting-popular-value-chip__label">(</span><span class="setting-popular-value-chip__accent">${escapeHtml(sampleText)}</span><span class="setting-popular-value-chip__label">)</span>
-    <span class="setting-popular-value-chip__accent">${escapeHtml(values.join(" · "))}</span>
-  `;
+  return carrotSettingsRuntime.popular.renderChipHtml(entry, popularRenderOptions(p));
 }
 
 function getSettingPopularDetailTitle() {
-  const carKey = String(settingPopularValuesState.carKey || "").trim();
+  const carKey = String(settingAuxState.popular.getState().carKey || "").trim();
   if (carKey) return getUIText("setting_popular_value_car_title", "{car} 인기값", { car: carKey });
   return getUIText("setting_popular_value_title", "내 차종 인기값");
 }
@@ -1103,77 +976,72 @@ function formatSettingPopularUpdated(epochSec) {
 }
 
 function renderSettingPopularDetailHtml(p, entry) {
-  const values = Array.isArray(entry?.top_values) ? entry.top_values : [];
-  if (!values.length) {
-    return `<div class="setting-popular-detail"><div class="setting-popular-detail__empty">${escapeHtml(getUIText("setting_popular_value_empty", "표시할 설정값이 없습니다."))}</div></div>`;
-  }
-
-  const counts = values.map((item) => Number(item?.count ?? 0)).filter((count) => Number.isFinite(count) && count > 0);
-  const maxCount = Math.max(1, ...counts);
-
-  const rows = values.map((item) => {
-    const value = formatSettingPopularValue(p, item?.value);
-    const count = Number(item?.count ?? 0);
-    const width = Math.max(4, Math.min(100, Math.round((Math.max(0, count) / maxCount) * 100)));
-    return `
-      <button type="button" class="setting-popular-detail__row" style="--setting-popular-width:${width}%" data-setting-popular-value="${escapeHtml(item?.value ?? "")}">
-        <span class="setting-popular-detail__marker" aria-hidden="true"></span>
-        <span class="setting-popular-detail__main">
-          <span class="setting-popular-detail__value">${escapeHtml(value)}</span>
-          ${values.length > 1 ? `<span class="setting-popular-detail__bar" aria-hidden="true"></span>` : ""}
-        </span>
-        <span class="setting-popular-detail__count">${escapeHtml(`${count}대`)}</span>
-      </button>
-    `;
-  }).join("");
-
-  const updated = formatSettingPopularUpdated(settingPopularValuesState.fetchedAt);
-  const updatedHtml = updated
-    ? `<div class="setting-popular-detail__updated" style="margin-top:8px;font-size:11px;color:var(--md-on-surface-var,#8a8f98)">${escapeHtml(getUIText("setting_popular_value_updated", "최근 업데이트: {time}", { time: updated }))}</div>`
-    : "";
-
-  return `
-    <div class="setting-popular-detail${values.length <= 1 ? " setting-popular-detail--single" : ""}">
-      <div class="setting-popular-detail__head">
-        <span class="setting-popular-detail__name">${escapeHtml(getSettingPopularDetailTitle())}</span>
-        <span class="setting-popular-detail__range">${escapeHtml(getUIText("setting_popular_value_common_values", "많이 쓰는 값"))}</span>
-      </div>
-      <div class="setting-popular-detail__rows">${rows}</div>
-      ${updatedHtml}
-    </div>
-  `;
+  return carrotSettingsRuntime.popular.renderDetailHtml(entry, {
+    ...popularRenderOptions(p),
+    title: getSettingPopularDetailTitle(),
+    updatedText: formatSettingPopularUpdated(settingAuxState.popular.getState().fetchedAt),
+  });
 }
 
+// The step multiplier lives on the device, not in the browser. Keeping it in
+// localStorage meant it was lost on every browser switch and on every "clear
+// your cache" instruction, which is advice this project hands out often.
 const SETTING_UNIT_STORAGE_KEY = "carrot.settingUnitIndex.v1";
-let settingUnitIndexStore = null;
+let settingUnitIndexHydrated = false;
 
-function getSettingUnitIndexStore() {
-  if (settingUnitIndexStore) return settingUnitIndexStore;
-  try {
-    settingUnitIndexStore = JSON.parse(localStorage.getItem(SETTING_UNIT_STORAGE_KEY) || "{}") || {};
-  } catch (_) {
-    settingUnitIndexStore = {};
+function hydrateSettingUnitIndex(units) {
+  if (units && typeof units === "object") {
+    Object.entries(units).forEach(([name, index]) => {
+      const value = Number(index);
+      if (Number.isInteger(value) && value > 0 && value < UNIT_CYCLE.length) UNIT_INDEX[name] = value;
+    });
   }
-  return settingUnitIndexStore;
+  // Runs even when the server sent nothing, so an older server (or an empty
+  // store) still gets whatever the browser was holding.
+  if (settingUnitIndexHydrated) return;
+  settingUnitIndexHydrated = true;
+  migrateLocalSettingUnitIndex();
+}
+
+// One-time lift of whatever the browser still holds, so nobody loses the
+// multipliers they had set before this moved to the server.
+function migrateLocalSettingUnitIndex() {
+  let stored = null;
+  try {
+    stored = JSON.parse(localStorage.getItem(SETTING_UNIT_STORAGE_KEY) || "null");
+  } catch (_) {
+    stored = null;
+  }
+  if (!stored || typeof stored !== "object") return;
+
+  const units = {};
+  Object.entries(stored).forEach(([name, index]) => {
+    const value = Number(index);
+    if (!Number.isInteger(value) || value <= 0 || value >= UNIT_CYCLE.length) return;
+    if (name in UNIT_INDEX) return;
+    UNIT_INDEX[name] = value;
+    units[name] = value;
+  });
+
+  try {
+    localStorage.removeItem(SETTING_UNIT_STORAGE_KEY);
+  } catch (_) {}
+  if (Object.keys(units).length) {
+    postJson("/api/setting_unit_index", { units }).catch(() => {});
+  }
 }
 
 function saveSettingUnitIndex(name, index) {
   const key = String(name || "").trim();
   if (!key) return;
-  try {
-    const store = getSettingUnitIndexStore();
-    store[key] = index;
-    localStorage.setItem(SETTING_UNIT_STORAGE_KEY, JSON.stringify(store));
-  } catch (_) {}
+  postJson("/api/setting_unit_index", { units: { [key]: index } }).catch(() => {
+    showAppToast(getUIText("setting_unit_save_failed", "배율을 저장하지 못했습니다."), { tone: "error" });
+  });
 }
 
 function getSettingUnitIndex(name) {
   const key = String(name || "").trim();
   if (!key) return 0;
-  if (!(key in UNIT_INDEX)) {
-    const saved = Number(getSettingUnitIndexStore()[key]);
-    UNIT_INDEX[key] = Number.isInteger(saved) && saved >= 0 && saved < UNIT_CYCLE.length ? saved : 0;
-  }
   if (!Number.isInteger(UNIT_INDEX[key]) || UNIT_INDEX[key] < 0 || UNIT_INDEX[key] >= UNIT_CYCLE.length) {
     UNIT_INDEX[key] = 0;
   }
@@ -1211,17 +1079,6 @@ function setSettingItemsTitle(label) {
     <span class="setting-title-backIcon" aria-hidden="true">${settingChevronSvg("left")}</span>
     <span class="setting-title-text">${safeLabel}</span>
   `;
-}
-
-function getLanguageSettingOptions() {
-  const options = Array.isArray(window.CarrotDeviceLanguageOptions) ? window.CarrotDeviceLanguageOptions : [];
-  return options.length
-    ? options
-    : [
-        { code: "en", name: "English" },
-        { code: "ko", name: "한국어" },
-        { code: "zh-CHS", name: "中文（简体）" },
-      ];
 }
 
 function getSoundLanguageSettingOptions() {
@@ -1303,10 +1160,22 @@ function syncSettingControlState(row, value) {
   const slider = row.querySelector(".setting-slider__input");
   if (slider) slider.value = text;
 
-  row.querySelectorAll(".setting-segment").forEach((button) => {
+  const segments = row.querySelectorAll(".setting-segment");
+  segments.forEach((button) => {
     button.classList.toggle("is-active", String(button.dataset.value) === text);
     button.setAttribute("aria-pressed", String(button.dataset.value) === text ? "true" : "false");
   });
+  if (segments.length) {
+    // Selection moved, so the keyboard entry point has to move with it.
+    // create() returns the already-mounted controller and re-syncs it.
+    const group = row.querySelector(".setting-segments");
+    if (group) {
+      window.CarrotUI?.segmentedControl?.create(group, {
+        itemSelector: ".setting-segment",
+        selectedAttribute: "aria-pressed",
+      });
+    }
+  }
 
   const select = row.querySelector(".setting-select");
   if (select) {
@@ -1322,9 +1191,7 @@ let settingGroupTransitionLock = false;
 let settingRenderToken = 0;
 let pendingSettingFocus = null;
 let settingFocusClearTimer = null;
-let settingSearchDebounceTimer = null;
 let settingSearchEntries = [];
-let settingSearchScope = { type: "all", profileId: "" };
 const settingPageRoot = document.getElementById("pageSetting");
 let settingFabMenuOpen = false;
 let CURRENT_SETTING_DETAIL = null;
@@ -1350,8 +1217,26 @@ function getLandscapeDefaultSettingGroup() {
   return match?.group || CURRENT_GROUP || groups[0]?.group || null;
 }
 
+function primeSettingsSnapshotForFirstEntry(snapshot = window.CarrotSettingsStore?.peek?.()) {
+  hydrateSettingUnitIndex(snapshot?.unit_index);
+  const catalog = settingEntryController.primeSnapshot(snapshot);
+  if (!catalog || !isCompactLandscapeMode()) return catalog;
+
+  const initialGroup = getLandscapeDefaultSettingGroup();
+  if (initialGroup) fetchSettingGroupValues(initialGroup).catch(() => {});
+  return catalog;
+}
+
+window.addEventListener("carrot:settings-store", (event) => {
+  if (event.detail?.status === "ready") primeSettingsSnapshotForFirstEntry();
+});
+
+if (window.CarrotSettingsStore?.status === "ready") {
+  queueMicrotask(() => primeSettingsSnapshotForFirstEntry());
+}
+
 function syncSettingSearchFabState() {
-  const isOpen = Boolean(settingSearchPanel && !settingSearchPanel.hidden);
+  const isOpen = settingSearchPanelView.isOpen();
   if (settingPageRoot) settingPageRoot.classList.toggle("setting-search-open", isOpen);
   if (btnSettingSearch) {
     btnSettingSearch.classList.toggle("active", isOpen || settingFabMenuOpen);
@@ -1359,42 +1244,13 @@ function syncSettingSearchFabState() {
   }
 }
 
-function normalizeSettingProfiles(profiles) {
-  return (Array.isArray(profiles) ? profiles : [])
-    .filter((profile) => profile && profile.id && profile.name && profile.values)
-    .map((profile) => ({
-      ...profile,
-      values: { ...(profile.values || {}) },
-      meta: { ...(profile.meta || {}) },
-    }));
-}
-
 async function loadSettingProfiles(force = false) {
-  if (!force && settingProfilesState.loaded) return settingProfilesState.profiles;
-  if (!force && settingProfilesState.loadPromise) return settingProfilesState.loadPromise;
-
-  settingProfilesState.loadPromise = getJson("/api/setting_profiles")
-    .then((payload) => {
-      settingProfilesState.loaded = true;
-      settingProfilesState.profiles = normalizeSettingProfiles(payload?.profiles || []);
-      return settingProfilesState.profiles;
-    })
-    .catch(() => {
-      settingProfilesState.loaded = true;
-      settingProfilesState.profiles = [];
-      return settingProfilesState.profiles;
-    })
-    .finally(() => {
-      settingProfilesState.loadPromise = null;
-    });
-
-  return settingProfilesState.loadPromise;
+  return settingAuxState.profiles.load(force);
 }
 
 function updateSettingProfilesFromPayload(payload) {
   if (!payload || !Array.isArray(payload.profiles)) return;
-  settingProfilesState.loaded = true;
-  settingProfilesState.profiles = normalizeSettingProfiles(payload.profiles);
+  settingAuxState.profiles.replace(payload.profiles);
 }
 
 function formatSettingProfileDate(value) {
@@ -1484,13 +1340,14 @@ async function applySettingProfile(profile) {
   if (selected <= 0 || !ok) return;
 
   try {
-    const result = await postJson("/api/setting_profiles/apply", { id: profile.id, values: profile.values || {} });
-    const failed = new Set((result.result?.fails || []).map((entry) => String(entry?.key || "")).filter(Boolean));
-    const restoredValues = {};
-    (result.preview?.entries || []).forEach((entry) => {
-      if (!entry?.apply || failed.has(String(entry.key))) return;
-      restoredValues[entry.key] = entry.value;
-    });
+    // Send only what the preview marked for apply, not the whole profile. The
+    // server still re-checks each value, so an entry that quietly became
+    // identical is skipped there; the 162 unchanged parameters are just no
+    // longer shipped and re-read on every apply. Selection logic is pure and
+    // tested in features/settings/profiles/apply_plan.js.
+    const applyValues = carrotSettingsRuntime.profiles.selectApplyValues(preview, profile.values);
+    const result = await postJson("/api/setting_profiles/apply", { id: profile.id, values: applyValues });
+    const restoredValues = carrotSettingsRuntime.profiles.collectRestoredValues(result);
     if (Object.keys(restoredValues).length) {
       window.dispatchEvent(new CustomEvent("carrot:paramsrestored", {
         detail: { source: "setting_profile", values: restoredValues },
@@ -1527,18 +1384,16 @@ async function deleteSettingProfile(profile) {
   }
 }
 
-function closeSettingProfileActionMenus(exceptPanel = null) {
-  document.querySelectorAll(".setting-profile-menu.is-open").forEach((menu) => {
-    if (exceptPanel && menu === exceptPanel) return;
-    menu.classList.remove("is-open");
-    const button = menu.querySelector(".setting-profile-menu__button");
-    const panel = menu.querySelector(".setting-profile-menu__panel");
-    if (button) button.setAttribute("aria-expanded", "false");
-    if (panel) {
-      panel.hidden = true;
-      panel.setAttribute("aria-hidden", "true");
-    }
+function closeSettingProfileActionMenus(exceptMenu = null) {
+  settingProfileMenuControllers.forEach((controller, menu) => {
+    if (exceptMenu && menu === exceptMenu) return;
+    controller.close();
   });
+}
+
+function destroySettingProfileActionMenus() {
+  settingProfileMenuControllers.forEach((controller) => controller.destroy());
+  settingProfileMenuControllers.clear();
 }
 
 function settingProfileActionIcon(kind) {
@@ -1566,11 +1421,7 @@ function makeSettingProfileMenuItem({ label, icon = "info", onClick, className =
     ${settingProfileActionIcon(icon)}
     <span>${settingsDiffEscape(label)}</span>
   `;
-  button.onclick = (event) => {
-    event.stopPropagation();
-    closeSettingProfileActionMenus();
-    if (typeof onClick === "function") onClick();
-  };
+  if (typeof onClick === "function") settingProfileMenuActions.set(button, onClick);
   return button;
 }
 
@@ -1668,6 +1519,7 @@ function appendSettingProfileHeader(profile, container) {
 
   const menu = document.createElement("div");
   menu.className = "setting-profile-menu ui-dropdown-menu";
+  menu.addEventListener("click", (event) => event.stopPropagation());
   const menuBtn = document.createElement("button");
   menuBtn.type = "button";
   menuBtn.className = "setting-profile-menu__button ui-dropdown-menu__button";
@@ -1684,6 +1536,15 @@ function appendSettingProfileHeader(profile, container) {
   menuPanel.setAttribute("role", "menu");
   menuPanel.setAttribute("aria-hidden", "true");
   menuPanel.hidden = true;
+  // Order: search, apply, delete — search leads while the overlay search is
+  // enabled. The destructive delete stays last, away from the others.
+  if (SETTING_OVERLAY_SEARCH_ENABLED) {
+    menuPanel.appendChild(makeSettingProfileMenuItem({
+      label: getUIText("setting_profile_search", "Search Profile"),
+      icon: "search",
+      onClick: () => openSettingSearchPanel({ scope: { type: "profile", profileId: profile.id } }).catch(() => {}),
+    }));
+  }
   menuPanel.appendChild(makeSettingProfileMenuItem({
     label: getUIText("apply", "Apply"),
     icon: "apply",
@@ -1691,27 +1552,33 @@ function appendSettingProfileHeader(profile, container) {
     className: "setting-profile-menu__item--primary",
   }));
   menuPanel.appendChild(makeSettingProfileMenuItem({
-    label: getUIText("setting_profile_search", "Search Profile"),
-    icon: "search",
-    onClick: () => openSettingSearchPanel({ scope: { type: "profile", profileId: profile.id } }).catch(() => {}),
-  }));
-  menuPanel.appendChild(makeSettingProfileMenuItem({
     label: getUIText("delete", "Delete"),
     icon: "delete",
     onClick: () => deleteSettingProfile(profile),
     className: "setting-profile-menu__item--danger",
   }));
-  menuBtn.onclick = (event) => {
-    event.stopPropagation();
-    const nextOpen = !menu.classList.contains("is-open");
-    closeSettingProfileActionMenus(menu);
-    menu.classList.toggle("is-open", nextOpen);
-    menuBtn.setAttribute("aria-expanded", nextOpen ? "true" : "false");
-    menuPanel.hidden = !nextOpen;
-    menuPanel.setAttribute("aria-hidden", nextOpen ? "false" : "true");
-  };
   menu.appendChild(menuBtn);
   menu.appendChild(menuPanel);
+  const menuApi = window.CarrotUI?.menu;
+  if (typeof menuApi?.mount === "function") {
+    const controller = menuApi.mount({
+      root: menu,
+      trigger: menuBtn,
+      panel: menuPanel,
+      itemSelector: ".setting-profile-menu__item",
+      beforeOpen: () => {
+        closeSettingProfileActionMenus(menu);
+        return true;
+      },
+      onSelect: (item) => {
+        const action = settingProfileMenuActions.get(item);
+        if (typeof action === "function") {
+          Promise.resolve().then(() => action()).catch(() => {});
+        }
+      },
+    });
+    settingProfileMenuControllers.set(menu, controller);
+  }
 
   const rows = document.createElement("div");
   rows.className = "setting-profile-card__rows";
@@ -1769,7 +1636,7 @@ function syncSettingFabMenuState() {
     }
   }
   if (btnSettingSearch) {
-    btnSettingSearch.classList.toggle("active", settingFabMenuOpen || Boolean(settingSearchPanel && !settingSearchPanel.hidden));
+    btnSettingSearch.classList.toggle("active", settingFabMenuOpen || settingSearchPanelView.isOpen());
     btnSettingSearch.setAttribute("aria-expanded", settingFabMenuOpen ? "true" : "false");
   }
 }
@@ -1785,99 +1652,151 @@ function toggleSettingFabMenu() {
   syncSettingFabMenuState();
 }
 
-function mountSettingSearchOverlay() {
-  if (settingSearchBackdrop && settingSearchBackdrop.parentElement !== document.body) {
-    document.body.appendChild(settingSearchBackdrop);
-  }
-  if (settingSearchPanel && settingSearchPanel.parentElement !== document.body) {
-    document.body.appendChild(settingSearchPanel);
-  }
-}
-
-function makeSettingSearchEntry({ source, profile = null, group, item }) {
-  const groupLabel = getSettingGroupLabel(group);
-  const contextGroupLabel = getSettingItemContextLabel(group, item);
-  const title = formatItemText(item, "title", "etitle", "");
-  const descr = formatItemText(item, "descr", "edescr", "");
-  const isProfile = source === "profile" && profile?.id;
-  const profileName = isProfile ? String(profile.name || "") : "";
-  const sourceLabel = isProfile
-    ? getUIText("setting_search_source_profile", "Profile")
-    : getUIText("setting_search_source_carrot", "CarrotPilot");
-  const contextLabel = isProfile
-    ? `${profileName} / ${contextGroupLabel}`
-    : contextGroupLabel;
-
-  return {
-    source: isProfile ? "profile" : "carrot",
-    sourceLabel,
-    profileId: isProfile ? profile.id : "",
-    profileName,
-    group: isProfile ? settingProfileGroup(profile.id) : group,
-    originalGroup: group,
-    groupLabel,
-    contextGroupLabel,
-    contextLabel,
-    name: item.name,
-    title,
-    descr,
-    haystack: [sourceLabel, profileName, groupLabel, contextGroupLabel, item.name, title, descr].join("\n").toLowerCase(),
-  };
-}
-
 function rebuildSettingSearchEntries() {
-  const groups = SETTINGS?.groups || [];
-  const entries = [];
-
-  groups.forEach((groupMeta) => {
-    const group = groupMeta.group;
-    const groupLabel = getSettingGroupLabel(group);
-    const list = SETTINGS?.items_by_group?.[group] || [];
-
-    list.forEach((item) => {
-      entries.push(makeSettingSearchEntry({ source: "carrot", group, item }));
-    });
+  settingSearchEntries = getSettingDerivedModel().buildSearchEntries({
+    carrot: getUIText("setting_search_source_carrot", "CarrotPilot"),
+    profile: getUIText("setting_search_source_profile", "Profile"),
   });
-
-  (settingProfilesState.profiles || []).forEach((profile) => {
-    getProfileSettingEntries(profile).forEach((entry) => {
-      entries.push(makeSettingSearchEntry({
-        source: "profile",
-        profile,
-        group: entry.group,
-        item: entry.item,
-      }));
-    });
-  });
-
-  settingSearchEntries = entries;
-  return entries;
-}
-
-function getSettingSearchEntries() {
   return settingSearchEntries;
 }
 
+// Pure highlight logic (and its escaping guarantees) live in
+// features/settings/search/highlight.js; this passes the app's escapeHtml in.
 function highlightSettingSearchText(text, query) {
-  const raw = String(text ?? "");
-  const q = String(query || "").trim().toLowerCase();
-  if (!raw || !q) return escapeHtml(raw);
-
-  const lower = raw.toLowerCase();
-  const start = lower.indexOf(q);
-  if (start < 0) return escapeHtml(raw);
-
-  const end = start + q.length;
-  return `${escapeHtml(raw.slice(0, start))}<mark class="setting-search-result__mark">${escapeHtml(raw.slice(start, end))}</mark>${escapeHtml(raw.slice(end))}`;
+  return carrotSettingsRuntime.search.highlight(text, query, { escape: escapeHtml });
 }
 
-function getSettingSearchScopeLabel() {
-  if (settingSearchScope.type === "profile") {
-    const profile = getSettingProfileById(settingSearchScope.profileId);
-    return profile?.name || getUIText("setting_search_source_profile", "Profile");
+async function selectSettingSearchEntry(entry) {
+  try {
+    const detailParent = String(entry.detailParent || "");
+    if (entry.source === "profile" && entry.profileId && entry.originalGroup) {
+      settingProfileSectionExpandedState.set(`${entry.profileId}:${entry.originalGroup}`, true);
+    }
+    closeSettingSearchPanel({ syncHistory: false });
+    if (entry.searchOnly) {
+      // This row is intentionally absent from its normal group. Render the
+      // matching live control in the inline-search virtual group instead.
+      await applySettingInlineSearch(entry.name);
+      focusSettingItem(entry.name);
+      return;
+    }
+    pendingSettingFocus = { group: entry.group, name: entry.name };
+    if (CURRENT_GROUP === entry.group && !CURRENT_SETTING_DETAIL && screenItems && screenItems.style.display !== "none") {
+      focusSettingItem(entry.name);
+      return;
+    }
+    if (detailParent) {
+      // A detail child only exists inside its parent's detail screen: open the
+      // group first, then the parent detail, and let the pending focus land on
+      // the child row once it renders.
+      if (CURRENT_GROUP === entry.group && CURRENT_SETTING_DETAIL === detailParent) {
+        focusSettingItem(entry.name);
+        return;
+      }
+      await activateSettingGroup(entry.group, true);
+      await selectSettingDetail(entry.group, detailParent, true);
+      return;
+    }
+    await activateSettingGroup(entry.group, true);
+  } catch (e) {
+    showAppToast(e.message || "Search jump failed", { tone: "error" });
   }
-  return getUIText("setting_search_all", "All settings");
 }
+
+function renderedPhoneSearchNames() {
+  if (document.hidden || CURRENT_PAGE !== "setting" || !isCarrotSettingTabActive() ||
+      CURRENT_GROUP !== SETTING_INLINE_SEARCH_GROUP || CURRENT_SETTING_DETAIL || !isSettingInlineSearchSurfaceActive()) return [];
+  const container = getSettingItemRenderContainer() || document.getElementById("items");
+  return Array.from(container?.querySelectorAll(".setting[data-setting-name]") || [])
+    .filter(row => row.offsetParent !== null).map(row => row.dataset.settingName);
+}
+
+function phoneSearchResultName(id, position) {
+  if (!phoneSearchResults || phoneSearchResults.id !== id || !settingSearchTitlesFirst ||
+      settingInlineSearchQuery !== phoneSearchResults.query) return null;
+  const expected = phoneSearchResults.names[position - 1];
+  return expected && renderedPhoneSearchNames()[position - 1] === expected ? expected : null;
+}
+
+async function findPhoneSettings(query, id) {
+  phoneSearchResults = null;
+  showPage("setting", true);
+  await loadSettings();
+  if (CURRENT_PAGE !== "setting" || document.hidden) return null;
+  await switchSettingTab("carrot");
+  settingInlineSearchView.setQuery(query);
+  await applySettingInlineSearch(query, { preferTitle: true });
+  if (!isSettingInlineSearchSurfaceActive() || settingInlineSearchQuery !== query) return null;
+  const { total, entries } = getSettingInlineSearchResults();
+  const names = renderedPhoneSearchNames();
+  if (total > 0 && !names.length) return null;
+  phoneSearchResults = { id, query, names };
+  const item = entries.find(entry => entry.item.name === names[0])?.item;
+  const spokenTitle = title => (title || item?.name || "").split(/[:：]/, 1)[0].trim();
+  return { status: "found", total, firstKo: spokenTitle(item?.title), firstEn: spokenTitle(item?.etitle) };
+}
+
+// The paired assistant may navigate only to an actual setting available in this
+// device's filtered catalog. Never accept URLs, scripts or parameter values.
+async function openAssistantSetting(name) {
+  if (!/^[A-Za-z][A-Za-z0-9_]{0,100}$/.test(String(name || ""))) return "unavailable";
+  showPage("setting", true);
+  await loadSettings();
+  if (typeof switchSettingTab === "function") await switchSettingTab("carrot");
+  const entry = rebuildSettingSearchEntries().find(item => item.name === name && item.source !== "profile");
+  if (!entry) return "unavailable";
+  // Entry rendering schedules its initial scroll reset on the next frame.
+  // Let it finish before placing the assistant's requested row in view.
+  const afterPaint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+  await afterPaint();
+  if (CURRENT_PAGE !== "setting") return "failed";
+  await selectSettingSearchEntry(entry);
+  if (entry.detailParent && CURRENT_SETTING_DETAIL !== entry.detailParent) {
+    await selectSettingDetail(entry.group, entry.detailParent, true);
+  }
+  await afterPaint();
+  if (CURRENT_PAGE !== "setting") return "failed";
+  const visible = Array.from(document.querySelectorAll('.setting[data-setting-name]'))
+    .some(row => row.dataset.settingName === name && row.offsetParent !== null);
+  return visible && focusSettingItem(name, "instant") ? "opened" : "failed";
+}
+
+// Overlay panel DOM state (visibility, scope, labels, results, debounce) lives
+// in features/settings/search/panel.js. The page keeps settings/profile
+// loading, history entries, the FAB state and the modal scroll lock.
+const settingSearchPanelView = settingSearchRuntime.createPanel({
+  elements: {
+    panel: document.getElementById("settingSearchPanel"),
+    backdrop: document.getElementById("settingSearchBackdrop"),
+    form: document.getElementById("settingSearchForm"),
+    input: document.getElementById("settingSearchInput"),
+    results: document.getElementById("settingSearchResults"),
+  },
+  getEntries: () => {
+    if (!SETTINGS) return [];
+    if (!settingSearchEntries.length) rebuildSettingSearchEntries();
+    return settingSearchEntries;
+  },
+  getLabels: () => ({
+    all: getUIText("setting_search_all", "All settings"),
+    placeholder: getUIText("setting_search_placeholder", "Search name, description, group"),
+    profilePlaceholder: getUIText("setting_profile_search_placeholder", "Search in this profile"),
+    empty: getUIText("setting_search_empty", "No matching settings found."),
+    sourceCarrot: getUIText("setting_search_source_carrot", "CarrotPilot"),
+    sourceProfile: getUIText("setting_search_source_profile", "Profile"),
+    count: getUIText("setting_inline_search_count", "Showing {shown} of {total}"),
+  }),
+  getProfileName: (profileId) => getSettingProfileById(profileId)?.name || "",
+  escape: escapeHtml,
+  highlight: highlightSettingSearchText,
+  onSelect: selectSettingSearchEntry,
+  onRequestClose: () => closeSettingSearchPanel({ syncHistory: true }),
+  onOpenChange: () => syncSettingSearchFabState(),
+  // The panel keeps `hidden` until its close fade finishes; re-sync the modal
+  // body lock then, like the shared dialog's finalize step.
+  onHidden: () => syncModalBodyLock(),
+});
+settingSearchPanelView.bind();
 
 function clearSettingItemFocus() {
   if (settingFocusClearTimer) {
@@ -1978,8 +1897,9 @@ function resetSettingItemsViewport() {
 }
 
 function hasRenderedSettingItems(group = CURRENT_GROUP) {
-  const itemsBox = document.getElementById("items");
+  const itemsBox = getSettingItemRenderContainer(group) || document.getElementById("items");
   if (!itemsBox || !group) return false;
+  if (group === SETTING_INLINE_SEARCH_GROUP && itemsBox.dataset.renderedSearchQuery !== settingInlineSearchQuery) return false;
   return itemsBox.dataset.renderedGroup === group && !itemsBox.dataset.renderedDetail && itemsBox.childElementCount > 0;
 }
 
@@ -1988,6 +1908,10 @@ function isCarrotSettingTabActive() {
 }
 
 function syncSettingGroupChrome(group = CURRENT_GROUP) {
+  mountSettingInlineSearch();
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    history.replaceState({ ...history.state, inlineSearchQuery: settingInlineSearchQuery }, "");
+  }
   const meta = document.getElementById("groupMeta");
   const list = getSettingItemEntriesForGroup(group);
   const profile = getSettingProfileByGroup(group);
@@ -2004,7 +1928,8 @@ function syncSettingGroupChrome(group = CURRENT_GROUP) {
   }
   if (meta && group) {
     meta.classList.remove("setting-profile-meta");
-    meta.textContent = profile ? "" : `${group} / ${list.length}`;
+    meta.textContent = group === SETTING_INLINE_SEARCH_GROUP ? getSettingInlineSearchCountLabel()
+      : profile ? "" : `${group} / ${list.length}`;
   }
   if (group) {
     settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + groupLabel;
@@ -2052,6 +1977,12 @@ async function selectSettingDetail(group, name, pushHistory = true) {
   saveCurrentSettingScrollPosition(targetGroup);
   CURRENT_GROUP = targetGroup;
   CURRENT_SETTING_DETAIL = targetName;
+  if (targetGroup === SETTING_INLINE_SEARCH_GROUP) settingValueRepository.invalidateGroup(targetGroup);
+  if (targetGroup === SETTING_INLINE_SEARCH_GROUP && !isCompactLandscapeMode()) {
+    // The detail opens on the items screen; the search field (and its
+    // keyboard) must not hover over it from behind.
+    document.getElementById("settingInlineSearchInput")?.blur();
+  }
   if (pushHistory) {
     history.pushState({
       page: "setting",
@@ -2064,8 +1995,50 @@ async function selectSettingDetail(group, name, pushHistory = true) {
     detailName: targetName,
     scrollMode: "top",
     animateItems: false,
-    forceValues: true,
   }), "forward");
+}
+
+function loadSettingDocumentationPanel(contextPanel, name, renderToken) {
+  contextPanel.setLoading(
+    "description",
+    getUIText("setting_doc_loading", "Loading guide..."),
+  );
+  settingDocumentationRuntime.load(name, LANG).then((payload) => {
+    if (renderToken !== settingRenderToken || !contextPanel.root.isConnected) return;
+    if (!payload?.available || !Array.isArray(payload.ast)) {
+      contextPanel.setEmpty(
+        "description",
+        getUIText("setting_context_description_empty", "No detailed description is available yet."),
+      );
+      return;
+    }
+
+    const content = document.createElement("div");
+    content.className = "setting-context__documentation";
+    if (payload.fallback) {
+      const fallback = document.createElement("div");
+      fallback.className = "setting-doc-language-fallback";
+      fallback.textContent = getUIText(
+        "setting_doc_language_fallback",
+        "This detailed guide is currently shown in English.",
+      );
+      content.appendChild(fallback);
+    }
+
+    const article = settingDocumentationRuntime.renderAst(document, payload.ast, {
+      text: getUIText,
+    });
+    content.appendChild(article);
+    contextPanel.root.dataset.docSource = `${payload.source || ""}#${payload.anchor || ""}`;
+    contextPanel.root.dataset.docContentSource = payload.content_source || "";
+    contextPanel.setContent("description", content);
+  }).catch(() => {
+    if (renderToken !== settingRenderToken || !contextPanel.root.isConnected) return;
+    contextPanel.setEmpty(
+      "description",
+      getUIText("setting_doc_load_failed", "The detailed guide could not be loaded."),
+    );
+  });
 }
 
 function settingMarqueeHtml(text, className) {
@@ -2113,12 +2086,19 @@ function syncSettingMarqueeOverflow(root = document) {
 }
 
 function focusSettingItem(name, behavior = "smooth") {
-  const itemsBox = document.getElementById("items");
-  if (!itemsBox || !name) return false;
-
-  const target = Array.from(itemsBox.querySelectorAll(".setting")).find(
-    (el) => el.dataset.settingName === name,
-  );
+  if (!name) return false;
+  // The row may live on the items screen or in the in-place search results;
+  // prefer whichever surface is actually visible.
+  let target = null;
+  for (const box of [document.getElementById("items"), document.getElementById("settingInlineSearchResults")]) {
+    if (!box) continue;
+    const found = Array.from(box.querySelectorAll(".setting")).find(
+      (el) => el.dataset.settingName === name,
+    );
+    if (!found) continue;
+    if (!target || found.offsetParent !== null) target = found;
+    if (found.offsetParent !== null) break;
+  }
   if (!target) return false;
 
   const section = target.closest(".setting-profile-section");
@@ -2143,24 +2123,7 @@ function focusSettingItem(name, behavior = "smooth") {
 function closeSettingSearchPanel(options = {}) {
   const syncHistory = Boolean(options.syncHistory);
   const fromHistory = Boolean(options.fromHistory);
-  if (settingSearchDebounceTimer) {
-    clearTimeout(settingSearchDebounceTimer);
-    settingSearchDebounceTimer = null;
-  }
-  if (settingSearchPanel) {
-    settingSearchPanel.hidden = true;
-    settingSearchPanel.setAttribute("aria-hidden", "true");
-  }
-  if (settingSearchBackdrop) settingSearchBackdrop.hidden = true;
-  syncSettingSearchFabState();
-
-  if (settingSearchInput) {
-    settingSearchInput.value = "";
-    settingSearchInput.placeholder = getUIText("setting_search_placeholder", "Search name, description, group");
-    settingSearchInput.removeAttribute("aria-label");
-  }
-  if (settingSearchResults) settingSearchResults.innerHTML = "";
-  settingSearchScope = { type: "all", profileId: "" };
+  settingSearchPanelView.hide();
   syncModalBodyLock();
 
   const state = history.state || {};
@@ -2174,106 +2137,9 @@ function closeSettingSearchPanel(options = {}) {
   }
 }
 
-function renderSettingSearchResults(query = "") {
-  if (!settingSearchResults) return;
-
-  const trimmed = String(query || "").trim();
-  if (!SETTINGS) {
-    settingSearchResults.innerHTML = "";
-    return;
-  }
-
-  if (!trimmed) {
-    settingSearchResults.innerHTML = "";
-    return;
-  }
-
-  if (!settingSearchEntries.length && SETTINGS) {
-    rebuildSettingSearchEntries();
-  }
-
-  const q = trimmed.toLowerCase();
-  const matches = getSettingSearchEntries()
-    .filter((entry) => {
-      if (!entry.haystack.includes(q)) return false;
-      if (settingSearchScope.type === "profile") {
-        return entry.source === "profile" && entry.profileId === settingSearchScope.profileId;
-      }
-      return true;
-    })
-    .slice(0, 36);
-
-  settingSearchResults.innerHTML = "";
-
-  if (!matches.length) {
-    const empty = document.createElement("div");
-    empty.className = "setting-search-result setting-search-result--empty";
-    empty.textContent = getUIText("setting_search_empty", "No matching settings found.");
-    settingSearchResults.appendChild(empty);
-    return;
-  }
-
-  const sections = [
-    {
-      key: "carrot",
-      title: getUIText("setting_search_source_carrot", "CarrotPilot"),
-      entries: matches.filter((entry) => entry.source === "carrot"),
-    },
-    {
-      key: "profile",
-      title: getUIText("setting_search_source_profile", "Profile"),
-      entries: matches.filter((entry) => entry.source === "profile"),
-    },
-  ].filter((section) => section.entries.length);
-
-  sections.forEach((section) => {
-    const sectionEl = document.createElement("div");
-    sectionEl.className = "setting-search-section";
-    sectionEl.innerHTML = `
-      <div class="setting-search-section__title">
-        <span>${escapeHtml(section.title)}</span>
-        <strong>${section.entries.length}</strong>
-      </div>
-      <div class="setting-search-section__body"></div>
-    `;
-    settingSearchResults.appendChild(sectionEl);
-    const sectionBody = sectionEl.querySelector(".setting-search-section__body");
-
-    section.entries.forEach((entry) => {
-      const button = document.createElement("button");
-      button.type = "button";
-      button.className = "setting-search-result";
-      const metaLabel = entry.source === "profile"
-        ? `${entry.profileName} / ${entry.contextGroupLabel || entry.groupLabel}`
-        : entry.contextGroupLabel || entry.groupLabel;
-      button.innerHTML = `
-        <div class="setting-search-result__group">${highlightSettingSearchText(metaLabel, trimmed)}</div>
-        <div class="setting-search-result__title">${highlightSettingSearchText(entry.title || entry.name, trimmed)}</div>
-        ${entry.name && entry.name !== entry.title ? `<div class="setting-search-result__name">${highlightSettingSearchText(entry.name, trimmed)}</div>` : ""}
-        ${entry.descr ? `<div class="setting-search-result__descr">${highlightSettingSearchText(entry.descr, trimmed)}</div>` : ""}
-      `;
-      button.onclick = async () => {
-        try {
-          pendingSettingFocus = { group: entry.group, name: entry.name };
-          if (entry.source === "profile" && entry.profileId && entry.originalGroup) {
-            settingProfileSectionExpandedState.set(`${entry.profileId}:${entry.originalGroup}`, true);
-          }
-          closeSettingSearchPanel({ syncHistory: false });
-          if (CURRENT_GROUP === entry.group && !CURRENT_SETTING_DETAIL && screenItems && screenItems.style.display !== "none") {
-            focusSettingItem(entry.name);
-            return;
-          }
-          await activateSettingGroup(entry.group, true);
-        } catch (e) {
-          showAppToast(e.message || "Search jump failed", { tone: "error" });
-        }
-      };
-      sectionBody.appendChild(button);
-    });
-  });
-}
-
 async function openSettingSearchPanel(options = {}) {
+  // Single gate for every entry point (FAB menu, profile card, history).
+  if (!SETTING_OVERLAY_SEARCH_ENABLED) return;
   const pushHistory = options.pushHistory !== false;
   const scope = options.scope || { type: "all", profileId: "" };
   if (CURRENT_PAGE !== "setting") return;
@@ -2286,17 +2152,9 @@ async function openSettingSearchPanel(options = {}) {
     }
   }
   await loadSettingProfiles();
-  settingSearchScope = {
-    type: scope.type === "profile" && scope.profileId ? "profile" : "all",
-    profileId: scope.type === "profile" && scope.profileId ? String(scope.profileId) : "",
-  };
+  const activeScope = settingSearchPanelView.setScope(scope);
   rebuildSettingSearchEntries();
-  if (!settingSearchPanel) return;
-  mountSettingSearchOverlay();
-  settingSearchPanel.hidden = false;
-  settingSearchPanel.setAttribute("aria-hidden", "false");
-  if (settingSearchBackdrop) settingSearchBackdrop.hidden = false;
-  syncSettingSearchFabState();
+  settingSearchPanelView.show();
   const state = history.state || {};
   if (pushHistory && !(state.page === "setting" && state.search)) {
     history.pushState({
@@ -2305,22 +2163,11 @@ async function openSettingSearchPanel(options = {}) {
       group: CURRENT_GROUP || null,
       settingName: CURRENT_SETTING_DETAIL || null,
       search: true,
-      searchScope: settingSearchScope.type,
-      profileId: settingSearchScope.profileId || null,
+      searchScope: activeScope.type,
+      profileId: activeScope.profileId || null,
     }, "");
   }
   syncModalBodyLock();
-  if (settingSearchInput) {
-    settingSearchInput.placeholder = settingSearchScope.type === "profile"
-      ? getUIText("setting_profile_search_placeholder", "Search in this profile")
-      : getUIText("setting_search_placeholder", "Search name, description, group");
-    settingSearchInput.setAttribute("aria-label", getSettingSearchScopeLabel());
-  }
-  renderSettingSearchResults(settingSearchInput?.value || "");
-  requestAnimationFrame(() => {
-    settingSearchInput?.focus({ preventScroll: true });
-    settingSearchInput?.select();
-  });
 }
 
 if (btnSettingSearch) {
@@ -2339,6 +2186,8 @@ if (btnSettingSearch) {
 }
 
 if (btnSettingFabSearch) {
+  // Hidden with the retired overlay search; the flag restores both together.
+  btnSettingFabSearch.hidden = !SETTING_OVERLAY_SEARCH_ENABLED;
   btnSettingFabSearch.onclick = () => {
     closeSettingFabMenu();
     openSettingSearchPanel().catch(() => {});
@@ -2348,6 +2197,99 @@ if (btnSettingFabSearch) {
 if (btnSettingFabProfileAdd) {
   btnSettingFabProfileAdd.onclick = () => {
     createSettingProfileFromCurrent().catch(() => {});
+  };
+}
+
+// One screen that answers "is my configuration still what it was, and can I
+// trust the change history?" — the two questions nobody could answer while
+// settings were drifting.
+if (btnSettingFabFingerprint) {
+  btnSettingFabFingerprint.onclick = async () => {
+    closeSettingFabMenu();
+    try {
+      const [fingerprint, integrity, recent] = await Promise.all([
+        getJson("/api/param_fingerprint"),
+        getJson("/api/param_changes/verify"),
+        // Over-fetch so 12 real settings remain after synthetic keys are dropped.
+        getJson("/api/param_changes?limit=60").catch(() => ({ changes: [] })),
+      ]);
+      // Show only real settings, dropping any leftover records for synthetic
+      // keys (GitPullTime) or hardware values (DeviceType) already in the log
+      // from before they were filtered out. This hides them without a reboot.
+      const settingChanges = (recent.changes || [])
+        .filter((record) => findSettingItemByName(record?.name))
+        .slice(0, 12);
+      // Each row is shown by its human title (not the internal key) and its
+      // value is formatted the same way the settings screen shows it (units,
+      // ON/OFF), so a non-developer reads "타이어공기압 표시  꺼짐 → 켜짐"
+      // instead of "ShowTpms  0 → 1".
+      const historyHtml = carrotSettingsRuntime.history.renderHtml(settingChanges, {
+        escape: escapeHtml,
+        text: getUIText,
+        locale: LANG === "ko" ? "ko-KR" : undefined,
+        withName: true,
+        displayName: (record) => {
+          const item = findSettingItemByName(record?.name)?.item;
+          return settingItemTitle(item, record?.name || "") || record?.name || "";
+        },
+        formatValue: (value) => String(value ?? ""),
+        formatFor: (record, value) => {
+          const item = findSettingItemByName(record?.name)?.item;
+          return item ? formatSettingPopularValue(item, value) : String(value ?? "");
+        },
+      });
+      // Summary (code + one-line meaning + count/integrity note) is a pure,
+      // tested module; the page only supplies the fetched data and formatters.
+      const summaryHtml = carrotSettingsRuntime.fingerprint.renderSummary(
+        {
+          fingerprint: fingerprint.fingerprint,
+          count: fingerprint.count,
+          integrity,
+          baseline: fingerprint.baseline,
+          changed: fingerprint.changed,
+          changed_count: fingerprint.changed_count,
+        },
+        { escape: escapeHtml, text: getUIText },
+      );
+      // "지금을 기준으로" saves the current settings as the reference. The
+      // dialog has no per-button hook, so the click is delegated while it is
+      // open and detached when it closes.
+      const onBaselineSave = async (event) => {
+        const button = event.target.closest("[data-setting-fingerprint-save]");
+        if (!button) return;
+        button.disabled = true;
+        try {
+          await postJson("/api/param_fingerprint/baseline", {});
+          const status = button.parentElement?.querySelector(".setting-fingerprint__status");
+          if (status) {
+            status.className = "setting-fingerprint__status setting-fingerprint__status--same";
+            status.textContent = getUIText("setting_fingerprint_same", "기준과 같아요");
+          }
+          button.remove();
+          showAppToast(getUIText("setting_fingerprint_saved", "지금 설정을 기준으로 저장했어요"));
+        } catch (err) {
+          button.disabled = false;
+          showAppToast(err?.message || getUIText("failed", "Failed"), { tone: "error" });
+        }
+      };
+      document.addEventListener("click", onBaselineSave);
+      try {
+        await openAppDialog({
+          mode: "alert",
+          title: getUIText("setting_fingerprint_title", "설정 코드"),
+          html: true,
+          messageHtml: summaryHtml
+            + `<div class="setting-fingerprint-history">`
+            + `<div class="setting-fingerprint-history__title">`
+            + `${escapeHtml(getUIText("setting_fingerprint_recent", "최근 바뀐 설정"))}</div>${historyHtml}</div>`,
+          confirmLabel: getUIText("ok", "OK"),
+        });
+      } finally {
+        document.removeEventListener("click", onBaselineSave);
+      }
+    } catch (e) {
+      showAppToast(e?.message || getUIText("failed", "Failed"), { tone: "error" });
+    }
   };
 }
 
@@ -2391,35 +2333,9 @@ if (btnSettingFabResetDefaults) {
   };
 }
 
-if (settingSearchBackdrop) {
-  settingSearchBackdrop.onclick = () => closeSettingSearchPanel({ syncHistory: true });
-}
-
-if (settingSearchForm) {
-  settingSearchForm.addEventListener("submit", (e) => {
-    e.preventDefault();
-    const firstResult = settingSearchResults?.querySelector("button.setting-search-result");
-    if (firstResult) firstResult.click();
-  });
-}
-
-if (settingSearchInput) {
-  settingSearchInput.addEventListener("input", () => {
-    if (settingSearchDebounceTimer) clearTimeout(settingSearchDebounceTimer);
-    settingSearchDebounceTimer = window.setTimeout(() => {
-      settingSearchDebounceTimer = null;
-      renderSettingSearchResults(settingSearchInput.value);
-    }, 70);
-  });
-}
-
 window.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && settingSearchPanel && !settingSearchPanel.hidden) {
+  if (e.key === "Escape" && settingSearchPanelView.isOpen()) {
     closeSettingSearchPanel({ syncHistory: true });
-    return;
-  }
-  if (e.key === "Escape" && document.querySelector(".setting-profile-menu.is-open")) {
-    closeSettingProfileActionMenus();
     return;
   }
   if (e.key === "Escape" && settingFabMenuOpen) {
@@ -2428,9 +2344,6 @@ window.addEventListener("keydown", (e) => {
 });
 
 document.addEventListener("pointerdown", (e) => {
-  if (!(e.target instanceof Element) || !e.target.closest(".setting-profile-menu")) {
-    closeSettingProfileActionMenus();
-  }
   if (settingFabMenuOpen && settingFabMenu && !settingFabMenu.contains(e.target)) {
     closeSettingFabMenu();
   }
@@ -2531,8 +2444,18 @@ async function transitionSettingItemsContent(renderContent, direction = "forward
 
 async function activateSettingGroup(group, pushHistory = true, options = {}) {
   if (!isCarrotSettingTabActive()) return;
+  if (
+    group === SETTING_INLINE_SEARCH_GROUP
+    && !isCompactLandscapeMode()
+    && typeof showSettingInlineSearchResultsInGroups === "function"
+  ) {
+    // Single-column layout: the search group is shown in place under its field.
+    await showSettingInlineSearchResultsInGroups();
+    return;
+  }
   const nextGroup = group || CURRENT_GROUP;
   const previousGroup = CURRENT_GROUP;
+  if (group === SETTING_INLINE_SEARCH_GROUP && CURRENT_SETTING_DETAIL) settingValueRepository.invalidateGroup(group);
   CURRENT_SETTING_DETAIL = null;
   const scrollMode = options.scrollMode || "top";
   const animateItems = options.animateItems !== false;
@@ -2607,6 +2530,7 @@ async function activateSettingGroup(group, pushHistory = true, options = {}) {
 }
 
 function selectGroup(group, pushHistory = true) {
+  exitSettingInlineSearchSurface();
   const shouldPush = pushHistory && !(isCompactLandscapeMode() && CURRENT_PAGE === "setting");
   const options = (isCompactLandscapeMode() && CURRENT_PAGE === "setting")
     ? { animateGroups: false }
@@ -2614,10 +2538,33 @@ function selectGroup(group, pushHistory = true) {
   activateSettingGroup(group, shouldPush, options).catch((e) => console.log("[Setting] selectGroup failed:", e));
 }
 
+function bindSettingProfileSectionToggle(rendered, stateKey) {
+  const { section, header } = rendered || {};
+  if (!section || !header) return;
+  header.onclick = () => {
+    const nextExpanded = section.classList.contains("is-collapsed");
+    section.classList.remove("is-expanding", "is-collapsing");
+    if (section.__settingProfileMotionTimer) {
+      window.clearTimeout(section.__settingProfileMotionTimer);
+    }
+    void section.offsetWidth;
+    section.classList.toggle("is-collapsed", !nextExpanded);
+    section.classList.add(nextExpanded ? "is-expanding" : "is-collapsing");
+    settingProfileSectionExpandedState.set(stateKey, nextExpanded);
+    header.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
+    section.__settingProfileMotionTimer = window.setTimeout(() => {
+      section.classList.remove("is-expanding", "is-collapsing");
+      section.__settingProfileMotionTimer = null;
+    }, 280);
+  };
+}
+
 async function renderItems(group, options = {}) {
   if (!isCarrotSettingTabActive()) return;
   const meta = document.getElementById("groupMeta");
-  const itemsBox = document.getElementById("items");
+  // Search results render into the in-place surface when the caller passes a
+  // container (single-column layout); everything else owns the items screen.
+  const itemsBox = options.container || document.getElementById("items");
   const renderToken = ++settingRenderToken;
   const detailName = String(options.detailName || "").trim();
   const detailMode = Boolean(detailName);
@@ -2625,13 +2572,11 @@ async function renderItems(group, options = {}) {
   const animateItems = options.animateItems !== false;
   const allowHidden = options.allowHidden === true;
   const requestedScrollTop = Number.isFinite(options.scrollTop) ? options.scrollTop : null;
-  itemsBox.innerHTML = "";
-  delete itemsBox.dataset.renderedGroup;
-  delete itemsBox.dataset.renderedDetail;
+  destroySettingProfileActionMenus();
 
   const allEntries = getSettingItemEntriesForGroup(group);
   const detailEntry = detailMode ? getSettingDetailEntry(group, detailName) : null;
-  const entries = detailMode ? (detailEntry ? [detailEntry] : []) : allEntries;
+  const entries = detailMode ? (detailEntry ? getSettingDetailEntries(group, detailName) : []) : allEntries;
   const list = entries.map((entry) => entry.item);
   const profile = getSettingProfileByGroup(group);
   if (screenItems) screenItems.classList.toggle("setting-screen-items--profile", Boolean(profile));
@@ -2639,11 +2584,15 @@ async function renderItems(group, options = {}) {
   CURRENT_SETTING_DETAIL = detailMode ? detailName : null;
   const groupLabel = getSettingGroupLabel(group);
   const detailTitle = detailMode && list[0] ? getSettingDetailTitle(list[0]) : "";
+  if (group === SETTING_INLINE_SEARCH_GROUP) {
+    history.replaceState({ ...history.state, inlineSearchQuery: settingInlineSearchQuery }, "");
+  }
   settingTitle.textContent = (UI_STRINGS[LANG].setting || "Setting") + " - " + (detailTitle || groupLabel);
   setSettingItemsTitle(detailTitle || groupLabel);
   if (meta) {
     meta.classList.remove("setting-profile-meta");
-    meta.textContent = profile && !detailMode ? "" : `${group} / ${detailMode ? "1" : list.length}`;
+    meta.textContent = group === SETTING_INLINE_SEARCH_GROUP && !detailMode ? getSettingInlineSearchCountLabel()
+      : profile && !detailMode ? "" : `${group} / ${detailMode ? "1" : list.length}`;
   }
 
   let values = {};
@@ -2665,18 +2614,19 @@ async function renderItems(group, options = {}) {
     return;
   }
 
+  // Clear only once the fresh values are ready: the inline search re-enters
+  // here on every debounced keystroke, and emptying the list up front made
+  // each keystroke flash like a full refresh.
+  itemsBox.innerHTML = "";
+  delete itemsBox.dataset.renderedGroup;
+  delete itemsBox.dataset.renderedDetail;
+  itemsBox.dataset.renderedSearchQuery = group === SETTING_INLINE_SEARCH_GROUP ? settingInlineSearchQuery : "";
+
   if (!list.length && detailMode) {
-    const empty = document.createElement("div");
-    empty.className = "setting-favorites-empty";
-    const emptyTitle = document.createElement("div");
-    emptyTitle.className = "setting-favorites-empty__title";
-    emptyTitle.textContent = getUIText("setting_not_found", "Setting not found");
-    const emptyDesc = document.createElement("div");
-    emptyDesc.className = "setting-favorites-empty__desc";
-    emptyDesc.textContent = detailName;
-    empty.appendChild(emptyTitle);
-    empty.appendChild(emptyDesc);
-    itemsBox.appendChild(empty);
+    settingViewRuntime.renderEmptyState(itemsBox, {
+      title: getUIText("setting_not_found", "Setting not found"),
+      description: detailName,
+    });
     itemsBox.dataset.renderedGroup = group;
     itemsBox.dataset.renderedDetail = detailName;
     requestAnimationFrame(resetSettingItemsViewport);
@@ -2684,20 +2634,13 @@ async function renderItems(group, options = {}) {
   }
 
   if (!list.length && isSettingFavoritesGroup(group)) {
-    const empty = document.createElement("div");
-    empty.className = "setting-favorites-empty";
-    const emptyTitle = document.createElement("div");
-    emptyTitle.className = "setting-favorites-empty__title";
-    emptyTitle.textContent = getUIText("setting_favorites_empty_title", "No favorites");
-    const emptyDesc = document.createElement("div");
-    emptyDesc.className = "setting-favorites-empty__desc";
-    emptyDesc.textContent = getUIText(
-      "setting_favorites_empty_desc",
-      "Long press a setting to add it. Long press again to remove it.",
-    );
-    empty.appendChild(emptyTitle);
-    empty.appendChild(emptyDesc);
-    itemsBox.appendChild(empty);
+    settingViewRuntime.renderEmptyState(itemsBox, {
+      title: getUIText("setting_favorites_empty_title", "No favorites"),
+      description: getUIText(
+        "setting_favorites_empty_desc",
+        "Long press a setting to add it. Long press again to remove it.",
+      ),
+    });
     itemsBox.dataset.renderedGroup = group;
     requestAnimationFrame(resetSettingItemsViewport);
     return;
@@ -2705,130 +2648,47 @@ async function renderItems(group, options = {}) {
 
   if (profile && !detailMode) appendSettingProfileHeader(profile, itemsBox);
 
-  const profileSectionCounts = new Map();
-  if (profile) {
-    entries.forEach((entry) => {
-      profileSectionCounts.set(entry.group, (profileSectionCounts.get(entry.group) || 0) + 1);
+  if (!list.length && group === SETTING_INLINE_SEARCH_GROUP) {
+    settingViewRuntime.renderEmptyState(itemsBox, {
+      title: getUIText("setting_search_empty", "No matching settings found."),
+      description: getUIText("setting_inline_search_hint", "Search names, descriptions and groups · Up to 20 results"),
     });
-  }
-  let lastProfileGroup = "";
-  let currentProfileSectionBody = null;
-  let lastCategorySectionKey = null;
-  let currentCategoryCardBody = null;
-
-  if (detailMode && list.length) {
-    const detailBlock = document.createElement("section");
-    detailBlock.className = animateItems ? "setting-section-block ui-stagger-item" : "setting-section-block";
-    if (animateItems) detailBlock.style.setProperty("--i", "1");
-    const detailCard = document.createElement("div");
-    detailCard.className = "setting-group-card";
-    const detailBody = document.createElement("div");
-    detailBody.className = "setting-group-card__body";
-    detailCard.appendChild(detailBody);
-    detailBlock.appendChild(detailCard);
-    itemsBox.appendChild(detailBlock);
-    currentCategoryCardBody = detailBody;
+    itemsBox.dataset.renderedGroup = group;
+    requestAnimationFrame(resetSettingItemsViewport);
+    return;
   }
 
-  // 즐겨찾기도 다른 하위메뉴와 같은 카드 박스(공통분모: setting-section-block +
-  // setting-group-card)에 담는다. 즐겨찾기는 소-섹션이 섞여 있으므로 단일 카드 1개로.
-  if (!detailMode && isSettingFavoritesGroup(group) && list.length) {
-    const favBlock = document.createElement("section");
-    favBlock.className = animateItems ? "setting-section-block ui-stagger-item" : "setting-section-block";
-    if (animateItems) favBlock.style.setProperty("--i", "1");
-    const favCard = document.createElement("div");
-    favCard.className = "setting-group-card";
-    const favBody = document.createElement("div");
-    favBody.className = "setting-group-card__body";
-    favCard.appendChild(favBody);
-    favBlock.appendChild(favCard);
-    itemsBox.appendChild(favBlock);
-    currentCategoryCardBody = favBody;
-  }
+  // Keep layout decisions independent from row controls: the plan opens a new
+  // detail/favorites/category/profile container only where the structure changes.
+  const itemLayout = settingViewRuntime.createItemLayoutPlan({
+    entries,
+    group,
+    detailMode,
+    profile,
+    favoriteMode: isSettingFavoritesGroup(group),
+    searchMode: group === SETTING_INLINE_SEARCH_GROUP,
+    getItemContextLabel: (originGroup, item) => getSettingDerivedModel().getItemContextLabel(originGroup, item),
+    getSectionLabel: settingNodeLabel,
+    getGroupLabel: getSettingGroupLabel,
+    getProfileSectionExpanded: (stateKey) => settingProfileSectionExpandedState.has(stateKey)
+      ? settingProfileSectionExpandedState.get(stateKey)
+      : true,
+  });
+  let currentItemContainer = itemsBox;
 
-  list.forEach((p, index) => {
+  itemLayout.rows.forEach((rowPlan) => {
+    const { item: p, index, originGroup } = rowPlan;
     const name = p.name;
-    const originGroup = entries[index]?.group || group;
     getSettingUnitIndex(name);
 
-    // 카테고리 모드: 소-섹션마다 카드(그룹박스) 생성 (프로필/즐겨찾기 뷰 제외).
-    // 라벨이 있으면 카드 제목으로, 없으면(단일 직속 섹션) 제목 없는 카드.
-    if (!detailMode && !profile && !isSettingFavoritesGroup(group) && p.__section) {
-      const secKey = p.__section.id || "";
-      if (secKey !== lastCategorySectionKey) {
-        lastCategorySectionKey = secKey;
-        const sectionBlock = document.createElement("section");
-        sectionBlock.className = animateItems ? "setting-section-block ui-stagger-item" : "setting-section-block";
-        sectionBlock.dataset.settingSectionId = secKey;
-        if (animateItems) sectionBlock.style.setProperty("--i", String(Math.min(index + 1, 14)));
-        const cardLabel = settingNodeLabel(p.__section);
-        if (cardLabel) {
-          const cardTitle = document.createElement("div");
-          cardTitle.className = "setting-group-card__title";
-          cardTitle.textContent = cardLabel;
-          sectionBlock.appendChild(cardTitle);
-        }
-        const card = document.createElement("div");
-        card.className = "setting-group-card";
-        const cardBody = document.createElement("div");
-        cardBody.className = "setting-group-card__body";
-        card.appendChild(cardBody);
-        sectionBlock.appendChild(card);
-        itemsBox.appendChild(sectionBlock);
-        currentCategoryCardBody = cardBody;
+    if (rowPlan.section) {
+      const renderedSection = settingViewRuntime.appendItemSection(itemsBox, rowPlan.section, {
+        animate: animateItems,
+      });
+      currentItemContainer = renderedSection?.body || itemsBox;
+      if (rowPlan.section.kind === "profile") {
+        bindSettingProfileSectionToggle(renderedSection, rowPlan.section.key);
       }
-    }
-
-    if (!detailMode && profile && originGroup !== lastProfileGroup) {
-      lastProfileGroup = originGroup;
-      const section = document.createElement("div");
-      section.className = animateItems ? "setting-section-block setting-profile-section ui-stagger-item" : "setting-section-block setting-profile-section";
-      if (animateItems) section.style.setProperty("--i", String(Math.min(index + 1, 14)));
-      const stateKey = `${profile.id}:${originGroup}`;
-      const expanded = settingProfileSectionExpandedState.has(stateKey)
-        ? settingProfileSectionExpandedState.get(stateKey)
-        : true;
-      const sectionLabel = getSettingGroupLabel(originGroup);
-      const sectionCount = profileSectionCounts.get(originGroup) || 0;
-      section.classList.toggle("is-collapsed", !expanded);
-
-      const header = document.createElement("button");
-      header.type = "button";
-      header.className = "setting-profile-section__header";
-      header.setAttribute("aria-expanded", expanded ? "true" : "false");
-      header.innerHTML = `
-        <span class="setting-profile-section__label">${settingsDiffEscape(sectionLabel)}</span>
-        <span class="setting-profile-section__count">${settingsDiffEscape(sectionCount)}</span>
-        <svg class="setting-profile-section__chevron" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
-          <path d="m6 9 6 6 6-6"></path>
-        </svg>
-      `;
-      const body = document.createElement("div");
-      body.className = "setting-profile-section__body";
-      const bodyInner = document.createElement("div");
-      bodyInner.className = "setting-group-card setting-group-card__body setting-profile-section__bodyInner";
-      header.onclick = () => {
-        const wasCollapsed = section.classList.contains("is-collapsed");
-        const nextExpanded = wasCollapsed;
-        section.classList.remove("is-expanding", "is-collapsing");
-        if (section.__settingProfileMotionTimer) {
-          window.clearTimeout(section.__settingProfileMotionTimer);
-        }
-        void section.offsetWidth;
-        section.classList.toggle("is-collapsed", !nextExpanded);
-        section.classList.add(nextExpanded ? "is-expanding" : "is-collapsing");
-        settingProfileSectionExpandedState.set(stateKey, nextExpanded);
-        header.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
-        section.__settingProfileMotionTimer = window.setTimeout(() => {
-          section.classList.remove("is-expanding", "is-collapsing");
-          section.__settingProfileMotionTimer = null;
-        }, 280);
-      };
-      body.appendChild(bodyInner);
-      section.appendChild(header);
-      section.appendChild(body);
-      itemsBox.appendChild(section);
-      currentProfileSectionBody = bodyInner;
     }
 
     const title = formatItemText(p, "title", "etitle", "");
@@ -2843,6 +2703,11 @@ async function renderItems(group, options = {}) {
     if (animateItems) el.style.setProperty("--i", String(index));
     el.dataset.settingName = name;
     el.dataset.settingGroup = originGroup;
+    if (detailMode && p.detail_parent) {
+      el.dataset.detailParent = p.detail_parent;
+      el.dataset.detailSection = p.detail_section || "";
+      el.classList.add("setting--detail-child");
+    }
     el.classList.toggle("is-favorite", isSettingFavorite(name));
 
     const top = document.createElement("div");
@@ -2850,9 +2715,14 @@ async function renderItems(group, options = {}) {
 
     const left = document.createElement("div");
     left.className = "setting-copy";
+    // A "risk" field on the parameter (carrot_settings.json) renders a warning
+    // badge next to its title — declared in data, so no code change is needed
+    // to mark a parameter risky.
+    const riskBadge = carrotSettingsRuntime.risk.renderBadge(p, { escape: escapeHtml, text: getUIText });
     left.innerHTML = `
       <div class="setting-title-row">
         ${settingMarqueeHtml(title, "title")}
+        ${riskBadge}
         ${renderSettingFavoriteMark(name)}
       </div>
       ${settingMarqueeHtml(name, "name")}
@@ -2860,112 +2730,34 @@ async function renderItems(group, options = {}) {
     `;
 
     const controlConfig = getSettingControlConfig(p);
+    top.classList.toggle("settingTop--choices", controlConfig.kind === "segmented" && Boolean(p.options));
     const compactNumeric = controlConfig.kind === "slider";
-    const ctrl = document.createElement("div");
-    ctrl.className = `ctrl ctrl--${compactNumeric ? "value" : controlConfig.kind}`;
+    // The markup comes from the shared component; this file keeps the wiring.
+    const control = window.CarrotUI.settingRow.createControl({
+      document,
+      kind: compactNumeric ? "stepper" : controlConfig.kind,
+      label: title || name,
+      valueLabel: getUIText("setting_value_edit", "Edit value"),
+      previousLabel: getUIText("setting_value_previous", "Previous value"),
+      nextLabel: getUIText("setting_value_next", "Next value"),
+      optionValues: controlConfig.kind === "segmented" ? getSettingOptionValues(name, controlConfig) : [],
+      optionLabel: (optionValue) => getSettingOptionLabel(name, optionValue),
+      min: controlConfig.min,
+      max: controlConfig.max,
+      step: controlConfig.unit,
+    });
 
-    const val = document.createElement("button");
-    val.type = "button";
-    val.className = compactNumeric ? "value-surface val setting-value-compact" : "value-surface val";
-    val.setAttribute("aria-label", getUIText("setting_value_edit", "Edit value"));
-
-    let btnMinus = null;
-    let btnPlus = null;
-    let unitBtn = null;
-    let sliderInput = null;
-    let toggleInput = null;
-    let selectInput = null;
-    const segmentButtons = [];
-
-    if (controlConfig.kind === "toggle") {
-      const switchLabel = document.createElement("label");
-      switchLabel.className = "c-switch";
-      toggleInput = document.createElement("input");
-      toggleInput.type = "checkbox";
-      toggleInput.className = "c-switch__input";
-      toggleInput.setAttribute("aria-label", title || name);
-      const switchTrack = document.createElement("span");
-      switchTrack.className = "c-switch__track";
-      switchLabel.appendChild(toggleInput);
-      switchLabel.appendChild(switchTrack);
-      ctrl.appendChild(switchLabel);
-      ctrl.appendChild(val);
-    } else if (controlConfig.kind === "segmented") {
-      const segmentWrap = document.createElement("div");
-      segmentWrap.className = "setting-segments";
-      getSettingOptionValues(name, controlConfig).forEach((optionValue) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "setting-segment";
-        button.dataset.value = String(optionValue);
-        button.textContent = getSettingOptionLabel(name, optionValue);
-        button.setAttribute("aria-pressed", "false");
-        segmentButtons.push(button);
-        segmentWrap.appendChild(button);
-      });
-      ctrl.appendChild(segmentWrap);
-      ctrl.appendChild(val);
-    } else if (controlConfig.kind === "select") {
-      selectInput = document.createElement("button");
-      selectInput.type = "button";
-      selectInput.className = "setting-select setting-select--button";
-      selectInput.setAttribute("aria-label", title || name);
-      selectInput.setAttribute("aria-haspopup", "dialog");
-      ctrl.appendChild(selectInput);
-      ctrl.appendChild(val);
-    } else if (compactNumeric) {
-      btnMinus = document.createElement("button");
-      btnMinus.type = "button";
-      btnMinus.className = "smallBtn setting-value-arrow setting-value-arrow--prev";
-      btnMinus.textContent = "-";
-      btnMinus.setAttribute("aria-label", getUIText("setting_value_previous", "Previous value"));
-
-      btnPlus = document.createElement("button");
-      btnPlus.type = "button";
-      btnPlus.className = "smallBtn setting-value-arrow setting-value-arrow--next";
-      btnPlus.textContent = "+";
-      btnPlus.setAttribute("aria-label", getUIText("setting_value_next", "Next value"));
-
-      unitBtn = document.createElement("button");
-      unitBtn.type = "button";
-      unitBtn.className = "setting-unit-cycle";
-      setSettingUnitButtonLabel(unitBtn, name);
-
-      ctrl.appendChild(btnMinus);
-      ctrl.appendChild(val);
-      ctrl.appendChild(btnPlus);
-    } else {
-      const sliderWrap = document.createElement("div");
-      sliderWrap.className = "setting-slider";
-      sliderInput = document.createElement("input");
-      sliderInput.type = "range";
-      sliderInput.className = "setting-slider__input";
-      sliderInput.min = String(controlConfig.min);
-      sliderInput.max = String(controlConfig.max);
-      sliderInput.step = String(controlConfig.unit);
-      sliderInput.setAttribute("aria-label", title || name);
-      sliderWrap.appendChild(sliderInput);
-
-      btnMinus = document.createElement("button");
-      btnMinus.type = "button";
-      btnMinus.className = "smallBtn setting-step setting-step--minus";
-      btnMinus.textContent = "-";
-
-      btnPlus = document.createElement("button");
-      btnPlus.type = "button";
-      btnPlus.className = "smallBtn setting-step setting-step--plus";
-      btnPlus.textContent = "+";
-
-      unitBtn = document.createElement("button");
-      unitBtn.type = "button";
-      unitBtn.className = "setting-unit-cycle";
-      setSettingUnitButtonLabel(unitBtn, name);
-
-      ctrl.appendChild(sliderWrap);
-      ctrl.appendChild(btnMinus);
-      ctrl.appendChild(val);
-      ctrl.appendChild(btnPlus);
-    }
+    const ctrl = control.ctrl;
+    const val = control.value;
+    const btnMinus = control.minusButton;
+    const btnPlus = control.plusButton;
+    const unitBtn = control.unitButton;
+    const sliderInput = control.sliderInput;
+    const toggleInput = control.toggleInput;
+    const selectInput = control.selectInput;
+    const segmentGroup = control.segmentGroup;
+    const segmentButtons = control.segmentButtons;
+    if (unitBtn) setSettingUnitButtonLabel(unitBtn, name);
 
     const popularEntry = getSettingPopularDisplayEntry(p, getSettingPopularValue(name));
     const popularText = renderSettingPopularChipText(p, popularEntry);
@@ -2982,12 +2774,43 @@ async function renderItems(group, options = {}) {
     el.appendChild(d);
 
     const popularTopValues = Array.isArray(popularEntry?.top_values) ? popularEntry.top_values : [];
+    let contextPanel = null;
     let popularDetail = null;
-    if (detailMode && popularTopValues.length) {
-      popularDetail = document.createElement("div");
-      popularDetail.className = "setting-popular-detail-block";
-      popularDetail.innerHTML = renderSettingPopularDetailHtml(p, popularEntry);
-      el.appendChild(popularDetail);
+    let historyBlock = null;
+    let historyFullBlock = null;
+    if (detailMode && index === 0) {
+      contextPanel = settingContextRuntime.create({
+        document,
+        text: getUIText,
+        locale: settingDocumentationRuntime.normalizeLanguage(LANG),
+      });
+      if (popularTopValues.length) {
+        popularDetail = document.createElement("div");
+        popularDetail.className = "setting-popular-detail-block";
+        popularDetail.innerHTML = renderSettingPopularDetailHtml(p, popularEntry);
+        contextPanel.setContent("popular", popularDetail);
+      } else {
+        contextPanel.setEmpty(
+          "popular",
+          getUIText("setting_context_popular_empty", "No popular-value data is available yet."),
+        );
+      }
+
+      historyBlock = document.createElement("div");
+      historyBlock.className = "setting-history-detail-block";
+      historyFullBlock = document.createElement("div");
+      historyFullBlock.className = "setting-history-detail-block";
+      if (profile) {
+        contextPanel.setEmpty(
+          "history",
+          getUIText("setting_context_history_empty", "No changes have been recorded yet."),
+        );
+      } else {
+        contextPanel.setLoading(
+          "history",
+          getUIText("setting_context_loading", "Loading..."),
+        );
+      }
     }
 
     // Footer actions row: optional unit-cycle (배율) plus a reset-to-default
@@ -3055,7 +2878,14 @@ async function renderItems(group, options = {}) {
     el.classList.add("setting--has-actions");
     el.appendChild(actions);
 
-    (currentProfileSectionBody || currentCategoryCardBody || itemsBox).appendChild(el);
+    currentItemContainer.appendChild(el);
+    if (contextPanel) {
+      // The setting control and its supplementary information are independent
+      // surfaces. Keep the context panel outside the setting card so the DOM
+      // structure matches the visual hierarchy at every viewport size.
+      itemsBox.appendChild(contextPanel.root);
+      loadSettingDocumentationPanel(contextPanel, name, renderToken);
+    }
 
     const cur = (name in values) ? values[name] : p.default;
     syncSettingControlState(el, cur);
@@ -3071,19 +2901,69 @@ async function renderItems(group, options = {}) {
         return matched || null;
       }
 
-      const num = Number(text);
-      if (!Number.isFinite(num)) return null;
-
-      const min = Number(p.min);
-      const max = Number(p.max);
-      let next = clamp(num, min, max);
-      if (Number.isInteger(min) && Number.isInteger(max)) {
-        next = Math.round(next);
-      }
-      return next;
+      return normalizeSettingNumericValue(text, p);
     }
 
-    async function commitSettingValue(next) {
+    async function refreshSettingHistory() {
+      if (!contextPanel || !historyBlock || !historyFullBlock || profile) return;
+      const runtimeHistory = carrotSettingsRuntime.history;
+      if (!runtimeHistory) return;
+      try {
+        const payload = await getJson(
+          `/api/param_changes?name=${encodeURIComponent(name)}`
+          + `&limit=${settingContextRuntime.historyFetchLimit}`,
+        );
+        const changes = Array.isArray(payload.changes) ? payload.changes : [];
+        const summaryChanges = changes.slice(0, settingContextRuntime.historyPreviewLimit);
+        const renderOptions = {
+          escape: escapeHtml,
+          text: getUIText,
+          locale: settingDocumentationRuntime.normalizeLanguage(LANG),
+          formatValue: (value) => formatSettingDisplayValue(p, value),
+        };
+        historyBlock.innerHTML = runtimeHistory.renderHtml(summaryChanges, renderOptions);
+        historyFullBlock.innerHTML = runtimeHistory.renderHtml(changes, renderOptions);
+        contextPanel.setHistoryContent(
+          historyBlock,
+          changes.length > summaryChanges.length ? historyFullBlock : null,
+          {
+            count: changes.length,
+            summaryCount: summaryChanges.length,
+            emptyMessage: getUIText(
+              "setting_context_history_empty",
+              "No changes have been recorded yet.",
+            ),
+          },
+        );
+        bindSettingHistoryUndo();
+      } catch (_) {
+        // History is supplementary: a failed read must not disturb the screen.
+        contextPanel.setEmpty(
+          "history",
+          getUIText("setting_context_history_empty", "No changes have been recorded yet."),
+        );
+      }
+    }
+
+    function bindSettingHistoryUndo() {
+      contextPanel?.root.querySelectorAll("[data-setting-history-undo]").forEach((button) => {
+        button.onclick = async (event) => {
+          event.stopPropagation();
+          const target = normalizeSettingValue(button.dataset.settingHistoryUndo);
+          if (target === null) return;
+          button.disabled = true;
+          try {
+            // The undo is itself a change, so it is recorded rather than
+            // erasing the entry it reverses.
+            await commitSettingValue(target, { source: "undo" });
+          } finally {
+            button.disabled = false;
+          }
+        };
+      });
+    }
+
+    async function commitSettingValue(next, commitOptions = {}) {
       try {
         if (profile) {
           const nextValues = { ...(profile.values || {}), [name]: next };
@@ -3094,13 +2974,14 @@ async function renderItems(group, options = {}) {
             profile.values = nextValues;
           }
         } else {
-          await setParam(name, next);
+          await setParam(name, next, commitOptions);
         }
         syncSettingControlState(el, next);
         val.dataset.committedValue = String(next);
         if (!profile) {
           cacheSettingValue(name, next, group);
           if (originGroup !== group) cacheSettingValue(name, next, originGroup);
+          refreshSettingHistory();
         }
       } catch (e) {
         showAppToast((UI_STRINGS[LANG].set_failed || "set failed: ") + e.message, { tone: "error" });
@@ -3138,110 +3019,22 @@ async function renderItems(group, options = {}) {
     }
 
     bindPopularDetailRows();
+    if (historyBlock) refreshSettingHistory();
 
-    async function applyDelta(sign) {
-      const step = getSettingUnitValue(name);
-      let curv = Number(val.dataset.rawValue);
-      if (Number.isNaN(curv)) curv = Number(p.default);
-
-      let next = curv + sign * step;
-      next = clamp(next, Number(p.min), Number(p.max));
-
-      if (Number.isInteger(Number(p.min)) && Number.isInteger(Number(p.max)) && Number.isInteger(step)) {
-        next = Math.round(next);
-      }
-
-      await commitSettingValue(next);
-    }
-
-    let deltaBusy = false;
-    async function requestDelta(sign) {
-      if (deltaBusy) return;
-      deltaBusy = true;
-      try {
-        await applyDelta(sign);
-      } finally {
-        deltaBusy = false;
-      }
-    }
-
-    function bindDeltaButton(button, sign) {
-      if (!button) return;
-
-      let holdTimer = null;
-      let repeatTimer = null;
-      let pointerActive = false;
-      let activePointerId = null;
-      let suppressClickUntil = 0;
-      const holdDelayMs = 900;
-      const repeatDelayMs = 160;
-      const clickSuppressMs = 450;
-
-      function clearTimers() {
-        if (holdTimer) {
-          clearTimeout(holdTimer);
-          holdTimer = null;
-        }
-        if (repeatTimer) {
-          clearTimeout(repeatTimer);
-          repeatTimer = null;
-        }
-      }
-
-      function stopHold() {
-        clearTimers();
-        pointerActive = false;
-        button.classList.remove("is-holding");
-        if (activePointerId !== null && typeof button.releasePointerCapture === "function") {
-          try {
-            button.releasePointerCapture(activePointerId);
-          } catch (_) {
-            /* pointer capture may already be released by the browser */
-          }
-        }
-        activePointerId = null;
-      }
-
-      function repeatDelta() {
-        if (!pointerActive) return;
-        requestDelta(sign);
-        repeatTimer = window.setTimeout(repeatDelta, repeatDelayMs);
-      }
-
-      button.addEventListener("pointerdown", (event) => {
-        if (event.button !== undefined && event.button !== 0) return;
-        event.stopPropagation();
-        event.preventDefault();
-        stopHold();
-        pointerActive = true;
-        activePointerId = event.pointerId;
-        suppressClickUntil = Date.now() + clickSuppressMs;
-        button.classList.add("is-holding");
-        if (typeof button.setPointerCapture === "function") {
-          try {
-            button.setPointerCapture(activePointerId);
-          } catch (_) {
-            /* pointer capture is best-effort for repeated input */
-          }
-        }
-        requestDelta(sign);
-        holdTimer = window.setTimeout(repeatDelta, holdDelayMs);
-      });
-
-      button.addEventListener("pointerup", (event) => {
-        event.stopPropagation();
-        suppressClickUntil = Date.now() + clickSuppressMs;
-        stopHold();
-      });
-      button.addEventListener("pointercancel", stopHold);
-      button.addEventListener("lostpointercapture", stopHold);
-      button.addEventListener("click", (event) => {
-        event.stopPropagation();
-        if (Date.now() < suppressClickUntil) {
-          event.preventDefault();
-          return;
-        }
-        requestDelta(sign);
+    // The −/+ buttons run on the shared commit gesture: a press only records
+    // where it started and the value is written on release, so a scroll that
+    // happens to begin on a button is handed back to the browser untouched.
+    // Step size still comes from the per-parameter x1 multiplier.
+    function bindDeltaButtons() {
+      if (!btnMinus && !btnPlus) return;
+      window.CarrotUI.numericStepper.create({
+        minusButton: btnMinus,
+        plusButton: btnPlus,
+        getValue: () => Number(val.dataset.rawValue),
+        getFallback: () => Number(p.default),
+        getStep: () => getSettingUnitValue(name),
+        getRange: () => ({ min: Number(p.min), max: Number(p.max) }),
+        commit: (next) => commitSettingValue(normalizeSettingNumericValue(next, p, Number(val.dataset.rawValue))),
       });
     }
 
@@ -3279,12 +3072,17 @@ async function renderItems(group, options = {}) {
           className: "setting-choice-option",
         };
       });
+      const choiceLayout = window.CarrotUI?.settingsChoiceDialog?.resolveLayout?.(p, { name }) || "list";
+      const currentLabel = getSettingOptionLabel(name, current);
+      const choiceMeta = choiceLayout === "list"
+        ? `${getUIText("setting_choice_current", "Current")}: ${currentLabel}`
+        : rangeMeta;
       const selected = await openAppDialog({
         mode: "choice",
-        choiceLayout: "value-grid",
+        choiceLayout,
         title: title || name,
         html: true,
-        messageHtml: `<div class="setting-choice-dialog">${escapeHtml(name)}<br>${escapeHtml(rangeMeta)}</div>`,
+        messageHtml: `<div class="setting-choice-dialog">${escapeHtml(choiceMeta)}</div>`,
         choices,
         cancelLabel: getUIText("cancel", "Cancel"),
         showCancel: true,
@@ -3309,8 +3107,7 @@ async function renderItems(group, options = {}) {
       };
     }
 
-    bindDeltaButton(btnMinus, -1);
-    bindDeltaButton(btnPlus, +1);
+    bindDeltaButtons();
 
     val.onclick = (event) => {
       event.stopPropagation();
@@ -3328,6 +3125,18 @@ async function renderItems(group, options = {}) {
         commitSettingValue(next);
       };
     });
+
+    // Reuse the app's segmented control for keyboard behaviour: roving
+    // tabindex plus arrow / Home / End navigation, which these buttons never
+    // had. No onActivate is passed on purpose — moving focus must not write a
+    // value. Activation stays with the native click, which Enter and Space
+    // already produce on a <button>.
+    if (segmentGroup && segmentButtons.length) {
+      window.CarrotUI?.segmentedControl?.create(segmentGroup, {
+        itemSelector: ".setting-segment",
+        selectedAttribute: "aria-pressed",
+      });
+    }
 
     if (selectInput) {
       selectInput.onclick = (event) => {
@@ -3353,7 +3162,7 @@ async function renderItems(group, options = {}) {
         if (el.dataset.settingSuppressClick === "1") return;
         if (isSettingValueControlHit(event, el)) return;
         if (isSettingInlineControlTarget(event.target)) return;
-        selectSettingDetail(originGroup, name).catch(() => {});
+        selectSettingDetail(group === SETTING_INLINE_SEARCH_GROUP ? group : originGroup, name).catch(() => {});
       };
     }
   });
@@ -3361,8 +3170,10 @@ async function renderItems(group, options = {}) {
   itemsBox.dataset.renderedGroup = group;
   if (detailMode) itemsBox.dataset.renderedDetail = detailName;
   scheduleSettingOverflowSync(itemsBox);
+  window.CarrotSettingsExtensions?.sync?.({ group, detailMode, detailName, root: itemsBox });
+  // Legacy panels are migrated into CarrotSettingsExtensions in later phases.
   window.CarrotMapboxTokenSettings?.sync?.();
-  window.CarrotYouTubeLiveSettings?.sync?.();
+  syncSettingLiveRefresh();
 
   if (pendingSettingFocus?.group === group) {
     requestAnimationFrame(() => focusSettingItem(pendingSettingFocus.name));
@@ -3378,8 +3189,7 @@ async function renderItems(group, options = {}) {
   });
 }
 
-function bindSettingFavoriteLongPress() {
-  const itemsBox = document.getElementById("items");
+function bindSettingFavoriteLongPressOn(itemsBox) {
   if (!itemsBox || itemsBox.dataset.favoriteLongPressBound === "1") return;
   itemsBox.dataset.favoriteLongPressBound = "1";
 
@@ -3442,13 +3252,20 @@ function bindSettingFavoriteLongPress() {
   });
 }
 
+// Favorite long-press and marquee drags follow the row surface: the items
+// screen plus the in-place search results on the group screen.
+function bindSettingFavoriteLongPress() {
+  bindSettingFavoriteLongPressOn(document.getElementById("items"));
+  bindSettingFavoriteLongPressOn(document.getElementById("settingInlineSearchResults"));
+}
+
 bindSettingFavoriteLongPress();
 
 // Let long titles / param names be panned left-right by the user. Automatic
 // movement uses transform, while manual movement uses scrollLeft; never allow
 // both coordinate systems to remain active at the same time.
 function bindSettingMarqueeDrag() {
-  ["items", "deviceItems"].forEach((id) => {
+  ["items", "deviceItems", "settingInlineSearchResults"].forEach((id) => {
     const box = document.getElementById(id);
     if (!box || box.dataset.marqueeDragBound === "1") return;
     box.dataset.marqueeDragBound = "1";
@@ -3574,6 +3391,13 @@ async function syncSettingViewportLayout(options = {}) {
 
   renderGroups({ animateGroups: animateChrome });
 
+  if (!splitLandscape && CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP && settingInlineSearchQuery && !CURRENT_SETTING_DETAIL) {
+    // A resize/orientation change while the in-place search surface is open:
+    // keep the results under the field instead of rebuilding the items screen.
+    await showSettingInlineSearchResultsInGroups({ animate: false });
+    return;
+  }
+
   if (splitLandscape) {
     const targetGroup = CURRENT_GROUP || getLandscapeDefaultSettingGroup();
     if (!targetGroup) return;
@@ -3619,19 +3443,8 @@ window.addEventListener("carrot:paramsrestored", (event) => {
   const values = event.detail?.values;
   if (!values || typeof values !== "object") return;
   const changedNames = new Set(Object.keys(values));
-  Object.entries(values).forEach(([name, value]) => cacheSettingValue(name, value));
+  settingValueRepository.applyValues(values);
   applyRestoredSettingValuesToRenderedItems(values);
-  for (const [group, cachedGroup] of settingGroupValueCache.entries()) {
-    if (!cachedGroup?.values) continue;
-    let touched = false;
-    changedNames.forEach((name) => {
-      if (name in cachedGroup.values) {
-        cachedGroup.values[name] = values[name];
-        touched = true;
-      }
-    });
-    if (touched) cachedGroup.loadedAt = Date.now();
-  }
 
   if (!CURRENT_GROUP || !isCarrotSettingTabActive()) return;
   const currentNames = new Set(getSettingGroupParamNames(CURRENT_GROUP));
@@ -3641,9 +3454,11 @@ window.addEventListener("carrot:paramsrestored", (event) => {
   const currentTop = getSettingItemsScrollTop();
   settingRestoreRefreshTimer = window.setTimeout(() => {
     settingRestoreRefreshTimer = null;
+    const container = getSettingItemRenderContainer(CURRENT_GROUP);
     renderItems(CURRENT_GROUP, {
+      container: container || undefined,
+      allowHidden: Boolean(container),
       detailName: CURRENT_SETTING_DETAIL || "",
-      forceValues: true,
       scrollMode: "restore",
       scrollTop: currentTop,
       animateItems: false,
@@ -3669,3 +3484,78 @@ if (window.visualViewport) {
 
 initSettingOverflowObservers();
 
+
+// ── Live value refresh ──────────────────────────────────────────────
+// Parameters are not only written by this screen: the steering-wheel gap
+// button changes MyDrivingMode and LongitudinalPersonality directly from the
+// driving process (car/cruise.py). Without a refresh the settings screen keeps
+// showing the cached value for the whole TTL, so the list can disagree with
+// the device — and, now, with the change history right below it.
+//
+// Only the group currently on screen is re-read, and only while that screen is
+// actually visible, so this costs one small bulk read every few seconds at
+// most and nothing at all when the page is in the background.
+const SETTING_LIVE_REFRESH_MS = 5000;
+let settingLiveRefreshTimer = null;
+let settingLiveRefreshInFlight = false;
+
+function shouldRefreshSettingValues() {
+  return (
+    CURRENT_PAGE === "setting" &&
+    isCarrotSettingTabActive() &&
+    !document.hidden &&
+    Boolean(CURRENT_GROUP) &&
+    (isSettingItemsScreenActive() || isSettingInlineSearchSurfaceActive()) &&
+    hasRenderedSettingItems(CURRENT_GROUP) &&
+    !getSettingProfileByGroup(CURRENT_GROUP)
+  );
+}
+
+function stopSettingLiveRefresh() {
+  if (!settingLiveRefreshTimer) return;
+  window.clearTimeout(settingLiveRefreshTimer);
+  settingLiveRefreshTimer = null;
+}
+
+function scheduleSettingLiveRefresh(delay = SETTING_LIVE_REFRESH_MS) {
+  stopSettingLiveRefresh();
+  if (!shouldRefreshSettingValues()) return;
+  settingLiveRefreshTimer = window.setTimeout(() => {
+    settingLiveRefreshTimer = null;
+    refreshSettingValuesFromDevice().catch(() => {});
+  }, delay);
+}
+
+async function refreshSettingValuesFromDevice() {
+  if (!shouldRefreshSettingValues() || settingLiveRefreshInFlight) {
+    syncSettingLiveRefresh();
+    return;
+  }
+
+  const group = CURRENT_GROUP;
+  settingLiveRefreshInFlight = true;
+  try {
+    const values = await fetchSettingGroupValues(group, { force: true });
+    // The user may have navigated while the read was in flight.
+    if (CURRENT_GROUP === group && shouldRefreshSettingValues()) {
+      applyRestoredSettingValuesToRenderedItems(values, { animate: false });
+    }
+  } finally {
+    settingLiveRefreshInFlight = false;
+    syncSettingLiveRefresh();
+  }
+}
+
+function syncSettingLiveRefresh() {
+  if (shouldRefreshSettingValues()) scheduleSettingLiveRefresh();
+  else stopSettingLiveRefresh();
+}
+
+// Coming back to the tab is the moment a stale value is most likely and most
+// visible, so refresh immediately rather than waiting out the interval.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopSettingLiveRefresh();
+  else scheduleSettingLiveRefresh(0);
+});
+window.addEventListener("carrot:pagechange", () => scheduleSettingLiveRefresh(0));
+syncSettingLiveRefresh();

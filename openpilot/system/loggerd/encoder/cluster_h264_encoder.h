@@ -25,6 +25,8 @@ struct ClusterH264EncoderConfig {
   int gop = 30;
   int slice_max_bytes = 4096;
   int rate_control = 2;
+  int min_qp = -1;
+  int max_qp = 51;
   bool realtime_priority = false;
   bool debug = false;
   ClusterH264InputFormat input_format = ClusterH264InputFormat::Auto;
@@ -60,6 +62,13 @@ struct ClusterH264EncodeTimings {
   uint64_t total_us = 0;
 };
 
+struct ClusterH264InputBuffer {
+  uint8_t *data = nullptr;
+  size_t size = 0;
+  unsigned int index = 0;
+  int dmabuf_fd = -1;
+};
+
 class ClusterH264Encoder {
 public:
   explicit ClusterH264Encoder(const ClusterH264EncoderConfig &config);
@@ -76,6 +85,10 @@ public:
   void encode_nv12(const uint8_t *nv12, size_t nv12_size, uint64_t timestamp_us, const ClusterH264PacketCallback &on_packet);
   std::vector<ClusterH264Packet> encode_nv12_active(const uint8_t *nv12, size_t nv12_size, uint64_t timestamp_us);
   void encode_nv12_active(const uint8_t *nv12, size_t nv12_size, uint64_t timestamp_us, const ClusterH264PacketCallback &on_packet);
+  ClusterH264InputBuffer acquire_nv12_input(const ClusterH264PacketCallback &on_packet);
+  void submit_nv12_input(unsigned int index, uint64_t timestamp_us, const ClusterH264PacketCallback &on_packet);
+  void submit_nv12_input_dmabuf(unsigned int index, uint64_t timestamp_us, const ClusterH264PacketCallback &on_packet);
+  void cancel_nv12_input(unsigned int index);
   std::vector<ClusterH264Packet> drain(int timeout_ms = 0);
   void drain(int timeout_ms, const ClusterH264PacketCallback &on_packet);
 
@@ -119,6 +132,8 @@ private:
                     InputCopyFn copy_input, const char *input_name);
   void copy_nv12_to_input(const uint8_t *nv12, size_t nv12_size, VisionBuf *dst) const;
   void copy_nv12_active_to_input(const uint8_t *nv12, size_t nv12_size, VisionBuf *dst) const;
+  void submit_nv12_input_with_sync(unsigned int index, uint64_t timestamp_us,
+                                   const ClusterH264PacketCallback &on_packet, bool dmabuf_written);
   void validate_config() const;
 
   ClusterH264EncoderConfig config_;
@@ -140,6 +155,7 @@ private:
   VisionBuf capture_buffers_[CLUSTER_H264_CAPTURE_BUFFER_COUNT];
   bool input_allocated_[CLUSTER_H264_INPUT_BUFFER_COUNT] = {};
   bool capture_allocated_[CLUSTER_H264_CAPTURE_BUFFER_COUNT] = {};
+  bool input_acquired_[CLUSTER_H264_INPUT_BUFFER_COUNT] = {};
   std::deque<unsigned int> free_inputs_;
   std::vector<uint8_t> codec_config_;
   bool sent_video_packet_ = false;

@@ -8,6 +8,11 @@ from openpilot.cereal import messaging, car, log
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
+from openpilot.common.egpu_recovery_status import read_status as read_egpu_recovery, recovery_badge
+from openpilot.selfdrive.modeld.helpers import active_usbgpu_compiled_path, usbgpu_compile_pending
+from openpilot.selfdrive.modeld.big_model import model_cache_dir
+from openpilot.selfdrive.modeld.big_model_status import delivery_badge, read_big_model_status
+from openpilot.selfdrive.ui.carrot_param_cache import RealtimeUiParamSnapshot, TimedSnapshotCache, read_realtime_ui_params
 from openpilot.selfdrive.ui.lib.prime_state import PrimeState
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.hardware import HARDWARE, PC
@@ -40,6 +45,7 @@ class UIState:
         "onroadEvents",
         "liveCalibration",
         "radarState",
+        "liveTracks",
         "deviceState",
         "pandaStates",
         "carParams",
@@ -57,10 +63,13 @@ class UIState:
         "liveParameters",
         "rawAudioData",
         "carrotMan",
+        "carrotNavi",
         "peripheralState",
         "liveDelay",
         "liveTorqueParameters",
         "lateralPlan",
+        "customReservedRawData0",
+        "customReservedRawData1",
       ]
     )
 
@@ -75,9 +84,15 @@ class UIState:
     self._started_prev: bool = False
 
     # Core state variables
-    self.is_metric: bool = self.params.get_bool("IsMetric")
+    self._realtime_params = TimedSnapshotCache(
+      RealtimeUiParamSnapshot(),
+      lambda: read_realtime_ui_params(self.params),
+    )
+    realtime_params = self._realtime_params.refresh(time.monotonic())
+    self.is_metric: bool = realtime_params.is_metric
     self.is_release = self.params.get_bool("IsReleaseBranch")
-    self.always_on_dm: bool = self.params.get_bool("AlwaysOnDM")
+    self.always_on_dm: bool = realtime_params.always_on_dm
+    self._record_audio_param: bool = realtime_params.record_audio
     self.started: bool = False
     self.ignition: bool = False
     self.recording_audio: bool = False
@@ -95,6 +110,17 @@ class UIState:
     # Brightness and UI options
     self.show_brightness_ratio: float = 1.0
     self.show_model_view: int = 0
+    self.share_data: bool = False
+    self.show_camera_with_cluster: bool = False
+    self.usbgpu_present: bool = False
+    self.usbgpu_compiled: bool = False
+    self.usbgpu_compile_pending: bool = False
+    self.usbgpu_delivery_badge = None
+    self.usbgpu_recovery_badge = None
+    self.usbgpu_loading: bool = False
+    self.usbgpu_active: bool = False
+    self.usbgpu_startup_failed: bool = False
+    self.jetlink_badge = None
 
     self.update_params()
 
@@ -148,10 +174,11 @@ class UIState:
     self.started = self.sm["deviceState"].started and self.ignition
 
     # Update recording audio state
-    self.recording_audio = self.params.get_bool("RecordAudio") and self.started
-
-    self.is_metric = self.params.get_bool("IsMetric")
-    self.always_on_dm = self.params.get_bool("AlwaysOnDM")
+    realtime_params = self._realtime_params.refresh(time.monotonic())
+    self._record_audio_param = realtime_params.record_audio
+    self.recording_audio = self._record_audio_param and self.started
+    self.is_metric = realtime_params.is_metric
+    self.always_on_dm = realtime_params.always_on_dm
 
   def _update_status(self) -> None:
     if self.started and self.sm.updated["selfdriveState"]:
@@ -199,6 +226,21 @@ class UIState:
     self.show_radar_info = self.params.get_int("ShowRadarInfo")
     self.show_brightness_ratio: float = self.params.get_int("ShowCustomBrightness") / 100.0
     self.show_model_view = self.params.get_int("ShowModelView")
+    self.share_data = self.params.get_bool("ShareData")
+    self.show_camera_with_cluster = self.params.get_int("ShowCameraWithCluster") == 1
+    self.usbgpu_present = self.params.get_bool("UsbGpuPresent")
+    # Runtime may temporarily fall back to the previous model's PKL. Keep the
+    # UI completion state tied to the active model so that fallback use does
+    # not look like the newly downloaded model was already compiled.
+    self.usbgpu_compiled = active_usbgpu_compiled_path() is not None
+    self.usbgpu_compile_pending = usbgpu_compile_pending()
+    self.usbgpu_delivery_badge = delivery_badge(read_big_model_status(model_cache_dir()))
+    self.usbgpu_loading = self.params.get_bool("UsbGpuLoading")
+    self.usbgpu_active = self.params.get_bool("UsbGpuActive")
+    self.usbgpu_startup_failed = self.params.get_bool("UsbGpuStartupFailed")
+    self.usbgpu_recovery_badge = recovery_badge(read_egpu_recovery())
+    from openpilot.common.jetlink_status import badge
+    self.jetlink_badge = badge()
 
     self._param_update_time = time.monotonic()
 

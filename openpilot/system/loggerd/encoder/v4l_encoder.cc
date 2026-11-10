@@ -96,7 +96,9 @@ void V4LEncoder::dequeue_handler(V4LEncoder *e) {
       }
       continue;
     } else if (rc == 0) {
-      LOGE("encoder dequeue poll timeout");
+      if (!e->idle) {
+        LOGE("encoder dequeue poll timeout");
+      }
       continue;
     }
 
@@ -147,7 +149,6 @@ void V4LEncoder::dequeue_handler(V4LEncoder *e) {
 V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_height)
     : VideoEncoder(encoder_info, in_width, in_height) {
   const bool carrot_livestream_road = strcmp(encoder_info.publish_name, "livestreamRoadEncodeData") == 0;
-  const bool youtube_road = strcmp(encoder_info.publish_name, "youtubeRoadEncodeData") == 0;
   if (carrot_livestream_road) {
     out_width = 964;
     out_height = 604;
@@ -208,50 +209,6 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
   };
   util::safe_ioctl(fd, VIDIOC_S_FMT, &fmt_in, "VIDIOC_S_FMT failed");
 
-  if (youtube_road) {
-    int crop_width = in_width & ~1;
-    int crop_height = ((crop_width * 9) / 16) & ~1;
-    if (crop_height > in_height) {
-      crop_height = in_height & ~1;
-      crop_width = ((crop_height * 16) / 9) & ~1;
-    }
-
-    struct v4l2_selection selection = {};
-    selection.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    selection.target = V4L2_SEL_TGT_CROP;
-    selection.r.left = ((in_width - crop_width) / 2) & ~1;
-    selection.r.top = ((in_height - crop_height) / 2) & ~1;
-    selection.r.width = (unsigned int)crop_width;
-    selection.r.height = (unsigned int)crop_height;
-    if (util::safe_ioctl(fd, VIDIOC_S_SELECTION, &selection) == 0) {
-      LOGW("YouTube encoder crop=%dx%d+%d+%d output=%dx%d bitrate=%d",
-           crop_width, crop_height, selection.r.left, selection.r.top,
-           out_width, out_height, encoder_settings.bitrate);
-    } else {
-      // no crop support: scale the full frame. keep the camera aspect ratio by
-      // growing the output height, but only onto a 16-aligned size — unaligned
-      // dimensions push the venc firmware onto a slow path that stalls every
-      // other encode session sharing the hardware.
-      int aspect_height = (out_width * in_height / in_width) & ~15;
-      if (aspect_height > out_height) {
-        int out_height_prev = out_height;
-        out_height = aspect_height;
-        fmt_out.fmt.pix_mp.height = (unsigned int)out_height;
-        if (util::safe_ioctl(fd, VIDIOC_S_FMT, &fmt_out) != 0) {
-          out_height = out_height_prev;
-          fmt_out.fmt.pix_mp.height = (unsigned int)out_height;
-          util::safe_ioctl(fd, VIDIOC_S_FMT, &fmt_out, "VIDIOC_S_FMT failed");
-          LOGW("YouTube encoder crop and aspect resize unavailable; scaling the full camera frame");
-        } else {
-          LOGW("YouTube encoder crop unavailable; scaling full frame to %dx%d (aspect preserved)",
-               out_width, out_height);
-        }
-      } else {
-        LOGW("YouTube encoder crop unavailable; scaling the full camera frame");
-      }
-    }
-  }
-
   LOGD("in buffer size %d, out buffer size %d",
     fmt_in.fmt.pix_mp.plane_fmt[0].sizeimage,
     fmt_out.fmt.pix_mp.plane_fmt[0].sizeimage);
@@ -301,10 +258,9 @@ V4LEncoder::V4LEncoder(const EncoderInfo &encoder_info, int in_width, int in_hei
 
   if (carrot_livestream_road) {
     LOGW("H264 compatibility profile enabled for %s: output=%dx%d bitrate=%d multi-slice-max-bytes=%d",
-         encoder_info.publish_name, out_width, out_height, 600'000, 1200);
+         encoder_info.publish_name, out_width, out_height, encoder_settings.bitrate, 1200);
 
     struct v4l2_control compatibility_ctrls[] = {
-      { .id = V4L2_CID_MPEG_VIDEO_BITRATE, .value = 600'000},
       { .id = V4L2_CID_MPEG_VIDEO_H264_PROFILE, .value = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE},
       { .id = V4L2_CID_MPEG_VIDEO_H264_ENTROPY_MODE, .value = V4L2_MPEG_VIDEO_H264_ENTROPY_MODE_CAVLC},
     };
@@ -383,6 +339,10 @@ void V4LEncoder::encoder_open() {
   dequeue_handler_thread = std::thread(V4LEncoder::dequeue_handler, this);
   this->is_open = true;
   this->counter = 0;
+}
+
+void V4LEncoder::set_idle(bool is_idle) {
+  this->idle = is_idle;
 }
 
 int V4LEncoder::encode_frame(VisionBuf* buf, VisionIpcBufExtra *extra) {

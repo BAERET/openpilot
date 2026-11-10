@@ -1,8 +1,14 @@
 import math
+import time
 import numpy as np
 
 from openpilot.cereal import car
 from openpilot.common.constants import CV
+from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
+from openpilot.selfdrive.carrot.cruise_gap import cruise_gap_levels, next_gap_personality, supported_gap_levels
+from openpilot.selfdrive.carrot.bluetooth.model import BLUETOOTH_CANCEL, CommandReader, REMOTE_BUTTONS
+from openpilot.selfdrive.carrot.assistant_speed import AssistantSpeed
+from openpilot.selfdrive.car.toyota_pcm_speed import ToyotaPcmSetSpeedSync
 
 from opendbc.car import structs
 GearShifter = structs.CarState.GearShifter
@@ -21,6 +27,9 @@ IMPERIAL_INCREMENT = round(CV.MPH_TO_KPH, 1)  # round here to avoid rounding err
 ButtonEvent = car.CarState.ButtonEvent
 ButtonType = car.CarState.ButtonEvent.Type
 CRUISE_LONG_PRESS = 50
+# Keep automatic re-engagement out of parking/full-lock turns. Hyundai EPS
+# fault avoidance begins at 85 degrees, so leave margin below that boundary.
+AUTO_CRUISE_MAX_STEERING_ANGLE = 70.0
 CRUISE_NEAREST_FUNC = {
   ButtonType.accelCruise: math.ceil,
   ButtonType.decelCruise: math.floor,
@@ -29,6 +38,10 @@ CRUISE_INTERVAL_SIGN = {
   ButtonType.accelCruise: +1,
   ButtonType.decelCruise: -1,
 }
+
+
+def is_hold_interlock_active(CS) -> bool:
+  return CS.brakeHoldActive or CS.parkingBrake
 
 
 class VCruiseHelper:
@@ -149,15 +162,17 @@ from openpilot.common.params import Params
 class VCruiseCarrot:
   def __init__(self, CP):
     self.CP = CP
+    self.bluetooth_commands = CommandReader('cruise')
+    self.assistant_speed = AssistantSpeed()
+    self.assistant_speed_valid = False
     self.frame = 0
     self.params_memory = Params("/dev/shm/params")
     self.params = Params()
-    from openpilot.selfdrive.controls.lib.drive_helpers import is_volkswagen_meb
-    self.is_vw_meb = is_volkswagen_meb(CP)
     self.v_cruise_kph = 20 #V_CRUISE_UNSET
     self.v_cruise_cluster_kph = 20 #V_CRUISE_UNSET
     self.v_cruise_kph_last = 20
     self._cruise_speed_initialized = False
+    self.toyota_pcm_speed_sync = ToyotaPcmSetSpeedSync(V_CRUISE_MAX)
 
     self.enabled_last = False
 
@@ -183,13 +198,18 @@ class VCruiseCarrot:
     self._gas_pressed_value = 0
     self._gas_tok_timer = int(0.4 / 0.01) # 0.4 sec
     self._gas_tok = False
+    self.speedcam_gas_tok_consumed = False  # set by card when carstate spent this tap on a camera skip
     self._brake_pressed_count = 0
     self._soft_hold_count = 0
     self._soft_hold_active = 0
+    self.soft_hold_on_cancel = self.params.get_bool("SoftHoldOnCancel")
     self._cruise_ready = False
     self._cruise_cancel_state = False
     self._pause_auto_speed_up = False
     self._activate_cruise = 0
+    self._cruise_available = False
+    self._hold_interlock_active = False
+    self._steering_interlock_active = False
     self._lat_enabled = self.params.get_int("AutoEngage") > 0
     self._v_cruise_kph_at_brake = 0
     self.cruise_state_available_last = False
@@ -253,6 +273,7 @@ class VCruiseCarrot:
     unit_factor = 1.0 if is_metric else CV.MPH_TO_KPH
     if self.frame % 10 == 0:
       self.autoCruiseControl = self.params.get_int("AutoCruiseControl") * unit_factor
+      self.soft_hold_on_cancel = self.params.get_bool("SoftHoldOnCancel")
       self.autoGasTokSpeed = self.params.get_int("AutoGasTokSpeed") * unit_factor
       self.autoGasCancelSpeed = self.params.get_int("AutoGasCancelSpeed") * unit_factor
       self.autoGasSyncSpeed = self.params.get_int("AutoGasSyncSpeed")
@@ -289,32 +310,34 @@ class VCruiseCarrot:
           cruiseSpeed1 = self.nRoadLimitSpeed + self.autoRoadSpeedLimitOffset
       self._cruise_speed_table = [cruiseSpeed1, cruiseSpeed2, cruiseSpeed3, cruiseSpeed4, cruiseSpeed5]
 
+  def _update_carrot_man(self, sm):
+    carrot_man = get_carrot_man(sm)
+    if carrot_man is not None:
+      self.nRoadLimitSpeed = carrot_man.nRoadLimitSpeed
+      self.desiredSpeed = carrot_man.desiredSpeed
+      self.carrot_cmd_index = carrot_man.carrotCmdIndex
+      self.carrot_cmd = carrot_man.carrotCmd
+      self.carrot_arg = carrot_man.carrotArg
+    else:
+      self.nRoadLimitSpeed = 0
+      self.desiredSpeed = 250
+      self.carrot_cmd = ""
+      self.carrot_arg = ""
+
   def update_v_cruise(self, CS, sm, is_metric):
+    prior_cruise_kph = self.v_cruise_kph
     self._add_log("")
     self.update_params(is_metric)
     self.frame += 1
-    # MEB(ID.4): SET/RESUME으로 (재)인게이지하면 상시조향도 복구.
-    # TA 버튼 등으로 조향만 꺼진 뒤 SET 재인게이지 시 롱컨만 살고 조향이 죽는 문제 방지
-    # (가감속 버튼 핸들러는 이미 _lat_enabled를 켜지만 setCruise는 핸들러가 없음).
-    if self.is_vw_meb and not self._lat_enabled:
-      for be in CS.buttonEvents:
-        if be.pressed and be.type in (ButtonType.setCruise, ButtonType.resumeCruise):
-          self._lat_enabled = True
-          self._add_log("Lateral enabled (set/resume engage)")
-          break
     if CS.gearShifter != GearShifter.drive:
       self.autoCruiseControl_cancel_timer = 20 * 100  # 20 sec
     else:
       self.autoCruiseControl_cancel_timer = max(0, self.autoCruiseControl_cancel_timer - 1)
 
     CC = sm['carControl']
-    if sm.alive['carrotMan']:
-      carrot_man = sm['carrotMan']
-      self.nRoadLimitSpeed = carrot_man.nRoadLimitSpeed
-      self.desiredSpeed = carrot_man.desiredSpeed
-      self.carrot_cmd_index = carrot_man.carrotCmdIndex
-      self.carrot_cmd = carrot_man.carrotCmd
-      self.carrot_arg = carrot_man.carrotArg
+    self.assistant_speed_valid = bool(getattr(sm, 'valid', {}).get('carControl', False) and sm.alive['carControl'] and
+                                     0 <= time.monotonic() - getattr(sm, 'recv_time', {}).get('carControl', 0) < .35)
+    self._update_carrot_man(sm)
     if sm.alive['longitudinalPlan']:
       lp = sm['longitudinalPlan']
       self.xState = lp.xState
@@ -336,10 +359,31 @@ class VCruiseCarrot:
     #self.events = []
     self.v_ego_kph_set = int(CS.vEgoCluster * CV.MS_TO_KPH + 0.5)
     self._activate_cruise = 0
+    self._cruise_available = CS.cruiseState.available
+    if not self._cruise_available:
+      self._cruise_ready = False
+      self._paddle_decel_active = False
+      self._soft_hold_count = 0
+      self._soft_hold_active = 0
+    self._hold_interlock_active = is_hold_interlock_active(CS)
+    self._steering_interlock_active = abs(CS.steeringAngleDeg) >= AUTO_CRUISE_MAX_STEERING_ANGLE
+    if self._hold_interlock_active:
+      # Drop queued automatic engagement state while AVH or the parking brake
+      # owns longitudinal control.
+      self._cruise_ready = False
+      self._paddle_decel_active = False
+      self._soft_hold_active = 0
     self._prepare_brake_gas(CS, CC)
     if CC.enabled:
       self._cruise_ready = False
+    previous_lat_enabled = self._lat_enabled
     v_cruise_kph = self._update_cruise_buttons(CS, CC, self.v_cruise_kph)
+    if self.assistant_speed.active:
+      self._lat_enabled = previous_lat_enabled  # A speed request must not enable lateral control.
+    pcm_speed = self.toyota_pcm_speed_sync.update(
+      self.CP, self.speed_from_pcm, CS,
+      local_changed=abs(v_cruise_kph - prior_cruise_kph) > 1e-3,
+    )
 
     if self._activate_cruise > 0:
       #self.events.append(EventName.buttonEnable)
@@ -357,12 +401,18 @@ class VCruiseCarrot:
         self.v_cruise_kph = np.clip(v_cruise_kph, self._cruise_speed_min, self._cruise_speed_max)
         self.v_cruise_cluster_kph = self.v_cruise_kph
       else:
-        if self.speed_from_pcm == 1:
+        if self.speed_from_pcm == 1 or (self.speed_from_pcm == 3 and self.CP.brand == "toyota"):
+          # Toyota reports RES/SET through the PCM set speed, not buttonEvents.
+          # Its dedicated mode must not retain an unrelated Carrot set speed.
           self.v_cruise_kph = CS.cruiseState.speed * CV.MS_TO_KPH
           self.v_cruise_cluster_kph = CS.cruiseState.speedCluster * CV.MS_TO_KPH
         else:
+          if pcm_speed is not None:
+            v_cruise_kph = pcm_speed[0]
           self.v_cruise_kph = np.clip(v_cruise_kph, 30, self._cruise_speed_max)
-          self.v_cruise_cluster_kph = self.v_cruise_kph
+          self.v_cruise_cluster_kph = (
+            self.v_cruise_kph if pcm_speed is None else np.clip(pcm_speed[1], 30, self._cruise_speed_max)
+          )
     else:
       self.v_cruise_kph = np.clip(v_cruise_kph, self._cruise_speed_min, self._cruise_speed_max) #max(20, self.v_ego_kph_set) #V_CRUISE_UNSET
       self.v_cruise_cluster_kph = self.v_cruise_kph #V_CRUISE_UNSET
@@ -371,6 +421,10 @@ class VCruiseCarrot:
 
     self.cruise_state_available_last = CS.cruiseState.available
     self.enabled_last = CC.enabled
+    try:
+      self.assistant_speed.finish(self.v_cruise_kph)
+    except (OSError, ValueError, TypeError):
+      pass
 
   def initialize_v_cruise(self, CS, experimental_mode: bool) -> None:
     return
@@ -392,14 +446,22 @@ class VCruiseCarrot:
     self.v_cruise_kph = np.clip(self.v_cruise_kph, self._cruise_speed_min, self._cruise_speed_max)
     self.v_cruise_cluster_kph = self.v_cruise_kph
 
-  def _prepare_buttons(self, CS, v_cruise_kph):
+  def _prepare_buttons(self, CS, v_cruise_kph, remote=None):
     button_kph = v_cruise_kph
     button_type = 0
     buttonEvents = CS.buttonEvents
+    if remote and remote.endswith('Long') and remote[:-4] in REMOTE_BUTTONS:
+      # A mapped long action represents one native long-press step, even when
+      # assigned to a short HID gesture. Never leave a synthetic held button.
+      button_type = getattr(ButtonType, remote[:-4])
+      if button_type in (ButtonType.accelCruise, ButtonType.decelCruise):
+        button_kph = self._long_button_speed(button_kph, button_type)
+      return button_kph, button_type, True
+    if remote in REMOTE_BUTTONS:
+      buttonEvents = [ButtonEvent.new_message(type=remote, pressed=True), ButtonEvent.new_message(type=remote, pressed=False)]
 
     SPEED_UP_UNIT = self._cruise_speed_unit_basic
     SPEED_DOWN_UNIT = self._cruise_speed_unit if self._cruise_button_mode in [1, 2, 3] else self._cruise_speed_unit_basic
-    V_CRUISE_DELTA = 10
     is_metric = self.is_metric
 
     # long press tracking
@@ -428,7 +490,7 @@ class VCruiseCarrot:
         self.button_cnt = 1
         self.button_prev = bt
         # VW 쓸어올리기(2단): 누르기 시작 시점의 GRA_Tip_Stufe_2 샘플 (이후 유지 중 래치로 보강)
-        self.button_big_step = bt in [ButtonType.accelCruise, ButtonType.decelCruise] and CS.cruiseSpeedBigStep
+        self.button_big_step = remote is None and bt in [ButtonType.accelCruise, ButtonType.decelCruise] and CS.cruiseSpeedBigStep
         self.button_long_time = self._cruise_button_long_delay if bt in [ButtonType.accelCruise, ButtonType.decelCruise] else self._cruise_button_long_delay + 30
 
       elif not b.pressed and self.button_cnt > 0 and bt == self.button_prev:
@@ -436,12 +498,8 @@ class VCruiseCarrot:
         if bt == ButtonType.cancel:
           button_type = bt
         elif self.button_big_step and not self.long_pressed and bt in [ButtonType.accelCruise, ButtonType.decelCruise]:
-          # VW swipe (stage-2): jump to next multiple of V_CRUISE_DELTA (=+10 like the stock stalk)
-          mod = button_kph % V_CRUISE_DELTA
-          if bt == ButtonType.accelCruise:
-            button_kph += V_CRUISE_DELTA - mod
-          else:
-            button_kph -= V_CRUISE_DELTA - (-mod % V_CRUISE_DELTA)
+          # VW swipe (stage-2): jump to the next multiple of 10 like the stock stalk.
+          button_kph = self._long_button_speed(button_kph, bt)
           button_type = bt
         elif not self.long_pressed:
           if bt == ButtonType.accelCruise:
@@ -464,11 +522,7 @@ class VCruiseCarrot:
       #  button_type = bt
       #  self.button_cnt = 0
       if bt in [ButtonType.accelCruise, ButtonType.decelCruise]:
-        mod = button_kph % V_CRUISE_DELTA
-        if bt == ButtonType.accelCruise:
-          button_kph += V_CRUISE_DELTA - mod
-        else:
-          button_kph -= V_CRUISE_DELTA - (-mod % V_CRUISE_DELTA)
+        button_kph = self._long_button_speed(button_kph, bt)
         button_type = bt
         self.button_cnt %= self.button_long_time
       else: #if bt in [ButtonType.gapAdjustCruise, ButtonType.lfaButton]:
@@ -476,7 +530,19 @@ class VCruiseCarrot:
           button_type = bt
         #self.button_cnt %= self.button_long_time
 
+    # Dedicated SET/RES are one-shot actions on release, even after a long hold.
+    # They do not borrow +/- timers or their speed-step/swipe behavior.
+    if button_type != ButtonType.cancel:
+      for b in buttonEvents:
+        if not b.pressed and b.type in (ButtonType.setCruise, ButtonType.resumeCruise):
+          return button_kph, b.type, False
     return button_kph, button_type, self.long_pressed
+
+  @staticmethod
+  def _long_button_speed(speed, button):
+    step = 10
+    remainder = speed % step
+    return speed + step - remainder if button == ButtonType.accelCruise else speed - step + (-remainder % step)
 
   def _carrot_command(self, v_cruise_kph, button_type, long_pressed):
     if self.carrot_cmd_index_last != self.carrot_cmd_index:
@@ -513,12 +579,43 @@ class VCruiseCarrot:
     
     return v_cruise_kph, button_type, long_pressed
 
+  def _read_assistant_speed(self, CS, CC, v_cruise_kph, remote):
+    if getattr(self, 'assistant_speed', None) is None:
+      return None
+    try:
+      minimum = max(self._cruise_speed_min, 30 if self.CP.pcmCruise else self._cruise_speed_min)
+      allowed = (self.assistant_speed_valid and CS.canValid and CC.enabled and getattr(CC, 'longActive', False) and
+                 self.CP.openpilotLongitudinalControl and CS.cruiseState.available and CS.gearShifter == GearShifter.drive and
+                 not (CS.brakePressed or CS.gasPressed or CS.buttonEvents or remote or self.button_cnt or self._hold_interlock_active) and
+                 self._soft_hold_active == 0 and minimum <= v_cruise_kph <= self._cruise_speed_max and
+                 not (self.CP.pcmCruise and (self.speed_from_pcm == 1 or (self.speed_from_pcm == 3 and self.CP.brand == 'toyota'))) and
+                 self.carrot_cmd_index_last == self.carrot_cmd_index)
+      voice_speed = self.assistant_speed.read(allowed=allowed, current=v_cruise_kph, minimum=minimum, maximum=self._cruise_speed_max)
+      return voice_speed
+    except (OSError, ValueError, TypeError):
+      return None
+
   def _update_cruise_buttons(self, CS, CC, v_cruise_kph):
-    button_kph, button_type, long_pressed = self._prepare_buttons(CS, v_cruise_kph)
+    remote = self.bluetooth_commands.read(allowed=(CS.canValid and CS.cruiseState.available and
+      CS.gearShifter == GearShifter.drive and not CS.buttonEvents and self.button_cnt == 0))
+    if getattr(self.bluetooth_commands, 'is_repeat', False) and not CC.enabled:
+      remote = None  # Holding a remote must never re-engage after disengagement.
+    voice_speed = self._read_assistant_speed(CS, CC, v_cruise_kph, remote)
+    if voice_speed and voice_speed['action'] == 'speed_up':
+      remote = 'accelCruise'  # Same RES/+ handling, without driver-attention input.
+    button_kph, button_type, long_pressed = self._prepare_buttons(CS, v_cruise_kph, remote)
+    remote_enable = remote in ('accelCruise', 'decelCruise', 'accelCruiseLong', 'decelCruiseLong') and not CC.enabled
+    # SET during soft hold retains its existing cancel behavior.
+    if remote == 'decelCruise' and self._soft_hold_active > 0:
+      remote_enable = False
 
     v_cruise_kph, button_type, long_pressed = self._carrot_command(v_cruise_kph, button_type, long_pressed)
+    if voice_speed and 'target' in voice_speed:
+      v_cruise_kph = voice_speed['target']
+      self._pause_auto_speed_up = True
+      self._v_cruise_kph_at_brake = 0
 
-    if button_type in [ButtonType.accelCruise, ButtonType.decelCruise]:
+    if button_type in [ButtonType.accelCruise, ButtonType.decelCruise, ButtonType.setCruise, ButtonType.resumeCruise]:
       self._paddle_decel_active = False
       if self.autoCruiseControl_cancel_timer > 0:
         self._add_log(f"AutoCruiseControl cancel timer RESET {button_type}")
@@ -528,11 +625,28 @@ class VCruiseCarrot:
         self._cruise_cancel_state = False
 
     if not long_pressed:
-      if button_type == ButtonType.accelCruise:
+      if button_type in (ButtonType.setCruise, ButtonType.resumeCruise):
+        self._lat_enabled = True
+        self._soft_hold_active = 0
+        self._cruise_ready = False
+        self.carrot_cruise_active = False
+        self._pause_auto_speed_up = button_type == ButtonType.setCruise
+        if button_type == ButtonType.setCruise:
+          v_cruise_kph = self._current_speed_for_initial_resume()
+        elif self._v_cruise_kph_at_brake > 0:
+          v_cruise_kph = self._v_cruise_kph_at_brake
+        elif not self._cruise_speed_initialized:
+          v_cruise_kph = self._current_speed_for_initial_resume()
+        self._v_cruise_kph_at_brake = 0
+        self._cruise_speed_initialized = True
+
+      elif button_type == ButtonType.accelCruise:
         self._lat_enabled = True
         self._pause_auto_speed_up = False
         if self._soft_hold_active > 0:
           self._soft_hold_active = 0
+        elif self.carrot_cruise_active:
+          self._v_cruise_kph_at_brake = 0
         elif self._cruise_ready or not CC.enabled or CS.cruiseState.standstill:
           if self._v_cruise_kph_at_brake > 0:
             v_cruise_kph = max(v_cruise_kph, self._v_cruise_kph_at_brake)
@@ -546,18 +660,14 @@ class VCruiseCarrot:
             road_limit_kph = self.nRoadLimitSpeed * self.autoSpeedUptoRoadSpeedLimit
             if road_limit_kph > 1.0:
               v_cruise_kph = max(v_cruise_kph, road_limit_kph)
-        elif self._v_cruise_kph_at_brake > 0:
-          v_cruise_kph = max(v_cruise_kph, self._v_cruise_kph_at_brake)
-          self._v_cruise_kph_at_brake = 0
-          self._cruise_speed_initialized = True
-        elif not self._cruise_speed_initialized:
-          v_cruise_kph = self._current_speed_for_initial_resume()
-          self._cruise_speed_initialized = True
-          self._add_log(f"{v_cruise_kph} Cruise resume from current speed")
-        elif self._cruise_button_mode == 0:
-          v_cruise_kph = button_kph
         else:
-          v_cruise_kph = self._v_cruise_desired(CS, v_cruise_kph)
+          # Once cruise is already active, RES/+ is a speed adjustment. Stale resume or
+          # initialization state must not consume the first press without changing speed.
+          self._v_cruise_kph_at_brake = 0
+          if self._cruise_button_mode == 0:
+            v_cruise_kph = button_kph
+          else:
+            v_cruise_kph = self._v_cruise_desired(CS, v_cruise_kph)
         self._cruise_speed_initialized = True
         self.carrot_cruise_active = False
 
@@ -589,11 +699,14 @@ class VCruiseCarrot:
         self._cruise_speed_initialized = True
 
       elif button_type == ButtonType.gapAdjustCruise:
-        longitudinalPersonalityMax = self.params.get_int("LongitudinalPersonalityMax")
-        if CS.pcmCruiseGap == 0:
-          personality = (self.params.get_int('LongitudinalPersonality') - 1) % longitudinalPersonalityMax
+        longitudinalPersonalityMax = supported_gap_levels(self.params.get_int("LongitudinalPersonalityMax"))
+        gap_levels = cruise_gap_levels(self.params.get_int("CruiseGapLevels"), longitudinalPersonalityMax)
+        if not self.CP.openpilotLongitudinalControl:
+          gap_levels = longitudinalPersonalityMax
+        if remote == 'gapAdjustCruise' or CS.pcmCruiseGap == 0 or gap_levels < longitudinalPersonalityMax:
+          personality = next_gap_personality(self.params.get_int('LongitudinalPersonality'), gap_levels)
         else:
-          personality = np.clip(CS.pcmCruiseGap - 1, 0, longitudinalPersonalityMax)
+          personality = int(np.clip(CS.pcmCruiseGap - 1, 0, longitudinalPersonalityMax - 1))
         self.params.put_int_nonblocking('LongitudinalPersonality', personality)
         #self.events.append(EventName.personalityChanged)
       elif button_type == ButtonType.lfaButton:
@@ -636,7 +749,14 @@ class VCruiseCarrot:
         #self.params.put_bool_nonblocking("ExperimentalMode", not self.params.get_bool("ExperimentalMode"))
         self._add_log("Lateral " + "enabled" if self._lat_enabled else "disabled")
 
-    if self._paddle_mode > 0 and button_type in [ButtonType.paddleLeft, ButtonType.paddleRight]:  # paddle button
+    if remote == 'carrotCruise':
+      # Same acceleration-limiting mode as LFA mode 2 / paddle mode 3.
+      # Repeated requests keep the mode on; RES/+ retains its existing exit path.
+      self.carrot_cruise_active = True
+    elif remote == 'paddleDecel':
+      self._cruise_control(-2, -1, "Cruise off & Ready (Bluetooth paddle)")
+      self._paddle_decel_active = True
+    elif self._paddle_mode > 0 and button_type in [ButtonType.paddleLeft, ButtonType.paddleRight]:  # paddle button
       if self._paddle_mode == 3:
         self.carrot_cruise_active = True
       else:
@@ -647,7 +767,17 @@ class VCruiseCarrot:
       if not CC.enabled:
         self._cruise_control(1, -1, "Cruise on (paddle decel)")
 
-    v_cruise_kph = self._update_cruise_state(CS, CC, v_cruise_kph)
+    updated_speed = self._update_cruise_state(CS, CC, v_cruise_kph)
+    # Keep automatic engagement/disengagement checks, but let an explicit SET/RES
+    # own the speed selected on this frame (e.g. simultaneous pedal release).
+    if button_type not in (ButtonType.setCruise, ButtonType.resumeCruise):
+      v_cruise_kph = updated_speed
+    if remote in ('cancel', 'cancelLong'):
+      self._cruise_control(BLUETOOTH_CANCEL, -1, 'Cruise off (Bluetooth cancel)', allow_cancel_state=True, manual=True)
+    elif remote_enable and not CS.brakePressed and not CS.gasPressed and self._activate_cruise >= 0:
+      self._cruise_control(1, -1, 'Cruise on (Bluetooth button)', manual=True)
+      if self._activate_cruise > 0:
+        self._lat_enabled = True
     return v_cruise_kph
 
   ## desiredSpeed :
@@ -707,18 +837,32 @@ class VCruiseCarrot:
     self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     return v_cruise_kph
 
-  def _cruise_control(self, enable, cancel_timer, reason):
-    if self._cruise_cancel_state: # and self._soft_hold_active != 2:
+  def _cruise_control(self, enable, cancel_timer, reason, allow_cancel_state=False, manual=False):
+    # Explicit HID button requests bypass automatic-engage preferences only;
+    # availability/interlocks below and selfdrived's normal no-entry checks remain.
+    if enable > 0 and not self._cruise_available:
+      self._activate_cruise = 0
+      self._add_log(reason + " > Cruise unavailable")
+      return
+    if enable > 0 and self._steering_interlock_active:
+      self._activate_cruise = 0
+      self._add_log(reason + " > Steering angle interlock active")
+      return
+    if enable > 0 and self._hold_interlock_active:
+      self._activate_cruise = 0
+      self._add_log(reason + " > Brake hold interlock active")
+      return
+    if self._cruise_cancel_state and not allow_cancel_state:
       self._add_log(reason + " > Cancel state")
     elif enable > 0 and self._cancel_timer > 0 and cancel_timer >= 0:
       enable = 0
       self._add_log(reason + " > Canceled")
     else:
-      if self.autoCruiseControl == 0 and enable != 0:
+      if not manual and self.autoCruiseControl == 0 and enable != 0:
         enable = 0
         self._soft_hold_active = 0
         return
-      if self.autoCruiseControl_cancel_timer > 0 and enable != 0:
+      if not manual and self.autoCruiseControl_cancel_timer > 0 and enable != 0:
         self._add_log(reason + " > timer Canceled")
         enable = 0
         self._soft_hold_active = 0
@@ -740,13 +884,16 @@ class VCruiseCarrot:
     else:
       return False, d_final
 
+  def _engage_soft_hold(self):
+    self._soft_hold_active = 2
+    self._cruise_control(1, -1, "Cruise on (soft hold)", allow_cancel_state=self.soft_hold_on_cancel)
+
   def _update_cruise_state(self, CS, CC, v_cruise_kph):
     if not CC.enabled:
       #self._pause_auto_speed_up = False
       if self._brake_pressed_count == -1 and self._soft_hold_active > 0:
-        self._soft_hold_active = 2
         #self.autoCruiseControl_cancel_timer = 0
-        self._cruise_control(1, -1, "Cruise on (soft hold)")
+        self._engage_soft_hold()
       # GM: autoResume
       elif self.params.get_bool("ActivateCruiseAfterBrake"):
         self.params.put_bool_nonblocking("ActivateCruiseAfterBrake", False)
@@ -848,20 +995,23 @@ class VCruiseCarrot:
   def _prepare_brake_gas(self, CS, CC):
     if CS.gasPressed:
       gas_pressed_start = self._gas_pressed_count <= 0
+      cancel_soft_hold = gas_pressed_start and self._soft_hold_active > 0 and self._cruise_cancel_state
       self._paddle_decel_active = False
       self._gas_pressed_count = max(1, self._gas_pressed_count + 1)
       self._gas_pressed_count_last = self._gas_pressed_count
       self._gas_pressed_value = max(CS.gas, self._gas_pressed_value) if self._gas_pressed_count > 1 else CS.gas
       self._gas_tok = False
-      #if self._cruise_cancel_state and self._soft_hold_active == 2:
-      #  self._cruise_control(-1, -1, "Cruise off,softhold mode (gasPressed)")
       self._soft_hold_active = 0
-      if gas_pressed_start and self.disengage_on_accelerator:
+      if cancel_soft_hold:
+        self._cruise_ready = False
+        self.carrot_cruise_active = False
+        self._cruise_control(-1, -1, "Cruise off (cancel soft hold released)", allow_cancel_state=True)
+      elif gas_pressed_start and self.disengage_on_accelerator:
         self._cruise_ready = False
         self.carrot_cruise_active = False
         self._cruise_control(-1, 0, "Cruise off (gas pressed)")
     else:
-      self._gas_tok = True if 0 < self._gas_pressed_count < self._gas_tok_timer else False
+      self._gas_tok = True if 0 < self._gas_pressed_count < self._gas_tok_timer and not self.speedcam_gas_tok_consumed else False
       self._gas_pressed_count = min(-1, self._gas_pressed_count - 1)
       if self._gas_pressed_count < -1:
         self._gas_pressed_count_last = 0
@@ -874,8 +1024,11 @@ class VCruiseCarrot:
       if self._brake_pressed_count == 1 and self.enabled_last:
         self._v_cruise_kph_at_brake = self.v_cruise_kph
         self._add_log(f"{self.v_cruise_kph} Cruise speed at brake")
-      self._soft_hold_count = self._soft_hold_count + 1 if CS.vEgo < 0.1 and CS.gearShifter == GearShifter.drive else 0
-      if self.autoCruiseControl == 0 or self.CP.pcmCruise:
+      soft_hold_available = CS.cruiseState.available and self.autoCruiseControl != 0 and not self.CP.pcmCruise and \
+                            self.autoCruiseControl_cancel_timer == 0 and \
+                            (not self._cruise_cancel_state or self.soft_hold_on_cancel)
+      self._soft_hold_count = self._soft_hold_count + 1 if soft_hold_available and CS.vEgo < 0.1 and CS.gearShifter == GearShifter.drive else 0
+      if not soft_hold_available:
         self._soft_hold_active = 0
       else:
         self._soft_hold_active = 1 if self._soft_hold_count > 60 else 0

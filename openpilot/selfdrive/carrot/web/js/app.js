@@ -28,6 +28,7 @@ window.addEventListener("popstate", async (ev) => {
   }
 
   if (st.page === "setting") {
+    if (st.group === SETTING_INLINE_SEARCH_GROUP) restoreSettingInlineSearch(st.inlineSearchQuery || "");
     const screen = st.screen || "groups";
     const previousDetail = CURRENT_SETTING_DETAIL;
     const itemsWereActive = typeof isSettingItemsScreenActive === "function" && isSettingItemsScreenActive();
@@ -64,7 +65,14 @@ window.addEventListener("popstate", async (ev) => {
         animateItems: false,
       }), previousDetail ? "backward" : "forward");
     } else if (screen === "items" && CURRENT_GROUP) {
-      if (itemsWereActive && previousDetail) {
+      if (
+        CURRENT_GROUP === SETTING_INLINE_SEARCH_GROUP
+        && typeof showSettingInlineSearchResultsInGroups === "function"
+      ) {
+        // Single-column search lives in place on the group screen, not on a
+        // separate results screen.
+        await showSettingInlineSearchResultsInGroups();
+      } else if (itemsWereActive && previousDetail) {
         await transitionSettingItemsContent(
           () => renderItems(CURRENT_GROUP, { scrollMode: "restore", animateItems: false }),
           "backward",
@@ -79,6 +87,7 @@ window.addEventListener("popstate", async (ev) => {
     } else {
       CURRENT_SETTING_DETAIL = null;
       showSettingScreen("groups", false);
+      if (typeof exitSettingInlineSearchSurface === "function") exitSettingInlineSearchSurface();
     }
     if (st.search) {
       openSettingSearchPanel({ pushHistory: false }).catch(() => {});
@@ -137,3 +146,14 @@ if (typeof window.bootstrapWebStartPage === "function") {
 } else {
   showPage("carrot", false);
 }
+
+// The settings bundle normally starts its no-store snapshot while later
+// scripts are parsed. Keep an after-first-paint fallback for partial/rolling
+// deployments where an older bundle has not started it yet.
+requestAnimationFrame(() => {
+  window.setTimeout(() => {
+    if (window.CarrotSettingsStore?.status === "idle") {
+      window.CarrotSettingsStore.preload?.();
+    }
+  }, 0);
+});

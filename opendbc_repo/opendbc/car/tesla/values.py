@@ -49,7 +49,7 @@ class CAR(Platforms):
     [
       # TODO: do we support 2017? It's HW3
       TeslaCarDocsHW3("Tesla Model 3 (with HW3) 2019-23"),
-      TeslaCarDocsHW4("Tesla Model 3 (with HW4) 2024-25"),
+      TeslaCarDocsHW4("Tesla Model 3 (with HW4) 2024-26"),
     ],
     CarSpecs(mass=1899., wheelbase=2.875, steerRatio=12.0),
     {Bus.party: 'tesla_model3_party', Bus.radar: 'tesla_radar_continental_generated'},
@@ -140,6 +140,8 @@ class CarControllerParams:
 class TeslaSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   FSD_14 = 2
+  AUTO_SPEED_LIMIT = 4
+  AUTO_TURN_SIGNALS = 8
 
 
 class TeslaFlags(IntFlag):
@@ -147,7 +149,9 @@ class TeslaFlags(IntFlag):
   FSD_14 = 2
   MISSING_DAS_SETTINGS = 4
   HAS_VEHICLE_BUS = 8
-  HAS_DAS_BODY_CONTROLS = 16
+  AUTO_SPEED_LIMIT = 16
+  AUTO_TURN_SIGNALS = 32
+  CAN_TRAFFIC_STOP = 64
 
 
 DBC = CAR.create_dbc_map()

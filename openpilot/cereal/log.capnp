@@ -140,6 +140,8 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     stopStop @120;
     audioLaneChange @121;
     audioTurn @122;
+    radarCutin @123;
+    radarStationaryLead @124;
     trafficSignGreen @100;
     trafficSignChanged @101;
     turningLeft @102;
@@ -157,6 +159,15 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     audio0 @114;
 
     torqueNNLoad @118;
+    updateRebootRequired @125;
+    driverMonitorFallback @126;
+    systemReady @127;
+    impactDetected @128;
+    impactDashcamReboot @129;
+    teslaTrafficStopWarning @130;
+    teslaTrafficStopTakeover @131;
+    pandaCanFault @132;
+    stockSccFault @133;
 
     soundsUnavailableDEPRECATED @47;
   }
@@ -299,11 +310,7 @@ struct GPSNMEAData {
   nmea @2 :Text;
 }
 
-# android sensor_event_t
 struct SensorEventData {
-  version @0 :Int32;
-  sensor @1 :Int32;
-  type @2 :Int32;
   timestamp @3 :Int64;
 
   union {
@@ -322,7 +329,10 @@ struct SensorEventData {
 
   struct SensorVec {
     v @0 :List(Float32);
-    status @1 :Int8;
+
+    deprecated :group {
+      status @1 :Int8;
+    }
   }
 
   enum SensorSource {
@@ -340,7 +350,11 @@ struct SensorEventData {
     mmc5603nj @11;
   }
 
+  # formerly based on android sensor_event_t
   deprecated :group {
+    version @0 :Int32;
+    sensor @1 :Int32;
+    type @2 :Int32;
     uncalibrated @10 :Bool;
   }
 }
@@ -587,6 +601,7 @@ struct PandaState @0xa7649e2575e4591e {
   # reserved for forks building alternate experiences.
   controlsAllowedRESERVED1 @38 :Bool;
   controlsAllowedRESERVED2 @39 :Bool;
+  wakeOnCan @40 :Bool;
 
   enum FaultStatus {
     none @0;
@@ -723,6 +738,7 @@ struct RadarState @0x9a185389d6fdd05f {
   leadsLeft2 @19 : List(LeadData);
   leadsRight2 @20 : List(LeadData);
   leadsCutIn @21 : List(LeadData);
+  leadCutInRisk @22 : LeadData;
 
   struct LeadData {
     dRel @0 :Float32;
@@ -744,6 +760,8 @@ struct RadarState @0x9a185389d6fdd05f {
     aLead @5 :Float32;
     jLead @16 :Float32;
     score @17 :Float32;
+    cutOutTime @18 :Float32;       # predicted body clearance, seconds; 0 = inactive
+    cutOutConfidence @19 :Float32; # confirmed/ramped future headway relief, 0..1
   }
 
   deprecated :group {
@@ -810,6 +828,10 @@ struct SelfdriveState {
   experimentalMode @10 :Bool;
   personality @11 :LongitudinalPersonality;
   distanceTraveled @13 :Float32;
+
+  # Latched cue from the audioTurn event, not the priority-selected alert sound.
+  atcTurnStartMonoTime @14 :UInt64;
+  atcTurnDirection @15 :LaneChangeDirection;
 
   enum OpenpilotState @0xdbe58b96d2d1ac61 {
     disabled @0;
@@ -1084,6 +1106,24 @@ struct ModelDataV2 {
     modelTurnSpeed @17 :Float32;
     laneChangeAvailableLeft @18 :Bool;
     laneChangeAvailableRight @19 :Bool;
+    laneChangeBlinkerHold @20 :LaneChangeDirection;  # carrot: hold this turn signal while a lever-requested change waits or is queued
+    leverTurn @21 :Bool;  # carrot: the turn desire comes from a latched lever (BlinkerLatchedTurn)
+    autoTurnSignal @22 :LaneChangeDirection;  # ATC-originated maneuver only; no steering request
+    autoTurnSignalLaneChange @23 :Bool;
+    autoTurnSignalDirection @24 :LaneChangeDirection;
+    autoTurnSignalRequestId @25 :UInt64;
+    manualLaneIndicator @26 :LaneChangeDirection;  # Lamp only; its feedback is excluded from driver lane requests.
+    manualLaneIndicatorMonoTime @27 :UInt64;
+    observedIndicator @28 :LaneChangeDirection; # Lamp-only observation; never steering admission.
+    observedIndicatorMonoTime @29 :UInt64;
+    observedIndicatorSource @30 :Text;
+    indicatorIsolationMask @31 :UInt8;
+    indicatorJournalMonoTime @32 :UInt64;
+    indicatorPrepareDirection @33 :LaneChangeDirection; # Display only; never an actuation request.
+    indicatorPrepareSource @34 :Text;
+    assistantLaneSignalId @35 :Text; # Set only after ordinary lane-change admission; direction is laneChangeDirection.
+    assistantLaneSignalRoute @36 :Text; # Empty outside voice maneuvers, otherwise ordinary, native or the selected adapter instance.
+
 
     deprecated :group {
       brakeDisengageProb @2 :Float32;
@@ -1214,7 +1254,56 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
   desiredDistance @47: Float32;
   myDrivingMode @48: Int32;
 
+  # carrot-egpu-tg longitudinal fast-path timing/debug fields
+  plannerExecutionTime @49 :Float32;
+  liveTracksMonoTime @50 :UInt64;
+  fastLeadTrackId @51 :Int32 = -1;
+  fastLeadMask @52 :UInt8;  # bit 0: leadOne, bit 1: leadTwo
+  planningTrigger @53 :PlanningTrigger;
+  fastRadarExecutionTime @54 :Float32;
+  fastLeadReason @55 :FastLeadReason;
+
+  # Lead-response diagnostics. LongActuatorDelay remains the physical base
+  # delay; leadPreviewSeconds is the bounded offset used only to request earlier
+  # deceleration from the already-solved MPC trajectory. Positive means farther
+  # into that trajectory. Positive acceleration response changes MPC costs
+  # before solving and is visible through aChangeCost.
+  aTargetBase @56 :Float32;
+  leadPreviewSeconds @57 :Float32;
+  leadPreviewActionTime @58 :Float32;
+  leadPreviewAccel @59 :Float32;  # deadbanded aLead - aEgo signal used by deceleration preview
+  aChangeCost @60 :Float32;
+  trafficStopModelLeadOffset @61 :Float32;  # 0 normally, +2 m for a confirmed model-vehicle stop
+  # Optional overspeed brake relief. Zero target/percent preserves legacy control.
+  cruiseCoastingTarget @62 :Float32;  # fixed physical m/s reference; 0 when ineligible
+  cruiseCoastingPercent @63 :UInt8;
+  signalDetectionSuspended @64 :Bool; # fresh vNavi motorway/urban expressway classification
+  signalObservationColor @65 :UInt8; # helper current evidence: 0 unknown, 1 red, 2 green, 3 mixed
+  signalAssistAction @66 :UInt8; # actual helper action: 0 none, 1 departure veto, 2 preparation, 3 confirmed green transition
+
   solverExecutionTime @35 :Float32;
+
+  enum PlanningTrigger {
+    modelV2 @0;
+    liveTracks @1;
+  }
+
+  enum FastLeadReason {
+    inactive @0;
+    active @1;
+    notRadarLead @2;
+    selectionPending @3;
+    selectionUnstable @4;
+    trackMissing @5;
+    trackUnmeasured @6;
+    nonFinite @7;
+    invalidDistance @8;
+    distanceDiscontinuity @9;
+    velocityDiscontinuity @10;
+    radarStateInvalid @11;
+    liveTracksInvalid @12;
+    selectionStale @13;
+  }
 
   enum LongitudinalPlanSource {
     cruise @0;
@@ -1446,6 +1535,8 @@ struct ProcLog {
     memPss @17 :UInt64;        # Pss — shared pages split by mapper count
     memPssAnon @18 :UInt64;    # Pss_Anon — private anonymous (heap, stack)
     memPssShmem @19 :UInt64;   # Pss_Shmem — proportional MSGQ/tmpfs share
+    memPssMonoTime @20 :UInt64; # scan start in monotonic ns; 0 means unavailable (also older logs)
+    memPrivateDirty @21 :UInt64; # bytes from the same completed scan; absent in older logs
   }
 
   struct CPUTimes {
@@ -2174,6 +2265,16 @@ struct DriverMonitoringState {
   alert3Count @12 :Int8;
   noResponseCount @13 :Int8;
   noResponseForceDecel @14 :Bool;
+  cameraUnavailable @15 :Bool;
+  dm2Experimental @16 :Bool;
+  dm2StrictTimeRemaining @17 :Float32;
+  dm2WheelTimeoutFactor @18 :Float32 = 1;
+  dm2ForwardAttentionScore @19 :Float32;
+  dm2ForwardRecovery @20 :Bool;
+  dm2InteractionCredit @21 :Float32;
+  dm2VisionTimeoutFactor @22 :Float32 = 1;
+  dm2InteractionGraceRemaining @23 :Float32;
+  dm2Disabled @24 :Bool;
 
   alwaysOn @3 :Bool;
   alwaysOnLockout @4 :Bool;
@@ -2215,6 +2316,7 @@ struct DriverMonitoringState {
       pose @0: Bool;
       eye @1: Bool;
       phone @2: Bool;
+      sleep @3: Bool;
     }
 
     struct Pose {
@@ -2272,6 +2374,7 @@ struct LiveParametersData {
   angleOffsetAverageValid @18 :Bool = true;
   steerRatioValid @19 :Bool = true;
   stiffnessFactorValid @20 :Bool = true;
+  centerToFrontRatio @21 :Float32;  # Applied geometry; 0 in legacy messages.
 
 
   struct FilterState {
@@ -2365,10 +2468,38 @@ struct Sentinel {
 
 struct UIDebug {
   drawTimeMillis @0 :Float32;
+  # carrot: 구간별 계측 (계측 전용 — draw 41.6ms의 내역을 재기 위함).
+  # 합계가 drawTimeMillis보다 작을 수 있다 — scissor begin/end(배치 flush),
+  # 캘리브레이션 등 미귀속 구간은 total에만 포함된다.
+  cameraTimeMillis      @1 :Float32;
+  modelTimeMillis       @2 :Float32;
+  driverStateTimeMillis @3 :Float32;
+  hudTimeMillis         @4 :Float32;
+  alertTimeMillis       @5 :Float32;
+  extrasTimeMillis      @6 :Float32;
+  plotMode              @7 :UInt8;   # ShowPlotMode (~2초 스로틀 캐시, 0=off)
+  recording             @8 :Bool;    # 화면 녹화 중 여부
+  # 상세 프로파일링 필드는 과거 로그와의 호환성을 위해 번호와 타입만 보존한다.
+  modelPathTimeMillisDEPRECATED       @9 :Float32;
+  modelLaneTimeMillisDEPRECATED       @10 :Float32;
+  modelBlindSpotTimeMillisDEPRECATED  @11 :Float32;
+  modelRadarTimeMillisDEPRECATED      @12 :Float32;
+  modelTimingValidDEPRECATED          @13 :Bool;
+  hudHeaderTimeMillisDEPRECATED       @14 :Float32;
+  hudSpeedTimeMillisDEPRECATED        @15 :Float32;
+  hudStatusTimeMillisDEPRECATED       @16 :Float32;
+  hudNavigationTimeMillisDEPRECATED   @17 :Float32;
+  hudButtonTimeMillisDEPRECATED       @18 :Float32;
+  hudPlotTimeMillisDEPRECATED         @19 :Float32;
+  hudAuxTimeMillisDEPRECATED          @20 :Float32;
+  hudTimingValidDEPRECATED            @21 :Bool;
+  modelBlindSpotStateMaskDEPRECATED   @22 :UInt8;
+  modelBlindSpotStateValidDEPRECATED  @23 :Bool;
 }
 
 struct ManagerState {
   processes @0 :List(ProcessState);
+  rebootRequired @1 :Bool; # checkout changed since manager startup
 
   struct ProcessState {
     name @0 :Text;
@@ -2439,6 +2570,7 @@ struct NavInstruction {
 
 struct NavRoute {
   coordinates @0 :List(Coordinate);
+  carrotRouteId @1 :UInt64;  # stable across route heartbeats; changes on source/geometry replacement
 
   struct Coordinate {
     latitude @0 :Float32;
@@ -2618,13 +2750,14 @@ struct Event {
     customReservedRawData0 @124 :Data;
     navRouteNavd @125 :NavRoute;
     navInstructionCarrot @126 :NavInstruction;
+    customReservedRawData1 @154 :Data;
 
     # DO change the name of the field and struct
     # DON'T change the ID (e.g. @107)
     # DON'T change which struct it points to
     carrotMan @107 :Custom.CarrotMan;
-    customReserved1 @108 :Custom.CustomReserved1;
-    customReserved2 @109 :Custom.CustomReserved2;
+    carrotNavi @108 :Custom.CarrotNaviState;
+    carrotNaviMedia @109 :Custom.CarrotNaviMedia;
     customReserved3 @110 :Custom.CustomReserved3;
     customReserved4 @111 :Custom.CustomReserved4;
     customReserved5 @112 :Custom.CustomReserved5;

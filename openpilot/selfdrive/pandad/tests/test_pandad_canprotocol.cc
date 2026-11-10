@@ -7,21 +7,83 @@
 #include "cereal/messaging/messaging.h"
 #include "common/util.h"
 #include "selfdrive/pandad/panda.h"
+#include "selfdrive/pandad/spi_alert.h"
+
+TEST_CASE("Panda SPI alert ignores isolated recovered retries", "[spi_alert]") {
+  PandaSpiAlertTracker tracker;
+  tracker.update_onroad(true, 1000U);
+
+  REQUIRE_FALSE(tracker.observe(6000U, 1U, false));
+  REQUIRE_FALSE(tracker.ready(8000U));
+}
+
+TEST_CASE("Panda SPI alert reports a recovered burst after confirmation", "[spi_alert]") {
+  PandaSpiAlertTracker tracker;
+  tracker.update_onroad(true, 1000U);
+
+  REQUIRE_FALSE(tracker.observe(6000U, 1U, false));
+  REQUIRE_FALSE(tracker.observe(7000U, 1U, false));
+  REQUIRE(tracker.observe(8000U, 1U, false));
+  REQUIRE_FALSE(tracker.ready(8999U));
+  REQUIRE(tracker.ready(9000U));
+}
+
+TEST_CASE("Panda SPI alert expires recovered retries outside the burst window", "[spi_alert]") {
+  PandaSpiAlertTracker tracker;
+  tracker.update_onroad(true, 1000U);
+
+  REQUIRE_FALSE(tracker.observe(6000U, 1U, false));
+  REQUIRE_FALSE(tracker.observe(7000U, 1U, false));
+  REQUIRE_FALSE(tracker.observe(17001U, 1U, false));
+  REQUIRE_FALSE(tracker.ready(20000U));
+}
+
+TEST_CASE("Panda SPI alert confirms terminal failures only while onroad", "[spi_alert]") {
+  PandaSpiAlertTracker tracker;
+  tracker.update_onroad(true, 1000U);
+
+  REQUIRE(tracker.observe(6000U, 1U, true));
+  REQUIRE_FALSE(tracker.ready(6999U));
+  tracker.update_onroad(false, 6500U);
+  REQUIRE_FALSE(tracker.ready(7000U));
+
+  tracker.update_onroad(true, 8000U);
+  REQUIRE_FALSE(tracker.observe(9000U, 1U, true));
+  REQUIRE(tracker.observe(13000U, 1U, true));
+  REQUIRE(tracker.ready(14000U));
+}
+
+TEST_CASE("Panda SPI alert captures at most once per drive", "[spi_alert]") {
+  PandaSpiAlertTracker tracker;
+  tracker.update_onroad(true, 1000U);
+  REQUIRE(tracker.observe(6000U, 3U, false));
+  REQUIRE(tracker.ready(7000U));
+  tracker.mark_capture_requested();
+
+  REQUIRE_FALSE(tracker.observe(8000U, 3U, false));
+  REQUIRE_FALSE(tracker.ready(9000U));
+
+  tracker.update_onroad(false, 10000U);
+  tracker.update_onroad(true, 11000U);
+  REQUIRE(tracker.observe(16000U, 3U, false));
+  REQUIRE(tracker.ready(17000U));
+}
 
 struct PandaTest : public Panda {
-  PandaTest(int can_list_size, cereal::PandaState::PandaType hw_type);
+  PandaTest(uint32_t bus_offset, int can_list_size, cereal::PandaState::PandaType hw_type);
   void test_can_send();
   void test_can_recv(uint32_t chunk_size = 0);
   void test_chunked_can_recv();
 
   std::map<int, std::string> test_data;
+  std::map<int, uint8_t> test_buses;
   int can_list_size = 0;
   int total_pakets_size = 0;
   MessageBuilder msg;
   capnp::List<cereal::CanData>::Reader can_data_list;
 };
 
-PandaTest::PandaTest(int can_list_size_, cereal::PandaState::PandaType hw_type_) : can_list_size(can_list_size_), Panda() {
+PandaTest::PandaTest(uint32_t bus_offset_, int can_list_size_, cereal::PandaState::PandaType hw_type_) : can_list_size(can_list_size_), Panda(bus_offset_) {
   this->hw_type = hw_type_;
   int data_limit = ((hw_type == cereal::PandaState::PandaType::RED_PANDA) ? std::size(dlc_to_len) : 8);
   // prepare test data
@@ -42,7 +104,9 @@ PandaTest::PandaTest(int can_list_size_, cereal::PandaState::PandaType hw_type_)
     uint32_t id = util::random_int(0, std::size(dlc_to_len) - 1);
     const std::string &dat = test_data[dlc_to_len[id]];
     can.setAddress(i);
-    can.setSrc(util::random_int(0, 2));
+    uint8_t bus = util::random_int(0, 2) + bus_offset;
+    can.setSrc(bus);
+    test_buses[i] = bus;
     can.setDat(kj::ArrayPtr((uint8_t *)dat.data(), dat.size()));
     total_pakets_size += sizeof(can_header) + dat.size();
   }
@@ -67,6 +131,7 @@ void PandaTest::test_can_send() {
     pckt_len = sizeof(can_header) + data_len;
 
     REQUIRE(header.addr == cnt);
+    REQUIRE(header.bus == test_buses[cnt] - bus_offset);
     REQUIRE(test_data.find(data_len) != test_data.end());
     const std::string &dat = test_data[data_len];
     REQUIRE(memcmp(dat.data(), &unpacked_data[pos + sizeof(can_header)], dat.size()) == 0);
@@ -98,6 +163,7 @@ void PandaTest::test_can_recv(uint32_t rx_chunk_size) {
   REQUIRE(frames.size() == can_list_size);
   for (int i = 0; i < frames.size(); ++i) {
     REQUIRE(frames[i].address == i);
+    REQUIRE(frames[i].src == test_buses[i]);
     REQUIRE(test_data.find(frames[i].dat.size()) != test_data.end());
     const std::string &dat = test_data[frames[i].dat.size()];
     REQUIRE(memcmp(dat.data(), frames[i].dat.data(), dat.size()) == 0);
@@ -105,8 +171,9 @@ void PandaTest::test_can_recv(uint32_t rx_chunk_size) {
 }
 
 TEST_CASE("send/recv CAN 2.0 packets") {
+  auto bus_offset = GENERATE(0, 4);
   auto can_list_size = GENERATE(1, 3, 5, 10, 30, 60, 100, 200);
-  PandaTest test(can_list_size, cereal::PandaState::PandaType::DOS);
+  PandaTest test(bus_offset, can_list_size, cereal::PandaState::PandaType::DOS);
 
   SECTION("can_send") {
     test.test_can_send();
@@ -120,8 +187,9 @@ TEST_CASE("send/recv CAN 2.0 packets") {
 }
 
 TEST_CASE("send/recv CAN FD packets") {
+  auto bus_offset = GENERATE(0, 4);
   auto can_list_size = GENERATE(1, 3, 5, 10, 30, 60, 100, 200);
-  PandaTest test(can_list_size, cereal::PandaState::PandaType::RED_PANDA);
+  PandaTest test(bus_offset, can_list_size, cereal::PandaState::PandaType::RED_PANDA);
 
   SECTION("can_send") {
     test.test_can_send();

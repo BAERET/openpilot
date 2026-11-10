@@ -22,6 +22,11 @@ NetworkType = log.DeviceState.NetworkType
 NetworkStrength = log.DeviceState.NetworkStrength
 
 
+def is_c3x_lite() -> bool:
+  from openpilot.common.params import Params
+  return Params().get_bool("HardwareC3xLite")
+
+
 def affine_irq(val, action):
   irqs = get_irqs_for_action(action)
   if len(irqs) == 0:
@@ -61,7 +66,9 @@ def get_default_route_iface():
 class Tici(HardwareBase):
   @cached_property
   def amplifier(self):
-    if self.get_device_type() == "mici":
+    # C3X Lite has no audio output hardware. Avoid probing the missing
+    # amplifier, since the normal I2C retry backoff delays startup.
+    if self.get_device_type() == "mici" or is_c3x_lite():
       return None
     return Amplifier()
 
@@ -80,7 +87,8 @@ class Tici(HardwareBase):
     return get_device_type()
 
   def reboot(self, reason=None):
-    subprocess.check_output(["sudo", "reboot"])
+    from openpilot.common.reboot import reboot_device
+    reboot_device()
 
   def uninstall(self):
     Path("/data/__system_reset__").touch()
@@ -323,7 +331,7 @@ class Tici(HardwareBase):
     # GPU, modeld core
     affine_irq(7, "kgsl-3d0")
 
-    # camerad core
+    # Match camerad/main.cc: restore the AGNOS-isolated camera core.
     camera_irqs = ("a5", "cci", "cpas_camnoc", "cpas-cdm", "csid", "ife", "csid-lite", "ife-lite")
     for n in camera_irqs:
       affine_irq(6, n)

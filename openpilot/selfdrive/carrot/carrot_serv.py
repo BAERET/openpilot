@@ -10,7 +10,6 @@ import time
 import numpy as np
 from datetime import datetime
 
-from ftplib import FTP
 from openpilot.cereal import log
 import openpilot.cereal.messaging as messaging
 from openpilot.common.realtime import Ratekeeper
@@ -20,6 +19,8 @@ from openpilot.system.hardware import PC, TICI
 from openpilot.selfdrive.navd.helpers import Coordinate
 from openpilot.common.constants import CV
 from openpilot.common.gps import get_gps_location_service
+from openpilot.selfdrive.carrot.gps_sources import GPSSources
+from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
 
 nav_type_mapping = {
   12: ("turn", "left", 1),
@@ -78,6 +79,11 @@ nav_type_mapping = {
 }
 
 import collections
+
+COUNTDOWN_NEW_TARGET_MIN_JUMP_M = 20.0
+SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S = 3.0
+
+
 class CarrotServ:
   def __init__(self):
     self.params = Params()
@@ -93,6 +99,7 @@ class CarrotServ:
     self.active_sdi_count_max = 200 # 20 sec
 
     self.active_kisa_count = 0
+    self.external_navigation_active = False
 
     self.nSdiType = -1
     self.nSdiSpeedLimit = 0
@@ -138,6 +145,7 @@ class CarrotServ:
 
     self.diff_angle_count = 0
     self.last_calculate_gps_time = 0
+    self.position_mono_time = 0
     self.last_update_gps_time = 0
     self.last_update_gps_time_phone = 0
     self.last_update_gps_time_navi = 0
@@ -156,6 +164,7 @@ class CarrotServ:
     self.xSpdLimit = 0
     self.xSpdDist = 0
     self.xSpdType = -1
+    self.rear_camera_events = []
 
     self.xTurnInfo = -1
     self.xDistToTurn = 0
@@ -175,8 +184,10 @@ class CarrotServ:
     self.traffic_light_count = -1
     self.traffic_state = 0
 
-    self.left_spd_sec = 0
-    self.left_tbt_sec = 0
+    self.left_spd_sec = 100
+    self.left_tbt_sec = 100
+    self.speed_countdown_distance_last = 0.0
+    self.turn_countdown_distance_last = 0.0
     self.left_sec = 100
     self.max_left_sec = 100
     self.carrot_left_sec = 100
@@ -187,7 +198,23 @@ class CarrotServ:
     self.atc_activate_count = 0
     self.gas_override_speed = 0
     self.gas_pressed_state = False
+    self.speed_event_gas_pressed = False
     self.source_last = "none"
+    self.school_zone_gas_override_started_at = None
+    self.school_zone_suppressed = False
+
+    self.carrot_navi_session_id = ""
+    self.carrot_navi_speed_sequence = -1
+    self.carrot_navi_current_sequence = -1
+    self.carrot_navi_next_sequence = -1
+    self.carrot_navi_vehicle_sequence = -1
+    self.carrot_navi_route_sequence = -1
+    self.carrot_navi_active = False
+    self.carrot_navi_has_control = False
+    self.carrot_navi_road_limit_valid = False
+    self.carrot_navi_off_route = False
+    self.carrot_navi_traffic_active = False
+    self.carrot_navi_control = None
 
     self.debugText = ""
 
@@ -200,8 +227,13 @@ class CarrotServ:
   def update_params(self):
     self.autoNaviSpeedBumpSpeed = float(self.params.get_int("AutoNaviSpeedBumpSpeed"))
     self.autoNaviSpeedBumpTime = float(self.params.get_int("AutoNaviSpeedBumpTime"))
+    self.autoNaviSpeedBumpEndDistance = float(min(5000, max(0, self.params.get_int("AutoNaviSpeedBumpEndDistance")))) * 0.01
     self.autoNaviSpeedCtrlEnd = float(self.params.get_int("AutoNaviSpeedCtrlEnd"))
+    self.autoNaviRearCameraHoldDistance = float(min(300, max(0, self.params.get_int("AutoNaviRearCameraHoldDistance"))))
     self.autoNaviSpeedCtrlMode = self.params.get_int("AutoNaviSpeedCtrlMode")
+    self.vehicleNaviCanControl = min(3, max(0, self.params.get_int("VehicleNaviCanControl")))
+    self.vehicleNaviSchoolZoneControl = self.params.get_bool("VehicleNaviSchoolZoneControl")
+    self.vehicleSpeedCameraControlMode = min(3, max(0, self.params.get_int("VehicleSpeedCameraControlMode")))
     self.autoNaviSpeedSafetyFactor = float(self.params.get_int("AutoNaviSpeedSafetyFactor")) * 0.01
     self.autoNaviSpeedDecelRate = float(self.params.get_int("AutoNaviSpeedDecelRate")) * 0.01
     self.autoNaviCountDownMode = self.params.get_int("AutoNaviCountDownMode")
@@ -334,6 +366,217 @@ class CarrotServ:
       speed_mps = math.sqrt(temp)
     return max(safe_speed_kph, min(250, speed_mps * 3.6))
 
+  def _external_navigation_connected(self):
+    # Connection freshness, not the presence of a camera/bump or active guidance.
+    return self.carrot_navi_active or self.active_count > 0 or self.active_kisa_count > 0
+
+  def _update_navigation_source(self):
+    external_active = self._external_navigation_connected()
+    changed = external_active != self.external_navigation_active
+    self.external_navigation_active = external_active
+    if changed:
+      self.rear_camera_events = []
+      self.speed_countdown_distance_last = self.turn_countdown_distance_last = 0.0
+      self.left_spd_sec = self.left_tbt_sec = 100
+      self.gas_override_speed = 0
+      self.school_zone_gas_override_started_at = None
+      self.school_zone_suppressed = False
+    return changed
+
+  def _rear_camera_speed(self, CS, delta_dist):
+    # TMAP EDC SDI 75/76: rear speed / rear signal-and-speed camera.
+    # Arm only on the final approach. Keep the wheel-distance endpoint even
+    # when the app removes the SDI at the camera or announces the next item.
+    hold_distance = self.autoNaviRearCameraHoldDistance
+    if (CS is None or delta_dist < 0 or not self.external_navigation_active or
+        self.autoNaviSpeedCtrlMode <= 0 or hold_distance <= 0 or self.carrot_navi_off_route):
+      self.rear_camera_events = []
+      return 250.0, 0.0
+
+    self.rear_camera_events = [event for event in self.rear_camera_events
+                               if event["target"] + hold_distance > self.totalDistance]
+    if (self.active_carrot > 1 and self.xSpdType in (75, 76) and
+        0 < self.xSpdDist <= 50 and self.xSpdLimit > 0):
+      target = self.totalDistance + self.xSpdDist
+      matching = next((event for event in self.rear_camera_events if abs(event["target"] - target) <= 40), None)
+      if matching is None:
+        self.rear_camera_events.append({"target": target, "speed": self.xSpdLimit})
+      else:
+        # Repeated zero/near-zero reports must not move the hold endpoint.
+        matching["speed"] = min(matching["speed"], self.xSpdLimit)
+
+    if not self.rear_camera_events:
+      return 250.0, 0.0
+    event = min(self.rear_camera_events, key=lambda event: event["speed"])
+    return event["speed"], max(0.0, event["target"] + hold_distance - self.totalDistance)
+
+  def _vehicle_speed_camera_enabled(self, CS):
+    return (not self.external_navigation_active and
+            self.vehicleSpeedCameraControlMode > 0 and CS.speedLimit > 0 and CS.speedLimitDistance > 0 and
+            not (CS.schoolZoneActive and self.school_zone_suppressed) and
+            not (self.vehicleSpeedCameraControlMode == 3 and CS.gasPressed))
+
+  def _speed_bump_control_active(self, distance):
+    return distance > self.autoNaviSpeedBumpEndDistance
+
+  def _vehicle_speed_bump_enabled(self, CS):
+    return (not self.external_navigation_active and self.vehicleNaviCanControl and self.autoNaviSpeedCtrlMode >= 2 and
+            self._speed_bump_control_active(CS.speedBumpDistance))
+
+  def _vehicle_school_zone_enabled(self, CS):
+    if not CS.schoolZoneActive:
+      self.school_zone_gas_override_started_at = None
+      self.school_zone_suppressed = False
+      return False
+    return (not self.external_navigation_active and
+            self.vehicleNaviSchoolZoneControl and self.vehicleSpeedCameraControlMode > 0 and not self.school_zone_suppressed and
+            not (self.vehicleSpeedCameraControlMode == 3 and CS.gasPressed))
+
+  def _vehicle_school_zone_speed(self, CS):
+    return 30 if self._vehicle_school_zone_enabled(CS) else 250
+
+  def _vehicle_section_zone_enabled(self, CS):
+    return (not self.external_navigation_active and self.vehicleNaviCanControl and self.vehicleSpeedCameraControlMode > 0 and
+            getattr(CS, "vehicleNaviSectionActive", False) and getattr(CS, "vehicleNaviSpeed", 0) > 0 and
+            not (self.vehicleSpeedCameraControlMode == 3 and CS.gasPressed))
+
+  def _vehicle_navigation_display(self, CS):
+    if self.external_navigation_active or CS is None or not self.vehicleNaviCanControl or not getattr(CS, "vehicleNaviActive", False):
+      return False, 0, False
+    if CS.schoolZoneActive:
+      speed = 30
+    elif getattr(CS, "vehicleNaviSpeed", 0) > 0:
+      speed = int(CS.vehicleNaviSpeed * self.autoNaviSpeedSafetyFactor)
+    elif self._speed_bump_control_active(CS.speedBumpDistance):
+      speed = int(self.autoNaviSpeedBumpSpeed)
+    else:
+      speed = 0
+    return speed > 0, speed, bool(getattr(CS, "vehicleNaviSectionActive", False))
+
+  def _speed_countdown_distance(self, CS):
+    distances = []
+    legacy_bump_suppressed = self.xSpdType == 22 and self.autoNaviCountDownMode == 1
+    if self.external_navigation_active and self.xSpdDist > 0 and not legacy_bump_suppressed:
+      distances.append(self.xSpdDist)
+
+    vehicle_navi_active = (not self.external_navigation_active and CS is not None and self.vehicleNaviCanControl and
+                           getattr(CS, "vehicleNaviActive", False))
+    if vehicle_navi_active:
+      camera_distance = getattr(CS, "speedLimitDistance", 0)
+      if camera_distance > 0:
+        distances.append(camera_distance)
+      bump_distance = getattr(CS, "speedBumpDistance", 0)
+      if self.autoNaviCountDownMode >= 2 and bump_distance > 0:
+        distances.append(bump_distance)
+
+    return min(distances, default=0)
+
+  def _update_countdown_alert(self, left_sec, source, v_ego_kph):
+    if left_sec > 11:
+      self.left_sec = 100
+      self.max_left_sec = 100
+      self.carrot_left_sec = 100
+      self.sdi_inform = False
+      return
+
+    self.sdi_inform = source in ("cam", "hda")
+    self.max_left_sec = min(11, max(6, int(v_ego_kph / 10) + 1))
+    if left_sec != self.left_sec:
+      if left_sec == self.max_left_sec and self.sdi_inform:
+        self.carrot_left_sec = 11
+      elif 1 <= left_sec < self.max_left_sec:
+        self.carrot_left_sec = left_sec
+      elif left_sec == 0 and self.left_sec == 1:
+        self.carrot_left_sec = left_sec
+
+      self.left_sec = left_sec
+
+  @staticmethod
+  def _countdown_channel(distance, previous_distance, previous_left_sec, v_ego):
+    if distance <= 0:
+      return 100, 0.0, False
+
+    calculated = int(max(distance - v_ego, 1) / max(1, v_ego) + 0.5)
+    new_target = (previous_distance > 0 and
+                  distance - previous_distance > max(COUNTDOWN_NEW_TARGET_MIN_JUMP_M, v_ego * 2.0))
+    rearmed = new_target and previous_left_sec <= 11
+    left_sec = calculated if new_target else min(previous_left_sec, calculated)
+    return (100 if rearmed else left_sec), float(distance), rearmed
+
+  def _update_school_zone_gas_override(self, override_active):
+    if not override_active:
+      self.school_zone_gas_override_started_at = None
+      return
+
+    now = time.monotonic()
+    if self.school_zone_gas_override_started_at is None:
+      self.school_zone_gas_override_started_at = now
+    elif now - self.school_zone_gas_override_started_at >= SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S:
+      self.school_zone_suppressed = True
+
+  def _apply_speed_source_gas_floor(self, CS, desired_speed, source, v_ego_kph, road_speed_limit_changed):
+    speed_event_gas_rising = CS.gasPressed and not self.speed_event_gas_pressed
+    self.speed_event_gas_pressed = CS.gasPressed
+
+    if source in ("hda", "hda_section", "hda_bump", "school"):
+      # Vehicle speed bumps always allow an intentional accelerator override.
+      # Camera, section, and school sources follow mode 2 only after their
+      # target has fallen below the current speed and actual deceleration is
+      # requested.
+      gas_floor_active = source == "hda_bump" or self.vehicleSpeedCameraControlMode == 2
+      if not gas_floor_active:
+        self.gas_override_speed = 0
+      else:
+        reset_floor = (source != self.source_last or CS.vEgo < 0.1 or desired_speed > 150 or
+                       CS.brakePressed or road_speed_limit_changed)
+        if reset_floor:
+          self.gas_override_speed = 0
+        if self.gas_override_speed <= 0:
+          if (speed_event_gas_rising and not CS.brakePressed and CS.vEgo >= 0.1 and
+              desired_speed <= 150 and desired_speed < v_ego_kph):
+            # A new accelerator input during active event deceleration means
+            # the driver wants to ignore the remaining slowdown.
+            self.gas_override_speed = v_ego_kph
+        elif CS.gasPressed:
+          # Keep the highest speed reached while overriding this event.
+          self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+
+      self.source_last = source
+      override_active = gas_floor_active and desired_speed < self.gas_override_speed
+      if source == "school":
+        self._update_school_zone_gas_override(override_active)
+      elif not self.school_zone_suppressed:
+        self.school_zone_gas_override_started_at = None
+      if override_active:
+        return self.gas_override_speed, "gas"
+      return desired_speed, source
+
+    # Vehicle speed-camera modes must not change the existing accelerator
+    # override behavior for road limits, curves, or other navigation sources.
+    if source != self.source_last:
+      self.gas_override_speed = 0
+      self.gas_pressed_state = CS.gasPressed
+
+    reset_floor = (CS.vEgo < 0.1 or desired_speed > 150 or source in ["cam", "section", "police"] or
+                   CS.brakePressed or road_speed_limit_changed)
+    if reset_floor:
+      self.gas_override_speed = 0
+    elif source == "bump":
+      if self.gas_override_speed <= 0:
+        if speed_event_gas_rising and desired_speed < v_ego_kph:
+          self.gas_override_speed = v_ego_kph
+      elif CS.gasPressed:
+        self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+    elif CS.gasPressed and not self.gas_pressed_state:
+      self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
+    else:
+      self.gas_pressed_state = False
+
+    self.source_last = source
+    if desired_speed < self.gas_override_speed:
+      return self.gas_override_speed, "gas"
+    return desired_speed, source
+
   def _update_tbt(self):
     #xTurnInfo : 1: left turn, 2: right turn, 3: left lane change, 4: right lane change, 5: rotary, 6: tg, 7: arrive or uturn
     turn_type_mapping = {
@@ -404,6 +647,8 @@ class CarrotServ:
   def _get_sdi_descr(self, nSdiType):
     # 多语言映射：ko（韩语，原始），zh（简体中文），en（英文）。
     sdi_ko = {
+        75: "후면 과속 단속",
+        76: "후면 신호·과속 단속",
         0: "신호과속",
         1: "과속 (고정식)",
         2: "구간단속 시작",
@@ -474,6 +719,8 @@ class CarrotServ:
     }
 
     sdi_en = {
+        75: "Rear speed camera",
+        76: "Rear signal and speed camera",
         0: "Signal speed enforcement",
         1: "Speed camera (fixed)",
         2: "Section control start",
@@ -544,6 +791,8 @@ class CarrotServ:
     }
 
     sdi_zh = {
+        75: "后向测速摄像头",
+        76: "后向闯红灯及测速摄像头",
         0: "信号测速/闯灯拍照",
         1: "固定测速摄像头",
         2: "区间测速开始",
@@ -645,69 +894,278 @@ class CarrotServ:
       self.xSpdType = -1
       self.xSpdDist = 0
 
-  def _update_gps(self, v_ego, sm, gps_service):
-    gps = sm[gps_service]
-    #print(f"location = {sm.valid[llk]}, {sm.updated[llk]}, {sm.recv_frame[llk]}, {sm.recv_time[llk]}")
-    if not sm.updated['carState'] or not sm.updated['carControl']: # or not sm.updated[llk]:
-      return self.nPosAngle
-    CS = sm['carState']
-    CC = sm['carControl']
-    self.gps_valid = sm.updated[gps_service] and gps.hasFix
+  def _reset_carrot_navi_sequences(self, session_id):
+    self.rear_camera_events = []
+    self.carrot_navi_session_id = session_id
+    self.carrot_navi_speed_sequence = -1
+    self.carrot_navi_current_sequence = -1
+    self.carrot_navi_next_sequence = -1
+    self.carrot_navi_vehicle_sequence = -1
+    self.carrot_navi_route_sequence = -1
 
-    now = time.monotonic()
-    gps_updated_phone = (now - self.last_update_gps_time_phone) < 3
-    gps_updated_navi = (now - self.last_update_gps_time_navi) < 3
+  def _clear_carrot_navi_traffic(self):
+    if not getattr(self, "carrot_navi_traffic_active", False):
+      return
+    params_memory = getattr(self, "params_memory", None)
+    if params_memory is not None:
+      try:
+        params_memory.remove("TrafficLight")
+      except Exception:
+        pass
+    self.carrot_navi_traffic_active = False
 
-    bearing = self.nPosAngle
-    if gps_updated_navi:
-      bearing = self.nPosAngle
-    elif gps_updated_phone:
-      bearing = self.nPosAnglePhone
-    elif self.gps_valid:
-      bearing = self.nPosAngle = gps.bearingDeg
+  def _clear_carrot_navi_control(self):
+    self.rear_camera_events = []
+    self.active_count = 0
+    self.active_sdi_count = 0
+    self.carrot_navi_has_control = False
+    self.carrot_navi_road_limit_valid = False
+    self.carrot_navi_off_route = False
+    self.carrot_navi_control = None
+    self._reset_carrot_navi_sequences("")
 
-    self.bearing_offset = 0.0
-    # TODO:  여기서 bearing 보정로직 추가 필요함. CC.orientationNED[2]를 이용하여.
+    self.nSdiType = self.nSdiBlockType = self.nSdiPlusType = self.nSdiPlusBlockType = -1
+    self.nSdiSection = -1
+    self.nSdiSpeedLimit = self.nSdiDist = 0
+    self.nSdiBlockSpeed = self.nSdiBlockDist = 0
+    self.nSdiPlusSpeedLimit = self.nSdiPlusDist = 0
+    self.nSdiPlusBlockSpeed = self.nSdiPlusBlockDist = 0
+    self.xSpdType = -1
+    self.xSpdLimit = self.xSpdDist = 0
 
-    #print(f"bearing = {bearing:.1f}, posA=={self.nPosAngle:.1f}, posP=={self.nPosAnglePhone:.1f}, offset={self.bearing_offset:.1f}, {gps_updated_phone}, {gps_updated_navi}")
-    gpsDelayTimeAdjust = 0.0
-    if gps_updated_navi:
-      gpsDelayTimeAdjust = 0 #1.0
+    self.nTBTTurnType = self.nTBTTurnTypeNext = -1
+    self.nTBTDist = self.nTBTDistNext = 0
+    self.xTurnInfo = self.xTurnInfoNext = -1
+    self.xDistToTurn = self.xDistToTurnNext = 0
+    self.navType = self.navTypeNext = "invalid"
+    self.navModifier = self.navModifierNext = ""
 
-    external_gps_update_timedout = not (gps_updated_phone or gps_updated_navi)
-    #print(f"gps_valid = {self.gps_valid}, bearing = {bearing:.1f}, pos = {location.positionGeodetic.value[0]:.6f}, {location.positionGeodetic.value[1]:.6f}")
-    if self.gps_valid and external_gps_update_timedout:    # 내부GPS가 작동하고 carrotman으로부터 gps신호가 없는경우
-      self.vpPosPointLatNavi = gps.latitude
-      self.vpPosPointLonNavi = gps.longitude
-      self.last_calculate_gps_time = now #sm.recv_time[llk]
-    elif gps_updated_navi:  # carrot navi로부터 gps신호가 수신되는 경우..
-      if abs(self.bearing_measured - bearing) < 0.1:
-          self.diff_angle_count += 1
-      else:
-          self.diff_angle_count = 0
-      self.bearing_measured = bearing
+    self.nGoPosDist = self.nGoPosTime = 0
+    self.last_update_gps_time_navi = 0
+    self._gps_sources().remove('external_navi')
+    self.szPosRoadName = ""
+    self._clear_carrot_navi_traffic()
 
-      if self.diff_angle_count > 5: # 조향각도변화가 거의 없을때만 업데이트
-        diff_angle = (self.nPosAngle - bearing) % 360
-        if diff_angle > 180:
-          diff_angle -= 360
-        self.bearing_offset = self.bearing_offset * 0.9 + diff_angle * 0.1
+  def _apply_carrot_navi_speed(self, navi: CarrotNaviControl):
+    speed = navi.speed
+    self.carrot_navi_road_limit_valid = speed.road_limit_kph is not None
+    if speed.road_limit_kph is not None:
+      self.nRoadLimitSpeed = speed.road_limit_kph
 
-    bearing_calculated = (bearing + self.bearing_offset) % 360
-
-    dt = now - self.last_calculate_gps_time
-    #print(f"dt = {dt:.1f}, {self.vpPosPointLatNavi}, {self.vpPosPointLonNavi}")
-    if dt > 5.0:
-      self.vpPosPointLat, self.vpPosPointLon = 0.0, 0.0
-    elif dt == 0:
-      self.vpPosPointLat, self.vpPosPointLon = self.vpPosPointLatNavi, self.vpPosPointLonNavi
+    if speed.section_active:
+      self.nSdiType = 4
+      self.nSdiSpeedLimit = speed.section_speed_limit_kph
+      self.nSdiDist = speed.section_remaining_distance_m
+      self.nSdiSection = 1
+      self.nSdiBlockType = 2
+      self.nSdiBlockSpeed = speed.section_speed_limit_kph
+      self.nSdiBlockDist = speed.section_remaining_distance_m
+    elif speed.sdi_present:
+      self.nSdiType = speed.sdi_type
+      self.nSdiSpeedLimit = speed.sdi_speed_limit_kph
+      self.nSdiDist = speed.sdi_distance_m
+      self.nSdiSection = speed.sdi_section_type
+      self.nSdiBlockType = speed.sdi_block_type
+      self.nSdiBlockSpeed = speed.sdi_block_speed_kph
+      self.nSdiBlockDist = speed.sdi_block_distance_m
     else:
-      self.vpPosPointLat, self.vpPosPointLon = self.estimate_position(float(self.vpPosPointLatNavi), float(self.vpPosPointLonNavi), v_ego, bearing_calculated, dt + gpsDelayTimeAdjust)
+      self.nSdiType = -1
+      self.nSdiSpeedLimit = 0
+      self.nSdiDist = 0
+      self.nSdiSection = -1
+      self.nSdiBlockType = -1
+      self.nSdiBlockSpeed = 0
+      self.nSdiBlockDist = 0
 
-    #self.debugText = " {} {:.1f},{:.1f}={:.1f}+{:.1f}".format(self.active_sdi_count, self.nPosAngle, bearing_calculated, bearing, self.bearing_offset)
-    #print("nPosAngle = {:.1f},{:.1f} = {:.1f}+{:.1f}".format(self.nPosAngle, bearing_calculated, bearing, self.bearing_offset))
+    if speed.secondary_sdi_present:
+      self.nSdiPlusType = speed.secondary_sdi_type
+      self.nSdiPlusSpeedLimit = speed.secondary_sdi_speed_limit_kph
+      self.nSdiPlusDist = speed.secondary_sdi_distance_m
+      self.nSdiPlusBlockType = speed.secondary_sdi_block_type
+      self.nSdiPlusBlockSpeed = speed.secondary_sdi_block_speed_kph
+      self.nSdiPlusBlockDist = speed.secondary_sdi_block_distance_m
+    else:
+      self.nSdiPlusType = -1
+      self.nSdiPlusSpeedLimit = 0
+      self.nSdiPlusDist = 0
+      self.nSdiPlusBlockType = -1
+      self.nSdiPlusBlockSpeed = 0
+      self.nSdiPlusBlockDist = 0
+    self._update_sdi()
 
-    return float(bearing_calculated)
+  def _apply_carrot_navi_vehicle(self, navi: CarrotNaviControl):
+    vehicle = navi.vehicle
+    if not vehicle.present:
+      self.last_update_gps_time_navi = 0
+      self._gps_sources().remove('external_navi')
+      self.szPosRoadName = ""
+      return
+
+    if vehicle.sequence == self.carrot_navi_vehicle_sequence:
+      return
+    now = time.monotonic()
+    # A cereal heartbeat is not a GPS fix. Retain the original local receipt
+    # time so dead reckoning and map freshness cannot restart on repeated data.
+    # Older senders without receipt metadata use their first observation only.
+    received = vehicle.received_mono_time_ns / 1e9 if vehicle.received_mono_time_ns else now
+    if received > now:
+      return
+    self.carrot_navi_vehicle_sequence = vehicle.sequence
+    self.vpPosPointLatNavi = vehicle.latitude
+    self.vpPosPointLonNavi = vehicle.longitude
+    self.nPosAngle = vehicle.heading_deg
+    self.nPosSpeed = vehicle.speed_kph
+    self.szPosRoadName = vehicle.road_name
+    self.last_update_gps_time_navi = self.last_calculate_gps_time = received
+    self._gps_sources().put('external_navi', vehicle.latitude, vehicle.longitude, vehicle.heading_deg,
+                            vehicle.speed_kph / 3.6, received)
+
+  def _apply_carrot_navi_route(self, navi: CarrotNaviControl):
+    route = navi.route
+    self.carrot_navi_route_sequence = route.sequence
+    self.nGoPosDist = route.remaining_distance_m if route.present else 0
+    self.nGoPosTime = route.remaining_time_sec if route.present else 0
+
+  def _apply_carrot_navi_traffic(self, navi: CarrotNaviControl):
+    traffic = navi.traffic
+    if not traffic.present or not traffic.visible or not traffic.lamp or traffic.remain_sec <= 0:
+      self._clear_carrot_navi_traffic()
+      return
+
+    params_memory = getattr(self, "params_memory", None)
+    if params_memory is None:
+      return
+    value = {
+      "distance": traffic.distance_m,
+      "lamp": traffic.lamp,
+      "remain": traffic.remain_sec,
+      "source": traffic.source,
+      "ts": time.monotonic(),
+    }
+    try:
+      params_memory.put_nonblocking("TrafficLight", json.dumps(value))
+      self.carrot_navi_traffic_active = True
+    except Exception:
+      pass
+
+  def _apply_carrot_navi_guidance(self, navi: CarrotNaviControl, force=False):
+    current = navi.current
+    current_changed = force or current.sequence != self.carrot_navi_current_sequence
+    next_guidance = navi.next
+    next_changed = force or next_guidance.sequence != self.carrot_navi_next_sequence
+    if not current_changed and not next_changed:
+      return
+
+    old_current_dist = self.xDistToTurn
+    old_next_dist = self.xDistToTurnNext
+    if current_changed:
+      self.carrot_navi_current_sequence = current.sequence
+      self.nTBTDist = current.distance_m if current.present else 0
+      self.nTBTTurnType = current.turn_type if current.present else -1
+      self.szTBTMainText = current.main_text if current.present else ""
+      self.szNearDirName = current.near_direction if current.present else ""
+      self.szFarDirName = current.far_direction if current.present else ""
+
+    if next_changed:
+      self.carrot_navi_next_sequence = next_guidance.sequence
+      self.nTBTDistNext = next_guidance.distance_m if next_guidance.present else 0
+      self.nTBTTurnTypeNext = next_guidance.turn_type if next_guidance.present else -1
+      self.szTBTMainTextNext = next_guidance.main_text if next_guidance.present else ""
+
+    self._update_tbt()
+    if not current_changed:
+      self.xDistToTurn = old_current_dist
+    if not next_changed:
+      self.xDistToTurnNext = old_next_dist
+
+  def _update_carrot_navi(self, sm):
+    service_active = sm.alive['carrotNavi'] and sm.valid['carrotNavi']
+    if service_active and not sm.updated['carrotNavi']:
+      if self.carrot_navi_active and self.carrot_navi_has_control:
+        self.active_count = 80
+        self.active_sdi_count = self.active_sdi_count_max
+      return self.carrot_navi_active and self.carrot_navi_has_control
+
+    navi = parse_carrot_navi_control(sm['carrotNavi']) if service_active else None
+    was_active = self.carrot_navi_active
+    self.carrot_navi_active = navi is not None
+    if navi is None:
+      if was_active:
+        self._clear_carrot_navi_control()
+      return False
+
+    self.carrot_navi_control = navi
+    new_session = navi.session_id != self.carrot_navi_session_id
+    if navi.session_id != self.carrot_navi_session_id:
+      self._reset_carrot_navi_sequences(navi.session_id)
+    off_route_changed = navi.off_route != self.carrot_navi_off_route
+    self.carrot_navi_off_route = navi.off_route
+    self.carrot_navi_road_limit_valid = navi.speed.road_limit_kph is not None
+    self.carrot_navi_has_control = (
+      navi.speed.present or navi.current.present or navi.next.present
+      or navi.guidance_active or navi.route.present
+    )
+
+    if new_session or off_route_changed or navi.speed.sequence != self.carrot_navi_speed_sequence:
+      self.carrot_navi_speed_sequence = navi.speed.sequence
+      self._apply_carrot_navi_speed(navi)
+
+    # Traffic Params still use the service heartbeat; GPS only accepts new fixes.
+    self._apply_carrot_navi_vehicle(navi)
+    self._apply_carrot_navi_traffic(navi)
+    if new_session or navi.route.sequence != self.carrot_navi_route_sequence:
+      self._apply_carrot_navi_route(navi)
+
+    if navi.road_category is not None:
+      self.roadcate = navi.road_category
+    self._apply_carrot_navi_guidance(navi, force=new_session or off_route_changed)
+    if self.carrot_navi_has_control:
+      self.active_count = 80
+      self.active_sdi_count = self.active_sdi_count_max
+    return self.carrot_navi_has_control
+
+  def _gps_sources(self):
+    if not hasattr(self, 'gps_sources'):
+      self.gps_sources = GPSSources()
+    return self.gps_sources
+
+  def _update_gps(self, v_ego, sm, gps_service):
+    now = time.monotonic()
+    sources = self._gps_sources()
+    gps = sm[gps_service]
+    if sm.updated[gps_service]:
+      if sm.valid[gps_service] and gps.hasFix:
+        sources.put('device', gps.latitude, gps.longitude, gps.bearingDeg, gps.speed, sm.recv_time[gps_service])
+      else:
+        sources.remove('device')
+    if not sm.alive[gps_service] or not sm.valid[gps_service]:
+      sources.remove('device')
+    vehicle = sm['carState'].vehicleGps
+    ego_speed = v_ego if math.isfinite(v_ego) and 0 <= v_ego <= 90 else 0.
+    if sm.alive['carState'] and sm.valid['carState'] and vehicle.valid:
+      sources.put('vehicle', vehicle.latitude, vehicle.longitude,
+                  vehicle.headingDeg if vehicle.headingValid else None, ego_speed, vehicle.sampleMonoTime / 1e9)
+    else:
+      sources.remove('vehicle')
+    source, fix = sources.select(now)
+    if source != getattr(self, 'position_source', 'none'):
+      print(f'[GPS] source={source}', flush=True)
+    self.position_source = source
+    self.position_mono_time = now
+    self.position_heading_valid = fix is not None and fix.heading is not None
+    if fix is None:
+      self.vpPosPointLat = self.vpPosPointLon = 0.
+      self.last_calculate_gps_time = 0.
+      return float(self.nPosAngle)
+    self.last_calculate_gps_time = fix.stamp
+    if fix.heading is not None:
+      self.nPosAngle = fix.heading
+    self.nPosSpeed = fix.speed * 3.6
+    # Unknown direction permits a raw position, never guessed motion.
+    elapsed = now - fix.stamp if fix.heading is not None else 0.
+    self.vpPosPointLat, self.vpPosPointLon = self.estimate_position(
+      fix.latitude, fix.longitude, ego_speed, self.nPosAngle, elapsed)
+    return float(self.nPosAngle)
 
 
   def estimate_position(self, lat, lon, speed, angle, dt):
@@ -797,6 +1255,8 @@ class CarrotServ:
     return atc_desired, atc_type, atc_speed, atc_dist
 
   def update_nav_instruction(self, sm):
+    if self._external_navigation_connected():
+      return
     if sm.alive['navInstruction'] and sm.valid['navInstruction']:
       msg_nav = sm['navInstruction']
 
@@ -850,16 +1310,15 @@ class CarrotServ:
         xSpdType = 100
 
       if xSpdType >= 0:
-        offset = 5 if self.is_metric else 5 * CV.MPH_TO_KPH
-        self.xSpdLimit = self.nRoadLimitSpeed + offset
-
+        self.xSpdLimit = self.nRoadLimitSpeed * self.autoNaviSpeedSafetyFactor if self.nRoadLimitSpeed > 0 else 0
         self.xSpdDist = distance
-        self.xSpdType =xSpdType
+        self.xSpdType = xSpdType
 
   def update_navi(self, remote_ip, sm, pm, vturn_speed, coords, distances, route_speed, gps_service):
 
     self.debugText = ""
     self.update_params()
+    carrot_navi_active = self._update_carrot_navi(sm)
     if sm.alive['carState'] and sm.alive['selfdriveState']:
       CS = sm['carState']
       v_ego = CS.vEgo
@@ -867,15 +1326,11 @@ class CarrotServ:
       distanceTraveled = sm['selfdriveState'].distanceTraveled
       delta_dist = distanceTraveled - self.totalDistance
       self.totalDistance = distanceTraveled
-      if CS.speedLimit > 0 and self.active_carrot <= 1:
-        self.nRoadLimitSpeed = CS.speedLimit
     else:
       v_ego = v_ego_kph = 0
       delta_dist = 0
       CS = None
 
-    road_speed_limit_changed = True if self.nRoadLimitSpeed != self.nRoadLimitSpeed_last else False
-    self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     #self.bearing = self.nPosAngle #self._update_gps(v_ego, sm)
     self.bearing = self._update_gps(v_ego, sm, gps_service)
 
@@ -885,6 +1340,11 @@ class CarrotServ:
     self.active_count = max(self.active_count - 1, 0)
     self.active_sdi_count = max(self.active_sdi_count - 1, 0)
     self.active_kisa_count = max(self.active_kisa_count - 1, 0)
+    navigation_source_changed = self._update_navigation_source()
+    if not self.external_navigation_active and CS is not None and CS.speedLimit > 0:
+      self.nRoadLimitSpeed = CS.speedLimit
+    road_speed_limit_changed = self.nRoadLimitSpeed != self.nRoadLimitSpeed_last
+    self.nRoadLimitSpeed_last = self.nRoadLimitSpeed
     if self.active_kisa_count > 0:
       self.active_carrot = 2
 
@@ -894,7 +1354,8 @@ class CarrotServ:
       self.active_carrot = 0
 
     limit_speed = 200
-    if self.autoRoadSpeedLimitOffset >= 0 and self.active_carrot>=2:
+    road_limit_valid = not carrot_navi_active or self.carrot_navi_road_limit_valid
+    if self.autoRoadSpeedLimitOffset >= 0 and self.active_carrot>=2 and road_limit_valid:
       if self.nRoadLimitSpeed >= 30:
         road_speed_limit_offset = self.autoRoadSpeedLimitOffset
         if not self.is_metric:
@@ -910,6 +1371,7 @@ class CarrotServ:
     if self.active_carrot <= 1 or self.active_kisa_count > 0:
       self.update_nav_instruction(sm)
 
+    rear_camera_speed, rear_camera_remaining = self._rear_camera_speed(CS, delta_dist)
     if self.xSpdType < 0 or (self.xSpdType not in [100,101] and self.xSpdDist <= 0) or (self.xSpdType in [100,101] and self.xSpdDist < -250):
       self.xSpdType = -1
       self.xSpdDist = self.xSpdLimit = 0
@@ -921,9 +1383,18 @@ class CarrotServ:
       self.xTurnInfoNext = -1
 
     sdi_speed = 250
-    hda_active = False
+    vehicle_camera_speed = 250
+    vehicle_speed_camera_active = CS is not None and self._vehicle_speed_camera_enabled(CS)
+    vehicle_bump_active = CS is not None and self._vehicle_speed_bump_enabled(CS)
+    vehicle_bump_speed = 250
+    vehicle_school_zone_speed = 250
+    vehicle_section_zone_speed = 250
     ### 과속카메라, 사고방지턱
-    if (self.xSpdDist > 0 or self.xSpdType in [100, 101]) and self.active_carrot > 0:
+    legacy_sdi_active = (self.external_navigation_active and
+                         self.xSpdLimit > 0 and (self.xSpdDist > 0 or self.xSpdType in [100, 101]) and
+                         self.active_carrot > 0 and
+                         (self.xSpdType != 22 or self._speed_bump_control_active(self.xSpdDist)))
+    if legacy_sdi_active:
       safe_sec = self.autoNaviSpeedBumpTime if self.xSpdType == 22 else self.autoNaviSpeedCtrlEnd
       decel = self.autoNaviSpeedDecelRate
       sdi_speed = min(sdi_speed, self.calculate_current_speed(self.xSpdDist, self.xSpdLimit, safe_sec, decel))
@@ -931,16 +1402,29 @@ class CarrotServ:
       if self.xSpdType == 4 or (self.xSpdType in [100, 101] and self.xSpdDist <= 0):
         sdi_speed = self.xSpdLimit
         self.active_carrot = 4
-    elif CS is not None and CS.speedLimit > 0 and CS.speedLimitDistance > 0:
-      sdi_speed = min(sdi_speed,
-                      self.calculate_current_speed(CS.speedLimitDistance,
-                                                   CS.speedLimit * self.autoNaviSpeedSafetyFactor,
-                                                   self.autoNaviSpeedCtrlEnd,
-                                                   self.autoNaviSpeedDecelRate))
+    if vehicle_speed_camera_active:
+      vehicle_camera_speed = self.calculate_current_speed(CS.speedLimitDistance,
+                                                          CS.speedLimit * self.autoNaviSpeedSafetyFactor,
+                                                          self.autoNaviSpeedCtrlEnd,
+                                                          self.autoNaviSpeedDecelRate)
       #self.active_carrot = 6
-      hda_active = True
 
-    #print(f"sdi_speed: {sdi_speed}, hda_active: {hda_active}, xSpdType: {self.xSpdType}, xSpdDist: {self.xSpdDist}, active_carrot: {self.active_carrot}, v_ego_kph: {v_ego_kph}, nRoadLimitSpeed: {self.nRoadLimitSpeed}")
+    if vehicle_bump_active:
+      vehicle_bump_speed = self.calculate_current_speed(CS.speedBumpDistance,
+                                                        self.autoNaviSpeedBumpSpeed,
+                                                        self.autoNaviSpeedBumpTime,
+                                                        self.autoNaviSpeedDecelRate)
+      self.active_carrot = 5
+
+    if CS is not None:
+      vehicle_school_zone_speed = self._vehicle_school_zone_speed(CS)
+      if vehicle_school_zone_speed < 250:
+        self.active_carrot = 6
+      if self._vehicle_section_zone_enabled(CS):
+        vehicle_section_zone_speed = CS.vehicleNaviSpeed * self.autoNaviSpeedSafetyFactor
+        self.active_carrot = 4
+
+    #print(f"sdi_speed: {sdi_speed}, vehicle_speed_camera_active: {vehicle_speed_camera_active}, xSpdType: {self.xSpdType}, xSpdDist: {self.xSpdDist}, active_carrot: {self.active_carrot}, v_ego_kph: {v_ego_kph}, nRoadLimitSpeed: {self.nRoadLimitSpeed}")
     ### TBT 속도제어
     atc_desired, self.atcType, self.atcSpeed, self.atcDist = self.update_auto_turn(v_ego*3.6, sm, self.xTurnInfo, self.xDistToTurn, True)
     atc_desired_next, _, _, _ = self.update_auto_turn(v_ego*3.6, sm, self.xTurnInfoNext, self.xDistToTurnNext, False)
@@ -968,10 +1452,21 @@ class CarrotServ:
       self.atcType = "none"
 
 
+    rear_camera_holding = rear_camera_speed < 250 and rear_camera_speed <= sdi_speed
+    sdi_speed = min(sdi_speed, rear_camera_speed)
+    if rear_camera_holding:
+      self.active_carrot = 3
+    sdi_source = ("cam" if rear_camera_holding else "bump" if self.xSpdType == 22 else "section" if self.xSpdType == 4 else
+                  "police" if self.xSpdType == 100 else
+                  "waze" if self.xSpdType == 101 else "cam")
     speed_n_sources = [
       (atc_desired, "atc"),
       (atc_desired_next, "atc2"),
-      (sdi_speed, "hda" if hda_active else "bump" if self.xSpdType == 22 else "section" if self.xSpdType == 4 else "police" if self.xSpdType == 100 else "waze" if self.xSpdType == 101 else "cam"),
+      (sdi_speed, sdi_source),
+      (vehicle_camera_speed, "hda"),
+      (vehicle_bump_speed, "hda_bump"),
+      (vehicle_school_zone_speed, "school"),
+      (vehicle_section_zone_speed, "hda_section"),
       (limit_speed, "road"),
     ]
     if self.turnSpeedControlMode in [1,2]:
@@ -985,64 +1480,36 @@ class CarrotServ:
       speed_n_sources.append((route_speed, "route"))
       #speed_n_sources.append((self.calculate_current_speed(dist, speed * self.mapTurnSpeedFactor, 0, 1.2), "route"))
 
-    model_turn_speed = max(sm['modelV2'].meta.modelTurnSpeed, self.autoCurveSpeedLowerLimit)
-    if model_turn_speed < 200 and abs(vturn_speed) < 120:
-      speed_n_sources.append((model_turn_speed, "model"))
-
     desired_speed, source = min(speed_n_sources, key=lambda x: x[0])
 
     if CS is not None:
-      if source != self.source_last:
-        self.gas_override_speed = 0
-        self.gas_pressed_state = CS.gasPressed
-      if CS.vEgo < 0.1 or desired_speed > 150 or source in ["cam", "section", "police"] or CS.brakePressed or road_speed_limit_changed:
-        self.gas_override_speed = 0
-      elif CS.gasPressed and not self.gas_pressed_state:
-        self.gas_override_speed = max(v_ego_kph, self.gas_override_speed)
-      else:
-        self.gas_pressed_state = False
-      self.source_last = source
-
-      if desired_speed < self.gas_override_speed:
-        source = "gas"
-        desired_speed = self.gas_override_speed
+      desired_speed, source = self._apply_speed_source_gas_floor(
+        CS, desired_speed, source, v_ego_kph, road_speed_limit_changed,
+      )
 
       self.debugText += f"route={route_speed:.1f}"#f"desired={desired_speed:.1f},{source},g={self.gas_override_speed:.0f}"
 
     left_spd_sec = 100
     left_tbt_sec = 100
+    speed_countdown_rearmed = False
+    turn_countdown_rearmed = False
     if self.autoNaviCountDownMode > 0:
-      if self.xSpdType == 22 and self.autoNaviCountDownMode == 1: # speed bump
-        pass
-      else:
-        if self.xSpdDist > 0:
-          left_spd_sec = min(self.left_spd_sec, int(max(self.xSpdDist - v_ego, 1) / max(1, v_ego) + 0.5))
-
-      if self.xDistToTurn > 0:
-        left_tbt_sec = min(self.left_tbt_sec, int(max(self.xDistToTurn - v_ego, 1) / max(1, v_ego) + 0.5))
+      speed_countdown_distance = self._speed_countdown_distance(CS)
+      left_spd_sec, self.speed_countdown_distance_last, speed_countdown_rearmed = self._countdown_channel(
+        speed_countdown_distance, self.speed_countdown_distance_last, self.left_spd_sec, v_ego,
+      )
+      left_tbt_sec, self.turn_countdown_distance_last, turn_countdown_rearmed = self._countdown_channel(
+        self.xDistToTurn, self.turn_countdown_distance_last, self.left_tbt_sec, v_ego,
+      )
+    else:
+      self.speed_countdown_distance_last = 0.0
+      self.turn_countdown_distance_last = 0.0
 
     self.left_spd_sec = left_spd_sec
     self.left_tbt_sec = left_tbt_sec
 
-    left_sec = min(left_spd_sec, left_tbt_sec)
-
-    if left_sec > 11:
-      self.left_sec = 100
-      self.max_left_sec = 100
-    else:
-      self.sdi_inform = True if source in ["cam", "hda"] else False
-      self.max_left_sec = min(11, max(6, int(v_ego_kph/10) + 1))
-
-    if left_sec != self.left_sec:
-      if left_sec == self.max_left_sec and self.sdi_inform:
-        self.carrot_left_sec = 11
-      elif 1 <= left_sec < self.max_left_sec:
-        self.carrot_left_sec = left_sec
-      elif left_sec == 0 and self.left_sec == 1:
-        self.carrot_left_sec = left_sec
-
-      self.left_sec = left_sec
-
+    left_sec = 100 if navigation_source_changed or speed_countdown_rearmed or turn_countdown_rearmed else min(left_spd_sec, left_tbt_sec)
+    self._update_countdown_alert(left_sec, source, v_ego_kph)
 
     self._update_cmd()
     msg = messaging.new_message('carrotMan')
@@ -1059,10 +1526,15 @@ class CarrotServ:
     msg.carrotMan.xTurnCountDown = int(left_tbt_sec)
     msg.carrotMan.atcType = self.atcType
     msg.carrotMan.vTurnSpeed = int(vturn_speed)
-    msg.carrotMan.szPosRoadName = self.debugText #self.szPosRoadName + self.debugText
+    msg.carrotMan.szPosRoadName = f"{self.szPosRoadName} {self.debugText}".strip()
     msg.carrotMan.szTBTMainText = self.szTBTMainText
     msg.carrotMan.desiredSpeed = int(desired_speed)
     msg.carrotMan.desiredSource = source
+    vehicle_navi_active, vehicle_navi_speed, vehicle_navi_section_active = self._vehicle_navigation_display(CS)
+    msg.carrotMan.vehicleNaviActive = vehicle_navi_active
+    msg.carrotMan.vehicleNaviSpeed = vehicle_navi_speed
+    msg.carrotMan.vehicleNaviSectionActive = vehicle_navi_section_active
+    msg.carrotMan.vehicleNaviAvailable = bool(getattr(CS, "vehicleNaviAvailable", False))
     msg.carrotMan.carrotCmdIndex = int(self.carrotCmdIndex)
     msg.carrotMan.carrotCmd = self.carrotCmd
     msg.carrotMan.carrotArg = self.carrotArg
@@ -1071,11 +1543,18 @@ class CarrotServ:
     msg.carrotMan.xPosSpeed = float(v_ego_kph) #float(self.nPosSpeed)
     msg.carrotMan.xPosAngle = float(self.bearing)
     msg.carrotMan.xPosLat = float(self.vpPosPointLat)
+    msg.carrotMan.positionFixMonoTime = max(0, int(self.last_calculate_gps_time * 1e9))
+    msg.carrotMan.positionSource = getattr(self, 'position_source', 'none')
+    msg.carrotMan.positionHeadingValid = getattr(self, 'position_heading_valid', False)
+    msg.carrotMan.positionMonoTime = max(0, int(self.position_mono_time * 1e9))
     msg.carrotMan.xPosLon = float(self.vpPosPointLon)
 
     msg.carrotMan.nGoPosDist = self.nGoPosDist
     msg.carrotMan.nGoPosTime = self.nGoPosTime
     msg.carrotMan.szSdiDescr = self._get_sdi_descr(-1 if self.nSdiType == 0 and self.nSdiDist == 0 else self.nSdiType)
+    if rear_camera_holding and source == "cam":
+      label = {"ko": "후면단속 속도 유지", "en": "Rear camera speed hold", "zh": "后向测速限速保持"}.get(self.lang, "Rear camera speed hold")
+      msg.carrotMan.szSdiDescr = f"{label} {math.ceil(rear_camera_remaining)}m"
 
     #coords_str = ";".join([f"{x},{y}" for x, y in coords])
     coords_str = ";".join([f"{x:.2f},{y:.2f},{d:.2f}" for (x, y), d in zip(coords, distances, strict=False)])
@@ -1084,7 +1563,7 @@ class CarrotServ:
     msg.carrotMan.leftSec = int(self.carrot_left_sec)
     pm.send('carrotMan', msg)
 
-    inst = messaging.new_message('navInstructionCarrot')
+    inst = messaging.new_message('navInstructionCarrot', valid=False)
     if self.active_carrot > 1 and self.active_kisa_count <= 0:
       inst.valid = True
 
@@ -1124,7 +1603,8 @@ class CarrotServ:
           maneuvers.append(maneuver)
 
       instruction.allManeuvers = maneuvers
-    elif sm.alive['navInstruction'] and sm.valid['navInstruction']:
+    elif not self._external_navigation_connected() and sm.alive['navInstruction'] and sm.valid['navInstruction']:
+      inst.valid = True
       inst.navInstructionCarrot = sm['navInstruction']
 
     pm.send('navInstructionCarrot', inst)
@@ -1169,6 +1649,9 @@ class CarrotServ:
     try:
         subprocess.run(["sudo", "ln", "-s", zoneinfo_path, localtime_path], check=True)
         print(f"Timezone successfully set to: {timezone}")
+        # 앱이 보낸 타임존은 최고 우선순위로 기록 -> timed.py의 wifi/gps 추정이 덮어쓰지 않음
+        self.params.put("TimezoneName", timezone)
+        self.params.put("TimezoneSource", "app")
     except subprocess.CalledProcessError as e:
         print(f"Failed to set timezone to {timezone}: {e}")
 
@@ -1281,6 +1764,10 @@ class CarrotServ:
       if self.vpPosPointLatNavi != 0.0:
         self.last_update_gps_time_navi = self.last_calculate_gps_time = now
         self.nPosAngle = float(json.get("nPosAngle", self.nPosAngle))
+        self._gps_sources().put('external_navi', self.vpPosPointLatNavi, self.vpPosPointLonNavi,
+                                _f(json.get('nPosAngle'), math.nan), _f(json.get('nPosSpeed'), 0) / 3.6, now)
+      else:
+        self._gps_sources().remove('external_navi')
 
       self.nPosSpeed = float(json.get("nPosSpeed", self.nPosSpeed))
       self._update_tbt()
@@ -1295,23 +1782,19 @@ class CarrotServ:
       #print(json)
       pass
 
-    # 3초간 navi 데이터가 없으면, phone gps로 업데이트
+    # Keep phone fixes while navigation has priority. A handover never renews
+    # a receipt timestamp; a disconnected phone expires after three seconds.
     if "latitude" in json:
-      self.nPosAnglePhone = _f(json.get("heading"), self.nPosAngle)
-      self.phone_latitude = _f(json.get("latitude"), self.vpPosPointLatNavi)
-      self.phone_longitude = _f(json.get("longitude"), self.vpPosPointLonNavi)
-      self.phone_gps_accuracy = _f(json.get("accuracy"), 0)
-      if self.phone_gps_accuracy < 15.0:
-        self.phone_gps_frame += 1
-      if (now - self.last_update_gps_time_navi) > 3.0:
-        self.vpPosPointLatNavi = self.phone_latitude
-        self.vpPosPointLonNavi = self.phone_longitude
-
-        self.nPosAngle = self.nPosAnglePhone
-        # self.nPosSpeed = self.ve # TODO speed from v_ego
-        self.last_update_gps_time_phone = self.last_calculate_gps_time = now        
-        self.nPosSpeed = float(json.get("gps_speed", 0))
-        print(f"phone gps: {self.vpPosPointLatNavi}, {self.vpPosPointLonNavi}, {self.phone_gps_accuracy}, {self.nPosSpeed}")
+      self.phone_latitude = _f(json.get("latitude"), math.nan)
+      self.phone_longitude = _f(json.get("longitude"), math.nan)
+      self.nPosAnglePhone = _f(json.get("heading"), math.nan)
+      self.phone_gps_accuracy = _f(json.get("accuracy"), math.nan)
+      if math.isfinite(self.phone_gps_accuracy) and 0 <= self.phone_gps_accuracy <= 30:
+        self.last_update_gps_time_phone = now
+        self._gps_sources().put('phone', self.phone_latitude, self.phone_longitude, self.nPosAnglePhone,
+                                _f(json.get('gps_speed'), 0) / 3.6, now)
+      else:
+        self._gps_sources().remove('phone')
 
 
 import traceback

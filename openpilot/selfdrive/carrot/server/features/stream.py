@@ -15,6 +15,9 @@ def _request_summary(body: bytes) -> dict:
       "cameras": payload.get("cameras"),
       "bridge_services_in": payload.get("bridge_services_in"),
       "bridge_services_out": payload.get("bridge_services_out"),
+      "client_id": str(payload.get("client_id") or "")[:128],
+      "takeover": bool(payload.get("takeover")),
+      "carrot_state": bool(payload.get("carrot_state")),
       "sdp_bytes": len(str(payload.get("sdp") or "")),
     }
   except Exception:
@@ -50,7 +53,9 @@ async def proxy_stream(request: web.Request) -> web.StreamResponse:
         "elapsed_ms": round((time.monotonic() - started_at) * 1000, 1),
       })
       return out
-  except asyncio.TimeoutError:
+  except asyncio.CancelledError:
+    raise
+  except TimeoutError:
     record_stream_proxy_event({
       **base_event,
       "ok": False,

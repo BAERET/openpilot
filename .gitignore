@@ -25,6 +25,11 @@ a.out
 .*.swo
 .*.un~
 *.tmp
+.tmp_radar_*
+# Local analysis archives and scratch work (never publish vehicle captures).
+/.analysis/
+/.tmp_*
+__pycache__/
 *.o
 *.o-*
 *.os
@@ -105,3 +110,6 @@ Pipfile
 .history
 .ionide
 .vs
+
+# Local Windows native CPU test builds
+*.pyd

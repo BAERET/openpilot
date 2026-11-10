@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from opendbc.car.carlog import carlog
 from opendbc.can.dbc import DBC, Signal
+from opendbc.can import native
 
 
 MAX_BAD_COUNTER = 5
@@ -59,10 +60,14 @@ class MessageState:
     if self.first_seen_nanos == 0:
       self.first_seen_nanos = nanos
 
+    decoded = native.raw_values(dat, self.signals) if native.raw_values is not None else None
     for i, sig in enumerate(self.signals):
-      tmp = get_raw_value(dat, sig)
-      if sig.is_signed:
-        tmp -= ((tmp >> (sig.size - 1)) & 0x1) * (1 << sig.size)
+      if decoded is not None:
+        tmp = decoded[i]
+      else:
+        tmp = get_raw_value(dat, sig)
+        if sig.is_signed:
+          tmp -= ((tmp >> (sig.size - 1)) & 0x1) * (1 << sig.size)
 
       if not self.ignore_checksum and sig.calc_checksum is not None:
         expected_checksum = sig.calc_checksum(self.address, sig, bytearray(dat))
@@ -139,10 +144,13 @@ class CANParser:
     self.vl: dict[int | str, dict[str, float]] = VLDict(self)
     self.vl_all: dict[int | str, dict[str, list[float]]] = {}
     self.ts_nanos: dict[int | str, dict[str, int]] = {}
+    # Latest raw payload for each message that passed counter/checksum validation.
+    self.dat: dict[int, bytes] = {}
     self.addresses: set[int] = set()
     self.message_states: dict[int, MessageState] = {}
     self.seen_addresses: set[int] = set()
     self.controls_ready = False
+    self._updated_lists: list[list[float]] = []
 
     for name_or_addr, freq in messages:
       if isinstance(name_or_addr, numbers.Number):
@@ -226,9 +234,11 @@ class CANParser:
     if strings and not isinstance(strings[0], list | tuple):
       strings = [strings]
 
-    for addr in self.addresses:
-      for k in self.vl_all[addr]:
-        self.vl_all[addr][k].clear()
+    # Only lists populated by the previous update need clearing. Retain their
+    # identity: vl_all aliases and consumers holding a list see the same clear.
+    for values in self._updated_lists:
+      values.clear()
+    self._updated_lists.clear()
 
     updated_addrs: set[int] = set()
     for entry in strings:
@@ -245,7 +255,10 @@ class CANParser:
         if state is None or len(dat) > 64:
           continue
         if state.parse(t, dat):
+          if address not in updated_addrs:
+            self._updated_lists.extend(state.all_vals)
           updated_addrs.add(address)
+          self.dat[address] = bytes(dat)
 
           vl_addr = self.vl[address]
           vl_all_addr = self.vl_all[address]

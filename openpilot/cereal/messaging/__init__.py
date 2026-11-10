@@ -105,10 +105,28 @@ def recv_one_retry(sock: SubSocket) -> capnp.lib.capnp._DynamicStructReader:
 
 
 class FrequencyTracker:
-  def __init__(self, service_freq: float, update_freq: float, is_poll: bool):
+  def __init__(self, service_freq: float, update_freq: float, is_poll: bool,
+               min_update_freq: Optional[float] = None,
+               service_freq_range: Optional[tuple[float, float]] = None):
     freq = max(min(service_freq, update_freq), 1.)
-    if is_poll:
+    if service_freq_range is not None:
+      service_min_freq, service_max_freq = service_freq_range
+      if is_poll:
+        min_freq = service_min_freq
+        max_freq = service_max_freq
+      else:
+        # A non-polled, conflated socket cannot be observed faster than the
+        # SubMaster update loop, but retains the source's slower lower bound.
+        min_freq = min(service_min_freq, update_freq)
+        max_freq = min(service_max_freq, update_freq)
+    elif is_poll:
       min_freq = max_freq = freq
+    elif min_update_freq is not None:
+      # Multiple poll sockets can wake together or independently. A conflated
+      # high-rate service is therefore sampled between the fastest individual
+      # poll rate and the sum of all poll rates.
+      min_freq = max(min(service_freq, min_update_freq), 1.)
+      max_freq = min(freq, update_freq)
     else:
       max_freq = min(freq, update_freq)
       if service_freq >= 2 * update_freq:
@@ -148,7 +166,7 @@ class FrequencyTracker:
 
 
 class SubMaster:
-  def __init__(self, services: List[str], poll: Optional[str] = None,
+  def __init__(self, services: List[str], poll: Optional[Union[str, List[str]]] = None,
                ignore_alive: Optional[List[str]] = None, ignore_avg_freq: Optional[List[str]] = None,
                ignore_valid: Optional[List[str]] = None, addr: str = "127.0.0.1", frequency: Optional[float] = None):
     self.frame = -1
@@ -166,11 +184,20 @@ class SubMaster:
     self.static_freq_services = set(s for s in services if not on_demand[s])
     self.alive = {s: on_demand[s] for s in services}
     self.freq_ok = {s: on_demand[s] for s in services}
+    self._received_freq_ok = dict.fromkeys(services, False)
     self.valid = {s: on_demand[s] for s in services}
 
     self.freq_tracker: Dict[str, FrequencyTracker] = {}
     self.poller = Poller()
-    polled_services = set([poll, ] if poll is not None else services)
+    if poll is None:
+      polled_services = set(services)
+    elif isinstance(poll, str):
+      polled_services = {poll}
+    else:
+      polled_services = set(poll)
+      assert polled_services, "At least one poll service is required"
+    assert polled_services <= set(services), "Poll services must be subscribed"
+    multiple_poll_services = poll is not None and not isinstance(poll, str) and len(polled_services) > 1
     self.non_polled_services = set(services) - polled_services
 
     self.ignore_average_freq = [] if ignore_avg_freq is None else ignore_avg_freq
@@ -179,9 +206,15 @@ class SubMaster:
 
     self.simulation = bool(int(os.getenv("SIMULATION", "0")))
 
-    # if freq and poll aren't specified, assume the max to be conservative
+    # Multiple independently phased poll services can wake the loop at their
+    # combined rate. Keep non-polled frequency tracking aligned with that rate.
     assert frequency is None or poll is None, "Do not specify 'frequency' - frequency of the polled service will be used."
-    self.update_freq = frequency or max([SERVICE_LIST[s].frequency for s in polled_services])
+    if frequency is not None:
+      self.update_freq = frequency
+    elif poll is not None and not isinstance(poll, str):
+      self.update_freq = sum(SERVICE_LIST[s].frequency for s in polled_services)
+    else:
+      self.update_freq = max(SERVICE_LIST[s].frequency for s in polled_services)
 
     for s in services:
       p = self.poller if s not in self.non_polled_services else None
@@ -193,7 +226,15 @@ class SubMaster:
         data = new_message(s, 0) # lists
 
       self.data[s] = getattr(data.as_reader(), s)
-      self.freq_tracker[s] = FrequencyTracker(SERVICE_LIST[s].frequency, self.update_freq, s == poll)
+      self.freq_tracker[s] = FrequencyTracker(
+        SERVICE_LIST[s].frequency,
+        self.update_freq,
+        poll is not None and s in polled_services,
+        (max(SERVICE_LIST[p].frequency for p in polled_services)
+         if multiple_poll_services and s in self.non_polled_services
+         else None),
+        SERVICE_LIST[s].frequency_range,
+      )
 
   def __getitem__(self, s: str) -> capnp.lib.capnp._DynamicStructReader:
     return self.data[s]
@@ -232,16 +273,29 @@ class SubMaster:
     for s in self.static_freq_services:
       # alive if delay is within 10x the expected frequency; checks relaxed in simulator
       self.alive[s] = (cur_time - self.recv_time[s]) < (10. / SERVICE_LIST[s].frequency) or (self.seen[s] and self.simulation)
-      self.freq_ok[s] = self.freq_tracker[s].valid or self.simulation
+      # Frequency windows change only on receipt; liveness/age still changes on
+      # every loop. Bounds are fixed when these trackers are constructed.
+      if self.updated[s]:
+        self._received_freq_ok[s] = self.freq_tracker[s].valid
+      self.freq_ok[s] = self._received_freq_ok[s] or self.simulation
 
   def all_alive(self, service_list: Optional[List[str]] = None) -> bool:
-    return all(self.alive[s] for s in (service_list or self.services) if s not in self.ignore_alive)
+    for s in service_list or self.services:
+      if s not in self.ignore_alive and not self.alive[s]:
+        return False
+    return True
 
   def all_freq_ok(self, service_list: Optional[List[str]] = None) -> bool:
-    return all(self.freq_ok[s] for s in (service_list or self.services) if self._check_avg_freq(s))
+    for s in service_list or self.services:
+      if SERVICE_LIST[s].frequency > 0.99 and s not in self.ignore_average_freq and s not in self.ignore_alive and not self.freq_ok[s]:
+        return False
+    return True
 
   def all_valid(self, service_list: Optional[List[str]] = None) -> bool:
-    return all(self.valid[s] for s in (service_list or self.services) if s not in self.ignore_valid)
+    for s in service_list or self.services:
+      if s not in self.ignore_valid and not self.valid[s]:
+        return False
+    return True
 
   def all_checks(self, service_list: Optional[List[str]] = None) -> bool:
     return self.all_alive(service_list) and self.all_freq_ok(service_list) and self.all_valid(service_list)

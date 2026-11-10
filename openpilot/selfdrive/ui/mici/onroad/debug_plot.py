@@ -131,8 +131,10 @@ class DebugPlot(Widget):
 
     a_ego = cs.aEgo
     v_ego = cs.vEgo
-    accel = lp.accels[0]
-    speed_0 = lp.speeds[0]
+    # A live longitudinalPlan can still contain empty arrays while the planner
+    # is starting up. Keep the debug UI alive until the first populated plan.
+    accel = float(_safe_arr_get(lp.accels, 0, 0.0))
+    speed_0 = float(_safe_arr_get(lp.speeds, 0, 0.0))
     accel_out = cc.actuators.accel
 
     torque_state = None
@@ -165,14 +167,14 @@ class DebugPlot(Widget):
 
     elif show_plot_mode == 4 and radar is not None:
       data[0] = accel
-      data[1] = float(_safe_get(radar, "aLeadK", 0.0))
-      data[2] = float(_safe_get(radar, "vRel", 0.0))
+      data[1] = float(_safe_get(radar, "leadOne.aLeadK", 0.0))
+      data[2] = float(_safe_get(radar, "leadOne.vRel", 0.0))
       title = "4.Lead (Y:accel, G:a_leadK, O:v_rel)"
 
     elif show_plot_mode == 5 and radar is not None:
       data[0] = a_ego
-      data[1] = float(_safe_get(radar, "aLead", 0.0))
-      data[2] = float(_safe_get(radar, "jLead", 0.0))
+      data[1] = float(_safe_get(radar, "leadOne.aLead", 0.0))
+      data[2] = float(_safe_get(radar, "leadOne.jLead", 0.0))
       title = "5.Lead (Y:a_ego, G:a_lead, O:j_lead)"
 
     elif show_plot_mode == 6 and torque_state is not None:

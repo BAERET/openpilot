@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 import ctypes
+from dataclasses import dataclass
 import os
 from pathlib import Path
 import queue
@@ -22,6 +25,7 @@ DEFAULT_H264_FFMPEG_ENCODER = "libx264"
 DEFAULT_H264_SLICE_MAX_BYTES = 4096
 DEFAULT_H264_ENCODER_ALIGN = 16
 DEFAULT_H264_RATE_CONTROL = "vbr-cfr"
+
 
 NATIVE_INPUT_FORMATS = {
     "auto": 0,
@@ -58,13 +62,33 @@ H264_DEBUG_PACKET_LIMIT = 40
 H264_DEBUG_PACKET_INTERVAL = 30
 H264_DEBUG_CHUNK_LIMIT = 60
 H264_DEBUG_CHUNK_INTERVAL = 25
-NATIVE_PACKET_QUEUE_MAX_CHUNKS = 8
-NATIVE_PACKET_QUEUE_PUT_TIMEOUT_S = 0.05
+NATIVE_ACCESS_UNIT_QUEUE_MAX = 3
 V4L2_BUF_FLAG_KEYFRAME = 0x00000008
 V4L2_BUF_FLAG_PFRAME = 0x00000010
 V4L2_BUF_FLAG_BFRAME = 0x00000020
 V4L2_QCOM_BUF_FLAG_CODECCONFIG = 0x00020000
 V4L2_QCOM_BUF_FLAG_EOS = 0x02000000
+
+
+class H264PipelineInitializationError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _NativeAccessUnit:
+    chunks: tuple[bytes, ...]
+    codec_config: bool
+    keyframe: bool
+
+
+@dataclass
+class NativeNv12InputBuffer:
+    address: int
+    size: int
+    index: int
+    owner_id: int
+    dmabuf_fd: int = -1
+    active: bool = True
 
 
 def _align_dimension(value: int, alignment: int) -> int:
@@ -162,14 +186,15 @@ def _h264_start_code_len(data: bytes, index: int) -> int:
 def _h264_start_codes(data: bytes) -> list[tuple[int, int]]:
     positions: list[tuple[int, int]] = []
     index = 0
-    while index + 3 <= len(data):
-        start_len = _h264_start_code_len(data, index)
-        if start_len:
-            positions.append((index, start_len))
-            index += start_len
-        else:
-            index += 1
-    return positions
+    while True:
+        found = data.find(b"\x00\x00\x01", index)
+        if found < 0:
+            return positions
+        # A four-byte prefix contains the three-byte one at offset one.
+        # Do not borrow a byte from a prefix already consumed above.
+        start = found - 1 if found > index and data[found - 1] == 0 else found
+        positions.append((start, found + 3 - start))
+        index = found + 3
 
 
 def _h264_nals(data: bytes) -> list[tuple[int, int, int]]:
@@ -729,6 +754,7 @@ class H264UsbPipeline:
         dump_path: str,
         debug: bool,
         diagnose_interval_s: float = 0.0,
+        ffmpeg_threads: int = 0,
     ) -> None:
         self.usb_display = usb_display
         self.width = int(width)
@@ -745,6 +771,9 @@ class H264UsbPipeline:
         self.ffmpeg_path = ffmpeg_path
         self.ffmpeg_encoder_request = ffmpeg_encoder
         self.ffmpeg_encoder_name = ffmpeg_encoder
+        self.ffmpeg_threads = int(ffmpeg_threads)
+        if not 0 <= self.ffmpeg_threads <= 16:
+            raise ValueError("ffmpeg_threads must be between 0 (automatic) and 16")
         self.ffmpeg_muxer_name = ""
         self.device_path = device_path
         self.input_format = input_format
@@ -765,6 +794,7 @@ class H264UsbPipeline:
         self._sps_patch_cache: tuple[bytes, bytes] | None = None
         self.chunk_size = 0
         self._chunks_sent = 0
+        self._chunks_completed = 0
         self._proc: subprocess.Popen[bytes] | None = None
         self._stdout_thread: threading.Thread | None = None
         self._stderr_thread: threading.Thread | None = None
@@ -780,7 +810,10 @@ class H264UsbPipeline:
         self._native_input_bytesused = 0
         self._native_input_active_bytes = 0
         self._native_has_active_nv12 = False
+        self._native_has_direct_input = False
+        self._native_has_dmabuf_input = False
         self._packet_queue: queue.Queue[Any] | None = None
+        self._packet_queue_lock = threading.Lock()
         self._condition = threading.Condition()
         self._closing = False
         self._stream_started = False
@@ -798,10 +831,22 @@ class H264UsbPipeline:
         self._debug_usb_bytes = 0
         self._debug_max_packet_bytes = 0
         self._debug_max_chunk_bytes = 0
+        self._debug_dropped_access_units = 0
+        self._debug_dropped_chunks = 0
         self._diag_window_started_at = now
         self._reset_h264_diag_window(now)
 
     def start(self) -> None:
+        try:
+            self._start_requested_backend()
+        except H264PipelineInitializationError:
+            raise
+        except Exception as exc:
+            raise H264PipelineInitializationError(
+                f"H264 {self.backend_request} pipeline initialization failed: {exc}"
+            ) from exc
+
+    def _start_requested_backend(self) -> None:
         if self.backend_request == "ffmpeg":
             self._start_ffmpeg()
             return
@@ -853,6 +898,7 @@ class H264UsbPipeline:
         self._set_native_slice_max_bytes(lib, handle)
         self._set_native_rate_control(lib, handle)
         self._set_native_realtime_priority(lib, handle)
+        self._set_native_qp_range(lib, handle)
 
         if lib.cluster_h264_encoder_bridge_open(handle) != 0:
             raise RuntimeError(self._native_error_text("native H264 encoder open failed"))
@@ -865,7 +911,7 @@ class H264UsbPipeline:
             self._close_native()
             raise
 
-        self._packet_queue = queue.Queue(maxsize=NATIVE_PACKET_QUEUE_MAX_CHUNKS)
+        self._packet_queue = queue.Queue(maxsize=NATIVE_ACCESS_UNIT_QUEUE_MAX)
         self._sender_thread = threading.Thread(
             target=self._send_queued_packets,
             name="cluster-usb-h264-native-send",
@@ -911,6 +957,11 @@ class H264UsbPipeline:
         )
         self._debug_log_session_config("native")
 
+    @property
+    def encoder_pid(self) -> int | None:
+        proc = self._proc
+        return proc.pid if proc is not None and proc.poll() is None else None
+
     def _start_ffmpeg(self) -> None:
         ffmpeg = self._ffmpeg_executable()
         self.ffmpeg_encoder_name = self._resolve_ffmpeg_encoder(ffmpeg)
@@ -924,6 +975,7 @@ class H264UsbPipeline:
             "Starting H264 USB ffmpeg encoder: "
             f"{self.ffmpeg_encoder_name} {self.encoder_width}x{self.encoder_height}@{self.fps} "
             f"bitrate={self.bitrate} gop={self.gop} muxer={self.ffmpeg_muxer_name} "
+            f"threads={self.ffmpeg_threads or 'auto'} "
             "packetize=access-unit "
             f"chunk_ack={'soft' if self.wait_for_ack and self.soft_ack else ('on' if self.wait_for_ack else 'off')}"
             f"{self._diagnose_text()}",
@@ -1126,6 +1178,116 @@ class H264UsbPipeline:
         render_bytes = active_bytes if use_active else input_bytes
         return stride, y_scanlines, uv_scanlines, uv_offset, input_bytes, render_bytes, use_active
 
+    def native_direct_input_available(self) -> bool:
+        return self._native_handle is not None and self._native_has_direct_input
+
+    def native_dmabuf_input_available(self) -> bool:
+        return self.native_direct_input_available() and self._native_has_dmabuf_input
+
+    @contextmanager
+    def native_nv12_input_buffer(self) -> Iterator[NativeNv12InputBuffer]:
+        lib = self._native_lib
+        handle = self._native_handle
+        callback = self._native_callback
+        if lib is None or handle is None or callback is None or not self._native_has_direct_input:
+            raise RuntimeError("native H264 direct input buffer API is not available")
+
+        address = ctypes.c_void_p()
+        size = ctypes.c_size_t()
+        index = ctypes.c_uint32()
+        dmabuf_fd = ctypes.c_int(-1)
+        acquire_dmabuf = getattr(lib, "cluster_h264_encoder_bridge_acquire_nv12_input_dmabuf", None)
+        if acquire_dmabuf is None:
+            result = lib.cluster_h264_encoder_bridge_acquire_nv12_input(
+                handle,
+                ctypes.byref(address),
+                ctypes.byref(size),
+                ctypes.byref(index),
+                callback,
+                None,
+            )
+        else:
+            result = acquire_dmabuf(
+                handle,
+                ctypes.byref(address),
+                ctypes.byref(size),
+                ctypes.byref(index),
+                ctypes.byref(dmabuf_fd),
+                callback,
+                None,
+            )
+        if result != 0:
+            raise RuntimeError(self._native_error_text("native H264 input buffer acquire failed"))
+        if not address.value or size.value < self._native_input_bytesused:
+            lib.cluster_h264_encoder_bridge_cancel_nv12_input(handle, index.value)
+            raise RuntimeError("native H264 input buffer acquire returned an invalid buffer")
+
+        input_buffer = NativeNv12InputBuffer(
+            address=int(address.value),
+            size=int(size.value),
+            index=int(index.value),
+            owner_id=id(self),
+            dmabuf_fd=int(dmabuf_fd.value),
+        )
+        try:
+            yield input_buffer
+        finally:
+            if input_buffer.active:
+                lib.cluster_h264_encoder_bridge_cancel_nv12_input(handle, input_buffer.index)
+                input_buffer.active = False
+
+    def submit_native_nv12_input(self, input_buffer: NativeNv12InputBuffer) -> None:
+        lib = self._native_lib
+        handle = self._native_handle
+        callback = self._native_callback
+        if lib is None or handle is None or callback is None or not self._native_has_direct_input:
+            raise RuntimeError("native H264 direct input buffer API is not available")
+        if input_buffer.owner_id != id(self) or not input_buffer.active:
+            raise RuntimeError("native H264 input buffer lease is not active")
+
+        profile_stage = time.perf_counter()
+        timestamp_us = self._native_frame_index * 1000000 // self.fps
+        result = lib.cluster_h264_encoder_bridge_submit_nv12_input(
+            handle,
+            input_buffer.index,
+            timestamp_us,
+            callback,
+            None,
+        )
+        if result != 0:
+            raise RuntimeError(self._native_error_text("native H264 direct input submit failed"))
+        input_buffer.active = False
+        self._native_frame_index += 1
+        self._add_native_timing_samples(lib, handle)
+        self._add_sample("usb_h264.native_submit_direct", profile_stage)
+        self.check_error()
+
+    def submit_native_nv12_dmabuf_input(self, input_buffer: NativeNv12InputBuffer) -> None:
+        lib = self._native_lib
+        handle = self._native_handle
+        callback = self._native_callback
+        if lib is None or handle is None or callback is None or not self.native_dmabuf_input_available():
+            raise RuntimeError("native H264 DMA-BUF input API is not available")
+        if input_buffer.owner_id != id(self) or not input_buffer.active or input_buffer.dmabuf_fd < 0:
+            raise RuntimeError("native H264 DMA-BUF input lease is not active")
+
+        profile_stage = time.perf_counter()
+        timestamp_us = self._native_frame_index * 1000000 // self.fps
+        result = lib.cluster_h264_encoder_bridge_submit_nv12_input_dmabuf(
+            handle,
+            input_buffer.index,
+            timestamp_us,
+            callback,
+            None,
+        )
+        if result != 0:
+            raise RuntimeError(self._native_error_text("native H264 DMA-BUF input submit failed"))
+        input_buffer.active = False
+        self._native_frame_index += 1
+        self._add_native_timing_samples(lib, handle)
+        self._add_sample("usb_h264.native_submit_dmabuf", profile_stage)
+        self.check_error()
+
     def _encoder_rgba(self, rgba: Any, width: int, height: int) -> Any:
         if self.encoder_width == width and self.encoder_height == height:
             return rgba
@@ -1321,6 +1483,8 @@ class H264UsbPipeline:
             f"stdout_reads={self._debug_stdout_reads} stdout_bytes={self._debug_stdout_bytes} "
             f"packetize_events={self._debug_packetize_events} "
             f"usb_chunks={self._chunks_sent} usb_bytes={self._debug_usb_bytes} "
+            f"dropped_units={self._debug_dropped_access_units} "
+            f"dropped_chunks={self._debug_dropped_chunks} "
             f"max_packet={self._debug_max_packet_bytes} max_chunk={self._debug_max_chunk_bytes}",
             flush=True,
         )
@@ -1338,6 +1502,8 @@ class H264UsbPipeline:
         self._diag_max_nals = 0
         self._diag_max_nal_bytes = 0
         self._diag_queue_max = 0
+        self._diag_dropped_units = 0
+        self._diag_dropped_chunks = 0
         self._diag_send_chunks = 0
         self._diag_send_bytes = 0
         self._diag_send_ms = 0.0
@@ -1374,6 +1540,15 @@ class H264UsbPipeline:
             return
         with self._condition:
             self._diag_queue_max = max(self._diag_queue_max, int(depth))
+
+    def _record_h264_drop(self, unit_count: int, chunk_count: int) -> None:
+        self._debug_dropped_access_units += int(unit_count)
+        self._debug_dropped_chunks += int(chunk_count)
+        if not self._diagnostics_enabled():
+            return
+        with self._condition:
+            self._diag_dropped_units += int(unit_count)
+            self._diag_dropped_chunks += int(chunk_count)
 
     def _record_h264_send(self, source: str, byte_count: int, milliseconds: float) -> None:
         if not self._diagnostics_enabled():
@@ -1414,7 +1589,8 @@ class H264UsbPipeline:
                 f"unit_kbps={unit_kbps:.0f} "
                 f"chunks_avg={chunks_avg:.1f} max={self._diag_max_chunks} "
                 f"nals_avg={nals_avg:.1f} max={self._diag_max_nals} "
-                f"max_nal={self._diag_max_nal_bytes} qmax={self._diag_queue_max} "
+                f"max_nal={self._diag_max_nal_bytes} au_qmax={self._diag_queue_max} "
+                f"drop_units={self._diag_dropped_units} drop_chunks={self._diag_dropped_chunks} "
                 f"send_chunks={self._diag_send_chunks} send_kbps={send_kbps:.0f} "
                 f"send_ms_avg={send_avg_ms:.2f} max={self._diag_send_ms_max:.2f}"
             )
@@ -1593,6 +1769,12 @@ class H264UsbPipeline:
             "+low_delay",
         ]
         if encoder == "libx264":
+            # Bound both the RGBA conversion pool and the encoder pool. Limiting
+            # only x264 leaves FFmpeg's automatically sized filter pool active.
+            # Other encoders and the default automatic setting retain their policy.
+            if self.ffmpeg_threads:
+                command[1:1] = ["-filter_threads", str(self.ffmpeg_threads)]
+                command.extend(["-threads:v", str(self.ffmpeg_threads)])
             command.extend(
                 [
                     "-preset",
@@ -1659,6 +1841,58 @@ class H264UsbPipeline:
             ]
             encode_nv12_active.restype = ctypes.c_int
             self._native_has_active_nv12 = True
+        try:
+            acquire_nv12_input = lib.cluster_h264_encoder_bridge_acquire_nv12_input
+            submit_nv12_input = lib.cluster_h264_encoder_bridge_submit_nv12_input
+            cancel_nv12_input = lib.cluster_h264_encoder_bridge_cancel_nv12_input
+        except AttributeError:
+            self._native_has_direct_input = False
+        else:
+            acquire_nv12_input.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_uint32),
+                NativePacketCallback,
+                ctypes.c_void_p,
+            ]
+            acquire_nv12_input.restype = ctypes.c_int
+            submit_nv12_input.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                NativePacketCallback,
+                ctypes.c_void_p,
+            ]
+            submit_nv12_input.restype = ctypes.c_int
+            cancel_nv12_input.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+            cancel_nv12_input.restype = ctypes.c_int
+            self._native_has_direct_input = True
+        try:
+            acquire_nv12_input_dmabuf = lib.cluster_h264_encoder_bridge_acquire_nv12_input_dmabuf
+            submit_nv12_input_dmabuf = lib.cluster_h264_encoder_bridge_submit_nv12_input_dmabuf
+        except AttributeError:
+            self._native_has_dmabuf_input = False
+        else:
+            acquire_nv12_input_dmabuf.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(ctypes.c_size_t),
+                ctypes.POINTER(ctypes.c_uint32),
+                ctypes.POINTER(ctypes.c_int),
+                NativePacketCallback,
+                ctypes.c_void_p,
+            ]
+            acquire_nv12_input_dmabuf.restype = ctypes.c_int
+            submit_nv12_input_dmabuf.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.c_uint64,
+                NativePacketCallback,
+                ctypes.c_void_p,
+            ]
+            submit_nv12_input_dmabuf.restype = ctypes.c_int
+            self._native_has_dmabuf_input = True
         lib.cluster_h264_encoder_bridge_drain.argtypes = [
             ctypes.c_void_p,
             ctypes.c_int,
@@ -1733,6 +1967,19 @@ class H264UsbPipeline:
             return
         if set_slice_max(handle, self.slice_max_bytes) != 0:
             raise RuntimeError(self._native_error_text("native H264 slice max-byte setup failed"))
+
+    def _set_native_qp_range(self, lib: ctypes.CDLL, handle: int) -> None:
+        limits = getattr(self.usb_display, "h264_qp_range", None)
+        if limits is None:
+            return
+        try:
+            setter = lib.cluster_h264_encoder_bridge_set_qp_range
+        except AttributeError as exc:
+            raise RuntimeError("Display H264 QP limits require rebuilding the native HUD encoder") from exc
+        setter.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        setter.restype = ctypes.c_int
+        if setter(handle, *limits) != 0:
+            raise RuntimeError(self._native_error_text("native H264 QP range setup failed"))
 
     def _set_native_rate_control(self, lib: ctypes.CDLL, handle: int) -> None:
         try:
@@ -1821,16 +2068,87 @@ class H264UsbPipeline:
             self._debug_log_packetize("native", packet_index, packet, chunks, chunk_size)
             self._record_h264_unit("native", packet, chunks, keyframe=bool(keyframe))
             profile_stage = time.perf_counter() if profile_callback else 0.0
-            for chunk in chunks:
-                packet_queue.put((chunk, False), timeout=NATIVE_PACKET_QUEUE_PUT_TIMEOUT_S)
-                self._record_h264_queue_depth(packet_queue.qsize())
+            self._enqueue_native_access_unit(
+                chunks,
+                codec_config=bool(codec_config),
+                keyframe=bool(keyframe),
+            )
             if profile_callback:
                 self._add_sample("usb_h264.native.callback_queue", profile_stage)
                 self._add_sample("usb_h264.native.callback_total", profile_total)
-        except queue.Full as exc:
-            self._set_error(RuntimeError("native H264 USB sender queue is full"))
         except BaseException as exc:
             self._set_error(exc)
+
+    def _enqueue_native_access_unit(
+        self,
+        chunks: list[bytes],
+        *,
+        codec_config: bool,
+        keyframe: bool,
+    ) -> None:
+        packet_queue = self._packet_queue
+        if packet_queue is None or not chunks:
+            return
+
+        if self._closing:
+            return
+
+        incoming = _NativeAccessUnit(tuple(chunks), codec_config, keyframe)
+        if getattr(self.usb_display, "h264_preserve_reference_frames", False):
+            # Backpressure the HUD encoder while TCP catches up. A 250ms queue
+            # wait is not evidence of a disconnected link; restarting here turns
+            # a short network stall into a complete display shutdown. Keep the
+            # same three slots and reference order. Only expire a sender that
+            # makes no progress; a large paced frame may take more than 3s.
+            deadline = time.monotonic() + 3.0
+            completed = self._chunks_completed
+            while not self._closing:
+                self.check_error()
+                try:
+                    packet_queue.put(incoming, timeout=0.05)
+                    self._record_h264_queue_depth(packet_queue.qsize())
+                    return
+                except queue.Full:
+                    if self._chunks_completed != completed:
+                        completed = self._chunks_completed
+                        deadline = time.monotonic() + 3.0
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Display disconnected; reconnect required") from ConnectionError(
+                            "H264 reference queue stalled for 3s; restart stream")
+            return
+        dropped: list[_NativeAccessUnit] = []
+        with self._packet_queue_lock:
+            pending: list[_NativeAccessUnit] = []
+            while True:
+                try:
+                    item = packet_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is None:
+                    packet_queue.put_nowait(None)
+                    return
+                pending.append(item)
+
+            candidates = [*pending, incoming]
+            latest_indexes = {len(candidates) - 1}
+            for attribute in ("codec_config", "keyframe"):
+                for index in range(len(candidates) - 1, -1, -1):
+                    if getattr(candidates[index], attribute):
+                        latest_indexes.add(index)
+                        break
+
+            selected = [candidates[index] for index in sorted(latest_indexes)]
+            if len(selected) > NATIVE_ACCESS_UNIT_QUEUE_MAX:
+                selected = selected[-NATIVE_ACCESS_UNIT_QUEUE_MAX:]
+            selected_ids = {id(unit) for unit in selected}
+            dropped = [unit for unit in candidates if id(unit) not in selected_ids]
+            for unit in selected:
+                packet_queue.put_nowait(unit)
+            queue_depth = packet_queue.qsize()
+
+        if dropped:
+            self._record_h264_drop(len(dropped), sum(len(unit.chunks) for unit in dropped))
+        self._record_h264_queue_depth(queue_depth)
 
     def _drain_native(self) -> None:
         lib = self._native_lib
@@ -1847,6 +2165,7 @@ class H264UsbPipeline:
         self._native_handle = None
         self._native_lib = None
         self._native_callback = None
+        self._native_has_direct_input = False
 
     def _native_error_text(self, message: str) -> str:
         lib = self._native_lib
@@ -1957,11 +2276,18 @@ class H264UsbPipeline:
         try:
             chunk_size = max(1, self.chunk_size)
             while True:
-                item = packet_queue.get()
+                if self._closing:
+                    return
+                try:
+                    item = packet_queue.get(timeout=0.25)
+                except queue.Empty:
+                    continue
                 if item is None:
                     return
-                chunk, is_last = item
-                self._send_h264_chunk(chunk, chunk_size, source="native", is_last=is_last)
+                for chunk in item.chunks:
+                    if self._closing:
+                        return
+                    self._send_h264_chunk(chunk, chunk_size, source="native")
         except BaseException as exc:
             with self._condition:
                 if not self._closing:
@@ -1992,6 +2318,7 @@ class H264UsbPipeline:
             wait_for_ack=self.wait_for_ack,
             require_ack_response=not self.soft_ack,
         )
+        self._chunks_completed += 1
         elapsed_ms = (time.perf_counter() - profile_stage) * 1000.0
         self._add_sample_value("usb_h264.send_chunk", elapsed_ms)
         self._record_h264_send(source, len(chunk), elapsed_ms)

@@ -14,6 +14,7 @@ from openpilot.cereal import car, log
 from openpilot.cereal.services import SERVICE_LIST
 from openpilot.common.utils import strip_deprecated_keys
 from openpilot.common.filter_simple import FirstOrderFilter
+from openpilot.common.gpio import gpio_set
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_HW
 from openpilot.selfdrive.selfdrived.alertmanager import set_offroad_alert
@@ -21,8 +22,10 @@ from openpilot.system.hardware import HARDWARE, TICI, AGNOS, PC
 from openpilot.system.loggerd.config import get_available_percent
 from openpilot.system.statsd import statlog
 from openpilot.common.swaglog import cloudlog
+from openpilot.system.memory_trace import FullGCTrace
 from openpilot.system.hardware.power_monitoring import PowerMonitoring
 from openpilot.system.hardware.fan_controller import FanController
+from openpilot.system.hardware.tici.pins import GPIO
 from openpilot.system.version import terms_version, training_version
 from openpilot.system.athena.registration import UNREGISTERED_DONGLE_ID
 
@@ -216,7 +219,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   HARDWARE.initialize_hardware()
   thermal_config = HARDWARE.get_thermal_config()
 
-  fan_controller = FanController(int(1./DT_HW))
+  fan_controller = FanController(int(1./DT_HW), HARDWARE.get_device_type())
 
   while not end_event.is_set():
     sm.update(PANDA_STATES_TIMEOUT)
@@ -290,6 +293,10 @@ def hardware_thread(end_event, hw_queue) -> None:
     msg.deviceState.maxTempC = all_comp_temp
 
     msg.deviceState.fanSpeedPercentDesired = fan_controller.update(all_comp_temp, onroad_conditions["ignition"])
+    # C3XL clones can keep their fan powered after the Panda has requested 0%.
+    # Leave the supply enabled only while cooling is actually requested.
+    if TICI:
+      gpio_set(GPIO.SOM_ST_IO, int(msg.deviceState.fanSpeedPercentDesired > 0))
 
     is_offroad_for_5_min = (started_ts is None) and ((not started_seen) or (off_ts is None) or (time.monotonic() - off_ts > 60 * 5))
     if is_offroad_for_5_min and offroad_comp_temp > OFFROAD_DANGER_TEMP:
@@ -356,7 +363,8 @@ def hardware_thread(end_event, hw_queue) -> None:
       except Exception:
         pass
 
-    # Tesla vehicles can keep CAN powered while parked, so keep the device awake.
+    # Tesla vehicles can keep CAN powered while parked, so keep the device awake
+    # without keeping onroad-only processes running after ignition drops.
     cp_cache.update(params)
     tesla_no_sleep = cp_cache.is_tesla
 
@@ -384,10 +392,6 @@ def hardware_thread(end_event, hw_queue) -> None:
       started_ts = None
       if off_ts is None:
         off_ts = time.monotonic()
-
-    # Keep onroad processes alive on Tesla even when parked.
-    if tesla_no_sleep and started_ts is None and started_seen:
-      started_ts = time.monotonic()
 
     # Offroad power monitoring
     voltage = None if peripheralState.pandaType == log.PandaState.PandaType.unknown else peripheralState.voltage
@@ -472,6 +476,11 @@ def hardware_thread(end_event, hw_queue) -> None:
 
 
 def main():
+  with FullGCTrace('hardwared') as trace:
+    run_hardware(trace)
+
+
+def run_hardware(trace):
   hw_queue = queue.Queue(maxsize=1)
   end_event = threading.Event()
 
@@ -489,6 +498,9 @@ def main():
   try:
     while True:
       time.sleep(1)
+      now = time.monotonic()
+      if trace.due(now):
+        trace.report(now, hw_queue=hw_queue.qsize())
       if not all(t.is_alive() for t in threads):
         break
   finally:

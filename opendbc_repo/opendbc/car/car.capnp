@@ -229,6 +229,11 @@ struct CarState {
   # blindspot sensors
   leftBlindspot @33 :Bool; # Is there something blocking the left lane change
   rightBlindspot @34 :Bool; # Is there something blocking the right lane change
+  leftBlindspotOem @95 :Bool; # vehicle BSD-only left source before ONNX merge
+  rightBlindspotOem @96 :Bool; # vehicle BSD-only right source before ONNX merge
+  leftBlindspotOnnx @97 :Bool; # ONNX BSD-only left source
+  rightBlindspotOnnx @98 :Bool; # ONNX BSD-only right source
+  blindspotSplitSourcesValid @99 :Bool; # split blindspot source fields are valid and should be trusted
 
   fuelGauge @41 :Float32; # battery or fuel tank level from 0.0 to 1.0
   charging @43 :Bool;
@@ -263,7 +268,79 @@ struct CarState {
   ureaGauge @82 :Float32; # diesel exhaust fluid/urea tank level from 0.0 to 1.0
   cruiseSpeedBigStep @83 :Bool; # VW: cruise +/- button is a stage-2 (swipe/long) press -> use big increment
   steeringCurvature @84 :Float32; # VW MEB: measured road curvature from EPS (QFK_01), rad/m. Used for closed-loop curvature correction.
+  evModeActive @85 :Bool; # decoded hybrid power-flow mode calls for the EV indicator
+  evModeValid @86 :Bool; # evModeActive is backed by a fresh, checksum-valid CAN frame of the expected bus and length
+  speedBumpDistance @87 :Float32; # distance to a speed bump received from the stock navigation CAN, meters
+  schoolZoneActive @88 :Bool; # stock-navigation kind 7 currently indicates a 30 km/h speed-limit zone
+  vehicleNaviActive @89 :Bool; # a valid stock-navigation CAN profile is currently relevant
+  vehicleNaviSectionActive @90 :Bool; # stock-navigation kind 7 indicates a non-school speed-limit section
+  vehicleNaviSpeed @91 :Float32; # raw speed from the active stock-navigation CAN profile, kph
+  vehicleNaviAvailable @92 :Bool; # stock-navigation 0x4BE has been observed during this drive
+  radarInput @93 :RadarInput;
+  steeringTouch @94 :SteeringTouch;
+  leftBlinkerStalkCount @100 :UInt8;  # +1 (wrapping) on every left turn-signal lever press; the lamp-based leftBlinker cannot show a press while the lamp is already flashing
+  rightBlinkerStalkCount @101 :UInt8; # +1 (wrapping) on every right turn-signal lever press
+  blinkerLever @102 :UInt8;           # turn-signal lever position: 0 released, 1 one-touch (half) detent, 2 latched
+  blinkerLamp @103 :UInt8;            # turn-signal lamp right now (no hold): 0 dark, 1 left lit, 2 right lit
 
+  vehicleGps @104 :VehicleGps;
+  autoTurnSignalDirection @105 :UInt8; # automatic ownership, including an unconfirmed cancellation tail
+  autoTurnSignalStatus @106 :Text;
+  turnSignalDriverValid @107 :Bool;
+  turnSignalDriverDirection @108 :UInt8; # actual stalk: 0 released, 1 left, 2 right
+  autoTurnSignalReadyRequestId @109 :UInt64; # TX echoed and lamps confirmed for this automatic maneuver; zero otherwise
+  tbtRearInputsAvailable @110 :Bool; # fresh CANFD OEM BSD input for the TBT physical-indicator trigger only (BSD-only since 2026-10-30)
+  tbtRightRearBlocked @111 :Bool = true; # OEM right BSD warning or invalid/stale BSD; no corner-distance veto; manual admission unchanged
+  laneLineInfoMonoTime @112 :UInt64; # exact OEM lane type/colour CAN observation; zero means unknown, manual indicator only
+  teslaTrafficControl @113 :TeslaTrafficControl;
+  stockSccFault @114 :Bool; # original Casper FCA failure, before outgoing fault suppression
+  cruiseCancelState @115 :Bool; # Carrot cruise CANCEL latch, cleared by SET/RES or +/-.
+
+  struct TeslaTrafficControl {
+    available @0 :Bool;
+    valid @1 :Bool;
+    sampleMonoTime @2 :UInt64;
+    stopLineDistance @3 :Float32; # APP_trafficControl metres; legacy DAS_road is not supported
+    light @4 :Light;
+    status @5 :Text;
+
+    enum Light {
+      unknown @0;
+      red @1;
+      green @2;
+      yellow @3;
+    }
+  }
+  struct VehicleGps {
+    available @0 :Bool;
+    valid @1 :Bool; # receive/continuity checks, not a decoded satellite fix flag
+    latitude @2 :Float64;
+    longitude @3 :Float64;
+    sampleMonoTime @4 :UInt64;
+    headingDeg @5 :Float32; # course derived from consecutive positions
+    headingValid @6 :Bool;
+  }
+
+  # Optional original vehicle receive signal. Separate from torque/override.
+  struct SteeringTouch {
+    available @0 :Bool;
+    valid @1 :Bool;
+    touched @2 :Bool;
+    sampleMonoTime @3 :UInt64;
+    rawStatus @4 :UInt8;
+    rawTouch1 @5 :UInt8;
+    rawTouch2 @6 :UInt8;
+  }
+
+  # Bind independent radar decoding to the exact CAN batch and ego state used
+  # by card. Empty batches still represent a control tick; receiveMonoTime is
+  # monotonic and must not be replaced by the later publication timestamp.
+  struct RadarInput {
+    firstCanMonoTime @0 :UInt64;
+    lastCanMonoTime @1 :UInt64;
+    canPacketCount @2 :UInt32;
+    receiveMonoTime @3 :UInt64;
+  }
   struct Tpms {
     fl @0 :Float32;
     fr @1 :Float32;
@@ -341,6 +418,9 @@ struct CarState {
 struct RadarData @0x888ad6581cf0aacb {
   errors @3 :Error;
   points @1 :List(RadarPoint);
+  radarTrackFlipped @4 :Bool; # frontRadar yRel/yvRel already inverted by RadarTrackFlip
+  displayPoints @5 :List(RadarPoint); # 제어 points와 분리한 전체 표시용 객체
+  hasDisplayData @6 :Bool; # 표시 스트림 지원 표지: 빈 목록·시작·오류에도 유지
 
   struct Error {
     canError @0 :Bool;
@@ -370,12 +450,14 @@ struct RadarData @0x888ad6581cf0aacb {
     aLead @8 :Float32; # m/s^2
     jLead @9 :Float32; # m/s^3
     radarSource @10 :RadarSource;
+    trackState @11 :UInt8; # radar-native object state; 0 when unavailable
 
     enum RadarSource {
       frontRadar @0;
       scc @1;
       corner235 @2;
       corner180 @3;
+      corner430 @4;
     }
   }
 
@@ -404,6 +486,7 @@ struct CarControl {
   # Blinker controls
   leftBlinker @15: Bool;
   rightBlinker @16: Bool;
+  assistantLaneSignalId @18 :Text; # Correlates an eligible voice request with the native indicator output.
 
   orientationNED @13 :List(Float32);
   angularVelocity @14 :List(Float32);
@@ -430,6 +513,7 @@ struct CarControl {
 
     jerk @9: Float32;  # m/s^3
     aTarget @10: Float32;  # m/s^2
+    stopObjectActive @11 :Bool; # synthetic signal-stop object included in the generated SCC packet
 
     enum LongControlState @0xe40f3a917d908282{
       off @0;
@@ -470,6 +554,10 @@ struct CarControl {
     naviEventType @19: Int16;   # VW MEB cluster: 0=없음 1=커브 2=교차로 3=분기/출구 4=로터리 5=병목 8=도로제한제어중
     naviEventSpeed @20: Int16;  # VW MEB cluster: 목표속도 kph (커브는 부호=방향: +우/-좌) -> ACC_Event_Wunschgeschw
     leadLimiting @21: Bool;     # VW MEB cluster: 앞차가 속도를 제한 중(xState lead) -> 앞차 하이라이트 우선
+
+    driverMonitoringAlert @22: UInt8;  # 0=none, 1=initial, 2=audible, 3=terminal; fresh enabled DM only
+    physicalBlinkerHold @23: UInt8;  # 0=legacy, 1=release, 2=left hold, 3=right hold; fresh USB-CAN lease
+    signalStopObject @24 :Bool; # request only; final SCC interlocks own application
 
     # not used with the dash, TODO: separate structs for dash UI and device UI
     audibleAlert @5: AudibleAlert;
@@ -528,6 +616,9 @@ struct CarControl {
       audio10 @33;
 
       nnff @34;
+      radarCutin @35;
+      radarStationaryLead @36;
+      systemReady @37;
     }
   }
 

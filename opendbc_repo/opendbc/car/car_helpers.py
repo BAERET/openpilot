@@ -1,5 +1,6 @@
 import os
 import time
+from urllib.parse import urlsplit
 
 from opendbc.car import gen_empty_fingerprint
 from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
@@ -8,6 +9,7 @@ from opendbc.car.structs import CarParams, CarParamsT
 from opendbc.car.fingerprints import eliminate_incompatible_cars, all_legacy_fingerprint_cars
 from opendbc.car.fw_versions import ObdCallback, get_fw_versions_ordered, get_present_ecus, match_fw_to_car
 from opendbc.car.mock.values import CAR as MOCK
+from opendbc.car.selected_car import get_selected_car_platform
 from opendbc.car.values import BRANDS
 from opendbc.car.vin import get_vin, is_valid_vin, VIN_UNKNOWN
 
@@ -15,6 +17,20 @@ from openpilot.common.params import Params
 
 
 FRAME_FINGERPRINT = 100  # 1s
+
+
+def format_git_source(remote: str | None, branch: str | None) -> str:
+  remote = remote or ""
+  # Normalize SCP-style SSH remotes as well as HTTPS/SSH URLs; never log credentials.
+  if "://" not in remote:
+    remote = "ssh://" + remote.replace(":", "/", 1)
+  try:
+    parsed = urlsplit(remote)
+    parts = parsed.path.strip("/").split("/")
+    owner = parts[0] if parsed.hostname and len(parts) >= 2 else "unknown"
+  except ValueError:
+    owner = "unknown"
+  return f"{owner}/{branch or 'unknown'}"
 
 
 def load_interfaces(brand_names):
@@ -85,9 +101,10 @@ def can_fingerprint(can_recv: CanRecvCallable) -> tuple[str | None, dict[int, di
 
 # **** for use live only ****
 def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multiplexing: ObdCallback, num_pandas: int,
-                cached_params: CarParamsT | None) -> tuple[str | None, dict, str, list[CarParams.CarFw], CarParams.FingerprintSource, bool]:
+                cached_params: CarParamsT | None, skip_fw_query: bool = False) -> tuple[str | None, dict, str, list[CarParams.CarFw],
+                                                                                      CarParams.FingerprintSource, bool]:
   fixed_fingerprint = os.environ.get('FINGERPRINT', "")
-  skip_fw_query = os.environ.get('SKIP_FW_QUERY', False)
+  skip_fw_query = skip_fw_query or bool(fixed_fingerprint) or bool(os.environ.get('SKIP_FW_QUERY', False))
   disable_fw_cache = os.environ.get('DISABLE_FW_CACHE', False)
   ecu_rx_addrs = set()
 
@@ -112,6 +129,7 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
 
     exact_fw_match, fw_candidates = match_fw_to_car(car_fw, vin)
   else:
+    carlog.warning("Skipping VIN & FW query")
     vin_rx_addr, vin_rx_bus, vin = -1, -1, VIN_UNKNOWN
     exact_fw_match, fw_candidates, car_fw = True, set(), []
     cached = False
@@ -144,54 +162,27 @@ def fingerprint(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_mu
     car_fingerprint = fixed_fingerprint
     source = CarParams.FingerprintSource.fixed
 
-  #carlog.error({"event": "fingerprinted", "car_fingerprint": str(car_fingerprint), "source": source, "fuzzy": not exact_match,
-  #              "cached": cached, "fw_count": len(car_fw), "ecu_responses": list(ecu_rx_addrs), "vin_rx_addr": vin_rx_addr,
-  #              "vin_rx_bus": vin_rx_bus, "fingerprints": repr(finger), "fw_query_time": fw_query_time})
+  carlog.error({"event": "fingerprinted", "car_fingerprint": str(car_fingerprint), "source": source, "fuzzy": not exact_match,
+                "cached": cached, "fw_count": len(car_fw), "ecu_responses": list(ecu_rx_addrs), "vin_rx_addr": vin_rx_addr,
+                "vin_rx_bus": vin_rx_bus, "fingerprints": repr(finger), "fw_query_time": fw_query_time})
 
   return car_fingerprint, finger, vin, car_fw, source, exact_match
 
 
 def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multiplexing: ObdCallback, alpha_long_allowed: bool,
             is_release: bool, num_pandas: int = 1, cached_params: CarParamsT | None = None):
-  candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(can_recv, can_send, set_obd_multiplexing, num_pandas, cached_params)
-
   selected_car = Params().get("CarSelected3")
-  if selected_car:
-    def find_car(name: str):
-      from opendbc.car.ford.values import CAR as FORD
-      from opendbc.car.hyundai.values import CAR as HYUNDAI
-      from opendbc.car.gm.values import CAR as GM
-      from opendbc.car.toyota.values import CAR as TOYOTA
-      from opendbc.car.mazda.values import CAR as MAZDA
-      from opendbc.car.volkswagen.values import CAR as VOLKSWAGEN
-      for platform in FORD:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
-      for platform in GM:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
-      for platform in TOYOTA:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
-      for platform in HYUNDAI:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
-      for platform in MAZDA:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
-      for platform in VOLKSWAGEN:
-        for doc in platform.config.car_docs:
-          if name == doc.name:
-            return platform
-      return None
-    found_car = find_car(selected_car)
-    if found_car is not None:
-      candidate = found_car
+  forced_candidate = get_selected_car_platform(selected_car) if selected_car else None
+
+  # A valid manual selection doesn't need active VIN, ECU presence, or firmware queries.
+  # Keep passive CAN fingerprinting since interfaces use it to detect buses and optional equipment.
+  candidate, fingerprints, vin, car_fw, source, exact_match = fingerprint(can_recv, can_send, set_obd_multiplexing, num_pandas,
+                                                                          cached_params, skip_fw_query=forced_candidate is not None)
+
+  if forced_candidate is not None:
+    candidate = forced_candidate
+    source = CarParams.FingerprintSource.fixed
+    exact_match = True
 
   if candidate is None:
     carlog.error({"event": "car doesn't match any fingerprints", "fingerprints": repr(fingerprints)})
@@ -208,7 +199,9 @@ def get_car(can_recv: CanRecvCallable, can_send: CanSendCallable, set_obd_multip
   CP.fingerprintSource = source
   CP.fuzzyFingerprint = not exact_match
 
-  print("Carrot GitBranch = {}, {}".format(Params().get("GitBranch"), Params().get("GitCommitDate")))
+  params = Params()
+  print("Carrot GitBranch = {}, {}".format(format_git_source(params.get("GitRemote"), params.get("GitBranch")),
+                                         params.get("GitCommitDate")))
 
   return interfaces[CP.carFingerprint](CP)
 

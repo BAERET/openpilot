@@ -19,10 +19,10 @@ from opendbc.car.common.basedir import BASEDIR
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.common.simple_kalman import KF1D, get_kalman_gain
 from opendbc.car.values import PLATFORMS
+from opendbc.car.radar_tracks import MyTrack as MyTrack, estimate_radar_jerk as estimate_radar_jerk
 from opendbc.can import CANParser
 
 from openpilot.common.params import Params
-from openpilot.common.filter_simple import FirstOrderFilter
 
 GearShifter = structs.CarState.GearShifter
 ButtonType = structs.CarState.ButtonEvent.Type
@@ -32,11 +32,6 @@ MAX_CTRL_SPEED = (V_CRUISE_MAX + 4) * CV.KPH_TO_MS
 ACCEL_MAX = 2.5
 ACCEL_MIN = -4.0 #3.5
 FRICTION_THRESHOLD = 0.3
-
-CORNER_RADAR_SLOT_TRACK_RANGES = ((200, 220), (240, 250))
-CORNER_RADAR_SLOT_DISCONTINUITY_D_REL_M = 8.0
-CORNER_RADAR_SLOT_DISCONTINUITY_Y_REL_M = 1.5
-CORNER_RADAR_SLOT_DISCONTINUITY_V_REL_MPS = 4.0
 
 NEURAL_PARAMS_PATH = os.path.join(BASEDIR, 'torque_data/neural_ff_weights.json')
 TORQUE_NN_MODEL_PATH = os.path.join(BASEDIR, 'torque_data/lat_models')
@@ -207,100 +202,6 @@ def get_nn_model(car, eps_firmware) -> tuple[FluxModel | None, float]:
     model = FluxModel(model)
   return model
 
-def radar_track_id_is_reused_corner_slot(track_id: int) -> bool:
-  return any(start <= track_id < end for start, end in CORNER_RADAR_SLOT_TRACK_RANGES)
-
-class MyTrack:
-  def __init__(self, track_id: int, radar_point, dt: float):
-    self.track_id = track_id
-    self.reused_corner_slot = radar_track_id_is_reused_corner_slot(track_id)
-    self.cnt = 0
-    self.dRel = radar_point.dRel
-    self.vRel = radar_point.vRel
-    self.yRel = radar_point.yRel
-    self.yvRel = radar_point.yvRel
-    self.vLead = radar_point.vLead
-    self.v_lead_filtered_last = self.vLead
-    self.aLead = 0.0
-    self.jLead = 0.0
-    self.dt = dt
-    self.vLead_avg = FirstOrderFilter(self.vLead, 0.1, self.dt)
-    self.aLead_avg = FirstOrderFilter(self.aLead, 0.15, self.dt)
-    self.jLead_avg = FirstOrderFilter(self.jLead, 0.4, self.dt)
-    self.yRel_avg = FirstOrderFilter(self.yRel, 0.1, self.dt)
-    self.yvRel_avg = FirstOrderFilter(self.yvRel, 0.1, self.dt)
-    self.cnt = 0
-
-  def init_point(self, radar_point):
-    self.dRel = radar_point.dRel
-    self.vRel = radar_point.vRel
-    self.yRel = radar_point.yRel
-    self.yvRel = radar_point.yvRel
-    self.vLead = radar_point.vLead
-    self.v_lead_filtered_last = self.vLead
-    self.aLead = 0.0
-    self.jLead = 0.0
-    self.vLead_avg.x = self.vLead
-    self.aLead_avg.x = self.aLead
-    self.jLead_avg.x = self.jLead
-    self.yRel_avg.x = self.yRel
-    self.yvRel_avg.x = self.yvRel
-
-  def is_discontinuous_corner_slot(self, radar_point) -> bool:
-    if not self.reused_corner_slot:
-      return False
-    return (
-      abs(radar_point.dRel - self.dRel) > CORNER_RADAR_SLOT_DISCONTINUITY_D_REL_M
-      or abs(radar_point.yRel - self.yRel) > CORNER_RADAR_SLOT_DISCONTINUITY_Y_REL_M
-      or abs(radar_point.vRel - self.vRel) > CORNER_RADAR_SLOT_DISCONTINUITY_V_REL_MPS
-    )
-        
-  def update(self, radar_point, a_ego):
-    if not radar_point.measured:
-      if self.cnt > 0:
-        self.init_point(radar_point)
-      self.cnt = 0
-    elif self.cnt < 1 or self.is_discontinuous_corner_slot(radar_point):
-      self.init_point(radar_point)
-      self.cnt += 1
-    else:      
-      self.vLead = radar_point.vLead
-      if self.reused_corner_slot:
-        self.yRel = radar_point.yRel
-        self.yvRel = radar_point.yvRel
-        self.yRel_avg.x = self.yRel
-        self.yvRel_avg.x = self.yvRel
-      else:
-        self.yRel = self.yRel_avg.update(radar_point.yRel)
-        self.yvRel = self.yvRel_avg.update(radar_point.yvRel)
-
-      if True: #math.isnan(radar_point.aRel): # 
-        v_lead_filtered = self.vLead_avg.update(self.vLead)
-        pseudo_stop = abs(v_lead_filtered) < 0.3 and abs(self.vLead - v_lead_filtered) < 0.05
-        a_raw = (v_lead_filtered - self.v_lead_filtered_last) / self.dt
-        self.v_lead_filtered_last = v_lead_filtered
-
-        self.noisy = abs(a_raw - self.aLead) > 3.0
-        if self.noisy:
-          self.cnt = 0
-        
-        a_lead = self.aLead_avg.update(np.clip(a_raw, -10.0, 5.0) if not pseudo_stop else 0.0)
-
-        j_lead = (a_lead - self.aLead) / self.dt
-        self.aLead = a_lead
-        self.jLead = self.jLead_avg.update(j_lead if self.cnt > 2 else 0.0)
-      else:
-        a_lead = radar_point.aRel + a_ego
-        j_lead = (a_lead - self.aLead) / self.dt
-        self.aLead = a_lead
-        self.jLead = self.jLead_avg.update(j_lead if self.cnt > 2 else 0.0)
-
-      # Store latest values
-      self.dRel = radar_point.dRel
-      self.vRel = radar_point.vRel
-
-      self.cnt += 1
-
 # generic car and radar interfaces
 class RadarInterfaceBase(ABC):
   def __init__(self, CP: structs.CarParams):
@@ -355,18 +256,19 @@ class RadarInterfaceBase(ABC):
           new_tracks[track_id] = self.tracks[track_id]
         new_tracks[track_id].update(radar_point, self.a_ego)
 
-        if new_tracks[track_id].cnt < 6:
-          radar_point.aLead = 0
-          radar_point.jLead = 0
-          radar_point.yRel = float(new_tracks[track_id].yRel)
-          radar_point.yvRel = float(new_tracks[track_id].yvRel)
-        else:
-          radar_point.aLead = float(new_tracks[track_id].aLead)
-          radar_point.jLead = float(new_tracks[track_id].jLead)
-          radar_point.yRel = float(new_tracks[track_id].yRel)
-          radar_point.yvRel = float(new_tracks[track_id].yvRel)
+        new_tracks[track_id].write_acceleration(radar_point)
+        radar_point.yRel = float(new_tracks[track_id].yRel)
+        radar_point.yvRel = float(new_tracks[track_id].yvRel)
                 
       self.tracks = new_tracks
+      # RadarInterface.update() may already have copied self.pts into the
+      # Cap'n Proto result. Refresh that copy after this frame's track update;
+      # otherwise current distance/speed are paired with last frame's dynamics.
+      # Keep the interface's selected point set, order, and raw metadata intact.
+      for radar_point in ret.points:
+        track = self.tracks.get(radar_point.trackId)
+        if track is not None:
+          track.write_acceleration(radar_point)
       """
       if self.last_timestamp is not None:
         print(f"dt1 = {rcv_time - self.last_timestamp:.6f}")
@@ -426,10 +328,11 @@ class CarInterfaceBase(ABC):
     return self.lat_torque_nn_model is not None
     
 
-  def apply(self, c: structs.CarControl, now_nanos: int | None = None, model_v2=None) -> tuple[structs.CarControl.Actuators, list[CanData]]:
+  def apply(self, c: structs.CarControl, now_nanos: int | None = None, model_v2=None, radar_state=None) -> tuple[structs.CarControl.Actuators, list[CanData]]:
     if now_nanos is None:
       now_nanos = int(time.monotonic() * 1e9)
     self.CS.modelV2 = model_v2
+    self.CS.radarState = radar_state
     return self.CC.update(c, self.CS, now_nanos)
 
   @staticmethod
@@ -625,6 +528,7 @@ class CarStateBase(ABC):
     self.lkas_enabled = False
 
     self.modelV2 = None
+    self.radarState = None
 
   @abstractmethod
   def update(self, can_parsers) -> structs.CarState:

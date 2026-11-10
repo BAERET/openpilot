@@ -15,14 +15,18 @@ from collections import deque
 
 from opendbc.car.car_helpers import interfaces
 from opendbc.car.vehicle_model import VehicleModel
+from opendbc.car.hyundai.stop_object import signal_stop_object_requested
 from opendbc.car.volkswagen.values import MEB_CURVATURE_PID_KP, MEB_CURVATURE_PID_KI, MEB_CURVATURE_PID_KF, MEB_CURVATURE_MAX
 
+from openpilot.selfdrive.car.voice_indicator import set_lane_change_blinkers
 from openpilot.selfdrive.controls.lib.drive_helpers import clip_curvature, get_lag_adjusted_curvature, is_volkswagen_meb
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl, MIN_LATERAL_CONTROL_SPEED
 from openpilot.selfdrive.controls.lib.latcontrol_pid import LatControlPID
 from openpilot.selfdrive.controls.lib.latcontrol_angle import LatControlAngle, STEER_ANGLE_SATURATION_THRESHOLD
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.controls.lib.steer_ratio import resolve_vehicle_model_steer_ratio
+from openpilot.selfdrive.controls.lib.lateral_readiness import LateralStartupGate, lateral_vehicle_parameters
 
 
 from openpilot.common.realtime import DT_CTRL, DT_MDL
@@ -32,13 +36,23 @@ from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.selfdrive.carrot.carrot_controls import CarrotControls
+from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
+from openpilot.selfdrive.monitoring.dm_alerts import driver_monitoring_hud_alert
+from openpilot.selfdrive.carrot.bluetooth.physical import HoldReader
+from openpilot.selfdrive.selfdrived.vehicle_faults import inhibit_faulted_controls
 
 State = log.SelfdriveState.OpenpilotState
-LaneChangeState = log.LaneChangeState
-LaneChangeDirection = log.LaneChangeDirection
 LAT_CURVATURE_SATURATION_ACCEL = 0.1  # infiniteCable2 LatControlCurvature: 곡률 기반 steer_limited 임계 (m/s^2 환산)
 
 ACTUATOR_FIELDS = tuple(car.CarControl.Actuators.schema.fields.keys())
+
+
+def lateral_control_allowed(selfdrive_active: bool, always_lateral: bool, lat_enabled: bool,
+                            steer_fault_temporary: bool, steer_fault_permanent: bool,
+                            below_min_speed: bool, standstill: bool, steer_at_standstill: bool) -> bool:
+  return ((selfdrive_active or always_lateral) and lat_enabled and
+          not steer_fault_temporary and not steer_fault_permanent and
+          ((standstill and steer_at_standstill) or (not standstill and not below_min_speed)))
 
 
 class Controls:
@@ -49,8 +63,7 @@ class Controls:
     cloudlog.info("controlsd got CarParams")
 
     self.CI = interfaces[self.CP.carFingerprint](self.CP)
-
-    self.disable_dm = False
+    self.physical_blinker_hold = HoldReader(self.CP.carFingerprint, self.params)
 
     self.sm = messaging.SubMaster(['liveDelay', 'liveParameters', 'liveTorqueParameters', 'modelV2', 'selfdriveState',
                                    'liveCalibration', 'livePose', 'longitudinalPlan', 'carState', 'carOutput',
@@ -61,6 +74,8 @@ class Controls:
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.lateral_startup = LateralStartupGate()
+    self.lateral_started = False
 
     # VW MEB(ID.4/ID.5)에서만 사용. infiniteCable2 LatControlCurvature 정확 복제:
     # EnableCurvatureController=1(기본 ON) 상태의 곡률 폐루프 PID + useCarSteerCurvature 보정
@@ -101,20 +116,17 @@ class Controls:
 
   def state_control(self):
     CS = self.sm['carState']
+    lateral_ready = self.lateral_startup.update(self.sm, CS, 'carState')
 
     # Update VehicleModel
-    lp = self.sm['liveParameters']
+    lp = self.sm['liveParameters'] if lateral_ready else lateral_vehicle_parameters(self.sm, self.CP)
     x = max(lp.stiffnessFactor, 0.1)
-    if self.is_vw_meb:
-      # VW MEB(ID.4/ID.5): infiniteCable2와 동일하게 학습된 steerRatio를 그대로 사용.
-      # carrot의 SteerRatioRate 자동학습/CustomSR 배수를 곱하면 VM steerRatio가 infiniteCable2와
-      # 어긋나 actual_curvature_vm이 틀어지고 useCarSteerCurvature 보정항이 각도비례 바이어스가 되어
-      # 곡선 발진·차선이탈을 유발함. MEB만 원본 방식(배수 미적용)으로 고정. 타 차종은 carrot 그대로.
-      sr = max(lp.steerRatio, 0.1)
-    else:
-      sr = max(lp.steerRatio, 0.1) * self.params.get_float("SteerRatioRate") / 100.0
-      custom_sr = self.params.get_float("CustomSR") / 10.0
-      sr = max(custom_sr if custom_sr > 1.0 else sr, 0.1)
+    # All platforms, including VW MEB, honor the manual ratio and live scaling.
+    # Invalid persisted rates still fall back to the unscaled learned ratio.
+    sr = resolve_vehicle_model_steer_ratio(lp.steerRatio,
+                                           self.params.get_float("SteerRatioRate"),
+                                           self.params.get_float("CustomSR"))
+    self.VM.update_geometry(getattr(lp, "centerToFrontRatio", 0.0))
     self.VM.update_params(x, sr)
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
@@ -140,22 +152,31 @@ class Controls:
     #self.soft_hold_active = CS.softHoldActive #car.OnroadEvent.EventName.softHold in [e.name for e in self.sm['onroadEvents']]
 
     # Check which actuators can be enabled
-    standstill = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED) or CS.standstill
-    CC.latActive = ((self.sm['selfdriveState'].active or lateral_enabled) and CS.latEnabled and
-                    not CS.steerFaultTemporary and not CS.steerFaultPermanent and not standstill)
+    below_min_speed = abs(CS.vEgo) <= max(self.CP.minSteerSpeed, MIN_LATERAL_CONTROL_SPEED)
+    # This Tesla engagement change must not relax other brands' speed gates.
+    steer_at_standstill = self.CP.brand == "tesla" and self.CP.steerAtStandstill
+    CC.latActive = lateral_control_allowed(self.sm['selfdriveState'].active, lateral_enabled, CS.latEnabled,
+                                           CS.steerFaultTemporary, CS.steerFaultPermanent, below_min_speed,
+                                           CS.standstill, steer_at_standstill)
     CC.latActive = self.carrot_controls.lat_suspend_control(CS, CC.latActive)
+    # Wait only for the first readiness confirmation, including AlwaysLateral.
+    CC.latActive = CC.latActive and lateral_ready
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and self.CP.openpilotLongitudinalControl
+    inhibit_faulted_controls(CC, self.sm['onroadEvents'])
+
+    # AlwaysLateral must also stop while manager drains workers for this reboot.
+    if self.params.get_bool("ImpactDashcamReboot"):
+      CC.enabled = CC.latActive = CC.longActive = False
 
     actuators = CC.actuators
-    actuators.longControlState = self.LoC.long_control_state
 
-    # Enable blinkers while lane changing
-    if model_v2.meta.laneChangeState != LaneChangeState.off:
-      CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
-      CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
+    set_lane_change_blinkers(CC, model_v2.meta)
 
     if not CC.latActive:
       self.LaC.reset()
+    if CC.latActive and not self.lateral_started:
+      self.desired_curvature = self.curvature
+      self.lateral_started = True
     if not CC.longActive:
       self.LoC.reset()
 
@@ -163,6 +184,7 @@ class Controls:
     pid_accel_limits = self.CI.get_pid_accel_limits(self.CP, CS.vEgo, CS.vCruise * CV.KPH_TO_MS)
     t_since_plan = (self.sm.frame - self.sm.recv_frame['longitudinalPlan']) * DT_CTRL
     accel, aTarget, jerk = self.LoC.update(CC.longActive, CS, long_plan, pid_accel_limits, t_since_plan, self.sm['radarState'])
+    actuators.longControlState = self.LoC.long_control_state
     actuators.accel = float(accel)
     actuators.aTarget = float(aTarget)
     actuators.jerk = float(jerk)
@@ -171,10 +193,11 @@ class Controls:
     lat_plan = self.sm['lateralPlan']
     curve_speed_abs = abs(self.sm['carrotMan'].vTurnSpeed)
     self.lanefull_mode_enabled = (lat_plan.useLaneLines and curve_speed_abs > self.params.get_int("UseLaneLineCurveSpeed"))
-    lat_smooth_seconds = self.params.get_float("LatSmoothSec") * 0.01
-    steer_actuator_delay = self.params.get_float("SteerActuatorDelay") * 0.01
-    if steer_actuator_delay == 0.0:
-      steer_actuator_delay = self.sm['liveDelay'].lateralDelay 
+    if CC.latActive and len(lat_plan.curvatures) > 0 and (lat_plan.useLaneLines if self.is_vw_meb else self.lanefull_mode_enabled):
+      lat_smooth_seconds = self.params.get_float("LatSmoothSec") * 0.01
+      steer_actuator_delay = self.params.get_float("SteerActuatorDelay") * 0.01
+      if steer_actuator_delay == 0.0:
+        steer_actuator_delay = self.sm['liveDelay'].lateralDelay
     
     def smooth_value(val, prev_val, tau):
       alpha = 1 - np.exp(-DT_CTRL / tau) if tau > 0 else 1
@@ -274,7 +297,8 @@ class Controls:
     CC.cruiseControl.override = CC.enabled and not CC.longActive and self.CP.openpilotLongitudinalControl
     CC.cruiseControl.cancel = CS.cruiseState.enabled and (not CC.enabled or not self.CP.pcmCruise)
 
-    desired_kph = min(CS.vCruiseCluster, self.sm['carrotMan'].desiredSpeed)
+    carrot_man = get_carrot_man(self.sm)
+    desired_kph = CS.vCruiseCluster if carrot_man is None else min(CS.vCruiseCluster, carrot_man.desiredSpeed)
     setSpeed = float(desired_kph * CV.KPH_TO_MS)
     speeds = self.sm['longitudinalPlan'].speeds
     if len(speeds):
@@ -283,6 +307,7 @@ class Controls:
       setSpeed = speeds[-1] / vCluRatio
 
     hudControl = CC.hudControl
+    hudControl.physicalBlinkerHold = self.physical_blinker_hold.read(CS.canValid)
 
     hudControl.activeCarrot = self.sm['carrotMan'].activeCarrot
     hudControl.atcDistance = self.sm['carrotMan'].xDistToTurn
@@ -346,6 +371,7 @@ class Controls:
     hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
     hudControl.leadDistanceBars = self.sm['selfdriveState'].personality.raw + 1
     hudControl.visualAlert = self.sm['selfdriveState'].alertHudVisual
+    hudControl.driverMonitoringAlert = driver_monitoring_hud_alert(self.sm)
 
     radarState = self.sm['radarState']
     leadOne = radarState.leadOne
@@ -353,6 +379,12 @@ class Controls:
     hudControl.leadRelSpeed = leadOne.vRel if leadOne.status else 0
     hudControl.leadRadar = 1 if leadOne.radar else 0
     hudControl.leadDPath = leadOne.dPath
+    hudControl.signalStopObject = signal_stop_object_requested(
+      self.CP, CS, CC, lp, radarState,
+      inputs_ready=self.sm.all_checks(['longitudinalPlan', 'radarState']) and
+                   0 <= (self.sm.frame - self.sm.recv_frame['longitudinalPlan']) * DT_CTRL <= 0.2 and
+                   0 <= (self.sm.frame - self.sm.recv_frame['radarState']) * DT_CTRL <= 0.2,
+    )
 
     meta = self.sm['modelV2'].meta
     if False: # command
@@ -411,10 +443,9 @@ class Controls:
     cs.upAccelCmd = float(self.LoC.pid.p)
     cs.uiAccelCmd = float(self.LoC.pid.i)
     cs.ufAccelCmd = float(self.LoC.pid.f)
-    cs.forceDecel = False
-    if self.params.get_int("DisableDM") == 0:
-      cs.forceDecel = bool((self.sm['driverMonitoringState'].alertLevel == log.DriverMonitoringState.AlertLevel.three) or
-                           (self.sm['selfdriveState'].state == State.softDisabling))
+    cs.forceDecel = bool((not self.sm['driverMonitoringState'].dm2Disabled and
+                          self.sm['driverMonitoringState'].alertLevel == log.DriverMonitoringState.AlertLevel.three) or
+                         (self.sm['selfdriveState'].state == State.softDisabling))
 
 
     lat_tuning = self.CP.lateralTuning.which()
@@ -444,7 +475,9 @@ class Controls:
 
 
 def main():
-  config_realtime_process(4, Priority.CTRL_HIGH)
+  # Share isolated core6 with selfdrived and camerad; keep the short 100Hz
+  # control work off core4's planner/radarcan queue. Preserve FIFO53.
+  config_realtime_process(6, Priority.CTRL_HIGH)
   controls = Controls()
   controls.run()
 

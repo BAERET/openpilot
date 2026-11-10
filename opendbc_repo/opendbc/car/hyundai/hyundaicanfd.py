@@ -1,15 +1,81 @@
 import copy
+import math
 import numpy as np
-from opendbc.car import CanBusBase
+from opendbc.car.hyundai.scalar import clip_float
+from opendbc.car import CanBusBase, DT_CTRL
+from opendbc.car.carlog import carlog
 from opendbc.car.crc import CRC16_XMODEM
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiExtFlags
+from opendbc.car.hyundai.stopping import MOVING_SPEED, STOP_LOWER_BAND
+from opendbc.car.hyundai.stop_object import apply_signal_stop_object
 from openpilot.common.params import Params
+from openpilot.common.filter_simple import FirstOrderFilter
 from opendbc.car.common.conversions import Conversions as CV
 from openpilot.cereal import log
 
 LaneChangeState = log.LaneChangeState
 LaneChangeDirection = log.LaneChangeDirection
 TurnDirection = log.Desire
+
+ACC_CONTROL_DT = 1.0 / 50.0
+
+
+def longitudinal_interlock_active(CS) -> bool:
+  return CS.out.brakeHoldActive or CS.out.parkingBrake
+
+
+def apply_accel_jerk_limit(a_raw: float, a_value_last: float, jerk_u: float, jerk_l: float,
+                           dt: float = ACC_CONTROL_DT) -> float:
+  """Ramp aReqValue toward aReqRaw using the asymmetric stock SCC jerk limits."""
+  upper_step = max(0.0, float(jerk_u)) * dt
+  lower_step = max(0.0, float(jerk_l)) * dt
+  return clip_float(a_raw, a_value_last - lower_step, a_value_last + upper_step)
+
+
+def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, jerk_l):
+  """Apply the zero-aReq stopping sequence after the normal SCC interlocks."""
+  if controller is None:
+    return
+
+  wheels = CS.out.wheelSpeeds
+  speeds = [CS.out.vEgo, CS.out.vEgoRaw, wheels.fl, wheels.fr, wheels.rl, wheels.rr]
+  finite = all(math.isfinite(v) for v in (*speeds, CS.out.aEgo, accel, values["aReqValue"], previous_value, jerk_u, jerk_l))
+  speed = max(abs(v) for v in speeds) if finite else 0.0
+  soft_hold = CS.softHoldActive > 0 and CS.out.cruiseState.available
+  # Only an armed, stationary soft hold may remain active while the driver brakes.
+  # Ordinary braking and pedal input while moving keep their existing interlock.
+  brake_blocked = CS.out.brakePressed and not (soft_hold and speed <= MOVING_SPEED)
+  blocked = (not finite or not CS.out.canValid or brake_blocked or CS.out.gasPressed
+             or str(CS.out.gearShifter) != "drive" or longitudinal_interlock_active(CS))
+  previous_phase = controller.phase
+  command = controller.update(
+    active=values["ACCMode"] == 1 and not blocked, requested=bool(values["StopReq"]), speed=speed,
+    held=CS.canfdSccHoldActive, accel=accel, previous_value=previous_value,
+    jerk_u=max(0.0, min(jerk_u, 5.0)), jerk_l=max(1.0, min(jerk_l, 5.0)),
+  )
+  if blocked or values["ACCMode"] != 1:
+    values.update(StopReq=0, aReqRaw=0.0, aReqValue=0.0, AccelLimitBandLower=0.0)
+    if not finite:
+      values.update(ACCMode=0, JerkUpperLimit=1.0, JerkLowerLimit=1.0)
+  elif command is not None:
+    values.update(StopReq=command.stop_req, aReqRaw=command.raw, aReqValue=command.value,
+                  AccelLimitBandUpper=0.0, AccelLimitBandLower=command.lower)
+  else:
+    # Establish the fixed band during ordinary active ACC, before any stop
+    # request. Approach/held packets retain it instead of adding a band edge
+    # alongside StopReq. This is a timing trial, not an OEM hold guarantee.
+    values["AccelLimitBandLower"] = STOP_LOWER_BAND
+
+  # Apply only to the final packet, after approach and interlocks select StopReq.
+  # The first StopReq frame already carries zero Raw/Value; Upper may rise next.
+  values["JerkUpperLimit"] = controller.limit_scc_jerk_upper(values["StopReq"], values["JerkUpperLimit"])
+
+  if controller.phase != previous_phase:
+    carlog.warning({"event": "carrot_stopping", "from": str(previous_phase), "phase": str(controller.phase),
+                    "reason": controller.reason, "speed": speed, "aEgo": CS.out.aEgo,
+                    "held": CS.canfdSccHoldActive,
+                    "soft_hold": soft_hold,
+                    "StopReq": values["StopReq"], "aReqRaw": values["aReqRaw"], "aReqValue": values["aReqValue"]})
 
 
 def hyundai_crc8(data: bytes) -> int:
@@ -97,7 +163,8 @@ def create_steering_messages_camera_scc(frame, packer, CP, CAN, CC, lat_active, 
   ret = []
   if CS.mdps is not None:
     values = copy.copy(CS.mdps)
-    #rx_counter = values.pop("COUNTER", None)
+    # Seed once from RX; subsequent counters follow actual transmissions, not RX timing.
+    rx_counter = values.pop("COUNTER", None)
     if angle_control:
       if CS.lfa_alt is not None:
         values["LFA2_ACTIVE"] = CS.lfa_alt["LKAS_ANGLE_ACTIVE"]
@@ -107,8 +174,7 @@ def create_steering_messages_camera_scc(frame, packer, CP, CAN, CC, lat_active, 
 
     if frame % 1000 < 40:
       values["STEERING_COL_TORQUE"] += 220
-    #ret.append(packer.make_can_msg("MDPS", CAN.CAM, values, rx_counter = rx_counter))
-    ret.append(packer.make_can_msg("MDPS", CAN.CAM, values))
+    ret.append(packer.make_can_msg("MDPS", CAN.CAM, values, rx_counter=rx_counter))
 
   if frame % 10 == 0:
     if CS.steer_touch_2af is not None:
@@ -282,7 +348,7 @@ def create_acc_cancel(packer, CP, CAN, cruise_info_copy):
   })
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
 
-def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
+def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active, *, suppress_camera_auto_disengage=False, dm_alert=0):
 
 
   if CS.lfahda_cluster is not None:
@@ -296,7 +362,41 @@ def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
     values["HDA_OptUsmSta"] = 2
   values["HDA_CntrlModSta"] = 2 if long_active else 0
   values["HDA_LFA_SymSta"] = 2 if lat_active else 0
+  # The scoped GV70/Sorento HEV stock cameras can request this popup with lateral control,
+  # including while longitudinal control is active. Suppress only the observed
+  # signature in the outgoing cluster copy;
+  # retain raw camera evidence and all fault / hands-off popup identities.
+  lfa = CS.lfa if suppress_camera_auto_disengage else None
+  mdps = CS.mdps if suppress_camera_auto_disengage else None
+  scc = CS.scc_control if suppress_camera_auto_disengage else None
+  if (suppress_camera_auto_disengage and lat_active
+      and values.get("HDA_InfoPUDis") == 3 and values.get("HDA_InfoPUDis1") == 0
+      and values.get("HDA_LFA_WrnSnd") == 0
+      and lfa is not None and lfa.get("FCA_SYSWARN") == 1 and lfa.get("VALUE63") == 15
+      and mdps is not None and mdps.get("LKA_FAULT") == 0 and mdps.get("LFA2_FAULT") == 0
+      and scc is not None and scc.get("SysFailState") == 0):
+    values["HDA_InfoPUDis"] = 0
+  if dm_alert in (1, 2, 3) and values.get("HDA_InfoPUDis") == 0 and values.get("HDA_InfoPUDis1") == 0:
+    values["HDA_InfoPUDis"] = 5  # DBC: hands-off popup, without the sound of value 6
   return [packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values, rx_counter=rx_counter)]
+
+def _apply_driver_monitoring_alert(values, hud_control, stock):
+  level = getattr(hud_control, "driverMonitoringAlert", 0)
+  if level not in (1, 2, 3):
+    return
+  # Use the documented hands-on warning, red at terminal DM. Apply after the
+  # legacy stock-warning filter, on a fresh copy each tick.
+  # Keep OEM popup/sound precedence. The reported stock terminal-warning pair
+  # is ALERTS_2=2 with SOUNDS_2=3 (DBC: constant chime).
+  if stock["ALERTS_2"] in (7, 8, 9, 10, 14, 21):
+    values["ALERTS_2"] = stock["ALERTS_2"]
+    for i in range(1, 5):
+      values[f"SOUNDS_{i}"] = stock[f"SOUNDS_{i}"]
+  if values["ALERTS_2"] == 0:
+    values["ALERTS_2"] = 2 if level == 3 else 1
+    if level == 3 and all(values[f"SOUNDS_{i}"] == 0 for i in range(1, 5)):
+      values["SOUNDS_2"] = 3
+
 
 def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
   ret = []
@@ -326,73 +426,137 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
     if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
       values["ALERTS_5"] = 0
 
+    _apply_driver_monitoring_alert(values, getattr(CC, "hudControl", None), CS.adrv_0x161)
     ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter=rx_counter))
   return ret
 
-def create_acc_control_scc2(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control, hyundai_jerk, CS):
+def _display_lead(radar_state):
+  # Vehicle displays show the nearest valid control lead, including leadTwo.
+  # Equal distances retain leadOne; this does not change radar/control roles.
+  leads = (getattr(radar_state, name, None) for name in ("leadOne", "leadTwo"))
+  return min((lead for lead in leads
+              if lead is not None and lead.status and lead.dRel > 0
+              and all(math.isfinite(v) for v in (lead.dRel, lead.yRel, lead.vRel))),
+             key=lambda lead: lead.dRel, default=None)
 
+
+def _display_lead_lateral(lead, model_v2):
+  # Model position and the cluster use right-positive y; radar yRel is left-positive.
+  lateral = -lead.yRel
+  position = getattr(model_v2, "position", None)
+  if position is not None:
+    x, y = position.x, position.y
+    if (len(x) >= 2 and len(x) == len(y)
+        and all(math.isfinite(v) for v in x) and all(math.isfinite(v) for v in y)
+        and all(x[i] > x[i - 1] for i in range(1, len(x)))):
+      lateral -= float(np.interp(lead.dRel, x, y))
+  return lateral
+
+
+class DisplayLeadLateralFilter:
+  """HUD-only path-relative lateral smoothing, updated once per control tick."""
+  def __init__(self):
+    self.filter = FirstOrderFilter(0.0, 0.4, DT_CTRL, initialized=False)
+    self.target = None
+    self.distance = None
+
+  def update(self, radar_state, model_v2=None):
+    lead = _display_lead(radar_state)
+    if lead is None:
+      self.filter.initialized = False
+      self.target = self.distance = None
+      return 0.0
+
+    # A leadOne/leadTwo role change must not reset the same radar target.
+    target = (getattr(lead, "radar", False), getattr(lead, "radarTrackId", -1))
+    # Also reject a discontinuous range jump (reused track ID / vision-only lead).
+    if target != self.target or (self.distance is not None and abs(lead.dRel - self.distance) > 5.0):
+      self.filter.initialized = False
+    self.target, self.distance = target, lead.dRel
+    return self.filter.update(_display_lead_lateral(lead, model_v2))
+
+
+def _apply_scc_lead(values, radar_state, model_v2=None, hud_lateral=None):
+  lead = _display_lead(radar_state)
+  # Match the stock no-object encoding; never retain an old camera target.
+  values.update(ACC_ObjDist=204.6, ACC_ObjLatPos=0.0, ACC_ObjRelSpd=239.4, HUD_LEAD_INFO=0)
+  if lead is not None:
+    values["ACC_ObjDist"] = clip_float(lead.dRel, 0.1, 204.5)
+    # Show the offset from the model path at the lead distance. Bound to
+    # the signed 9-bit signal's representable range (0.1 scale, -20 offset).
+    lateral = _display_lead_lateral(lead, model_v2) if hud_lateral is None else hud_lateral
+    values["ACC_ObjLatPos"] = clip_float(lateral, -45.6, 5.5)
+    values["ACC_ObjRelSpd"] = clip_float(lead.vRel, -170.0, 239.3)
+    # Keep the OEM HUD/cluster lead white around standstill; relative-speed
+    # noise near zero must not alternate white (2) and receding gray (1).
+    values["HUD_LEAD_INFO"] = 1 if lead.vRel > 0.3 else 2
+
+
+def create_acc_control_scc2(packer, CAN, enabled, accel_value_last, accel, stopping, gas_override, set_speed, hud_control, hyundai_jerk, CS,
+                            stop_controller=None, hud_lateral=None):
+
+  if stop_controller is not None:
+    stop_controller.stop_object_active = False
   if CS.scc_control is None:
-    return None
-  enabled = (enabled or CS.softHoldActive > 0) and CS.paddle_button_prev == 0
+    if stop_controller is not None:
+      stop_controller.reset()
+    return None, accel_value_last
+  interlock_active = longitudinal_interlock_active(CS)
+  soft_hold_active = CS.softHoldActive > 0 and CS.out.cruiseState.available
+  acc_control_enabled = (enabled or soft_hold_active) and CS.out.cruiseState.available and CS.paddle_button_prev == 0 and not interlock_active
+  enabled = acc_control_enabled
 
   acc_mode = 0 if not enabled else (2 if gas_override else 1)
+  previous_value = accel_value_last
 
   if hyundai_jerk.carrot_cruise == 1:
     acc_mode = 4 if enabled else 0
     enabled = False
-    accel = accel_last = 0.5
+    accel = accel_value_last = 0.5
 
   elif hyundai_jerk.carrot_cruise == 2:
-    accel = accel_last = hyundai_jerk.carrot_cruise_accel
+    accel = accel_value_last = hyundai_jerk.carrot_cruise_accel
 
-  jerk_u = hyundai_jerk.jerk_u
+  jerk_u = 2.0 if stopping or soft_hold_active else hyundai_jerk.jerk_u
   jerk_l = hyundai_jerk.jerk_l
-  jerk = 5
-  jn = jerk / 50
   if not enabled or gas_override:
     a_val, a_raw = 0, 0
   else:
     a_raw = accel
-    a_val = accel #np.clip(accel, accel_last - jn, accel_last + jn)
+    a_val = apply_accel_jerk_limit(a_raw, accel_value_last, jerk_u, jerk_l)
 
   values = copy.copy(CS.scc_control)
   rx_counter = values.pop("COUNTER", None)
   values["ACCMode"] = acc_mode
   values["MainMode_ACC"] = 1
-  values["StopReq"] = 1 if stopping or CS.softHoldActive > 0 else 0  # 1: Stop control is required, 2: Not used, 3: Error Indicator
+  values["StopReq"] = 1 if acc_control_enabled and (stopping or soft_hold_active) else 0  # 1: Stop control is required, 2: Not used, 3: Error Indicator
   values["aReqValue"] = a_val
   values["aReqRaw"] = a_raw
   values["VSetDis"] = set_speed
   #values["JerkLowerLimit"] = jerk if enabled else 1
   #values["JerkUpperLimit"] = 3.0
   values["JerkLowerLimit"] = jerk_l if enabled else 1
-  values["JerkUpperLimit"] = 2.0 if stopping or CS.softHoldActive else jerk_u
+  values["JerkUpperLimit"] = jerk_u
   values["DISTANCE_SETTING"] = hud_control.leadDistanceBars # + 5
   #values["DISTANCE_SETTING"] = hud_control.leadDistanceBars  + 5
 
-  #values["ACC_ObjDist"] = 1
   #values["ObjValid"] = 0
   #values["OBJ_STATUS"] =  2
   #values["NSCCOper"] = 1 if enabled else 0 # 0: off, 1: Ready, 2: Act, 3: Error Indicator
   #values["NSCCOnOff"] = 2  # 0: Default, 1: Off, 2: On, 3: Invalid
   #values["SET_ME_3"] = 0x3  # objRelsped와 충돌
-  #values["ACC_ObjLatPos"] = - hud_control.leadDPath
   values["DriveMode"] = 0 # 0: Default, 1: Comfort Mode, 2:Normal mode, 3:Dynamic mode, reserved
 
-  hud_lead_info = 0
-  if hud_control.leadVisible:
-    hud_lead_info = 1 if values["ACC_ObjRelSpd"] > 0 else 2
-  values["HUD_LEAD_INFO"] = hud_lead_info  #1: in-path object detected(uncontrollable), 2: controllable long, 3: controllable long & lat, ... reserved
+  _apply_scc_lead(values, getattr(CS, "radarState", None), getattr(CS, "modelV2", None), hud_lateral)
 
   values["DriverAlert"] = 0   # 1: SCC Disengaged, 2: No SCC Engage condition, 3: SCC Disenganed when the vehicle stops
 
-  values["TARGET_DISTANCE"] = CS.out.vEgo * 1.0 + 4.0
+  values["TARGET_DISTANCE"] = CS.out.vEgo + 4.0 if math.isfinite(CS.out.vEgo) else 4.0
 
-  soft_hold_info = 1 if CS.softHoldActive > 1 and enabled else 0
-
-  # 이거안하면 정지중 뒤로 밀리는 현상 발생하는듯.. (신호정지중에 뒤로 밀리는 경험함.. 시험해봐야)
-  if values["InfoDisplay"] != 5: #5: Front Car Departure Notice
-    values["InfoDisplay"] = 4 if stopping and CS.out.aEgo > -0.3 else 0  # 1: SCC Mode, 2: Convention Cruise Mode, 3: Object disappered at low speed, 4: Available to resume acceleration control, 5: Front vehicle departure notice, 6: Reserved, 7: Invalid
+  if stop_controller is not None:
+    values["InfoDisplay"] = 0
+  elif values["InfoDisplay"] != 5:
+    values["InfoDisplay"] = 4 if not interlock_active and stopping and CS.out.aEgo > -0.3 else 0
 
   values["TakeOverReq"] = 0    # 1: Takeover request, 2: Not used, 3: Error indicator , 이것이 켜지면 가속을 안하는듯함.
   #values["NEW_SIGNAL_4"] = 9 if hud_control.leadVisible else 0
@@ -402,13 +566,27 @@ def create_acc_control_scc2(packer, CAN, enabled, accel_last, accel, stopping, g
   values["AccelLimitBandUpper"] = 0.0   # 이값이 1.26일때 가속을 안하는 증상이 보임..
   values["AccelLimitBandLower"] = 0.0
 
-  values["ZEROS_7"] = 1
+  values["ZEROS_7"] = 0 if stop_controller is not None else 1
+  apply_canfd_stopping(values, CS, stop_controller, accel, previous_value, jerk_u, jerk_l)
 
-  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+  # Existing state-only fallback for no-lead stops (OEM SCC_ObjSta). The
+  # explicitly requested signal-stop object below additionally supplies range
+  # and speed; neither path modifies RX or establishes an ESC acceptance gate.
+  if stop_controller is not None and values["ACCMode"] == 1 and values["StopReq"] == 1 and values["HUD_LEAD_INFO"] == 0:
+    values["HUD_LEAD_INFO"] = 2
 
-def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control, jerk_u, jerk_l, CS):
+  if stop_controller is not None:
+    stop_controller.stop_object_active = apply_signal_stop_object(values, CS, hud_control, stopping_controller=stop_controller)
 
-  enabled = enabled or CS.softHoldActive > 0
+  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values), values["aReqValue"]
+
+def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control, jerk_u, jerk_l, CS,
+                       stop_controller=None, accel_value_last=None):
+
+  interlock_active = longitudinal_interlock_active(CS)
+  soft_hold_active = CS.softHoldActive > 0 and CS.out.cruiseState.available
+  acc_control_enabled = (enabled or soft_hold_active) and CS.out.cruiseState.available and not interlock_active
+  enabled = acc_control_enabled
   jerk = 5
   jn = jerk / 50
   if not enabled or gas_override:
@@ -420,7 +598,7 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
   values = {
     "ACCMode": 0 if not enabled else (2 if gas_override else 1),
     "MainMode_ACC": 1,
-    "StopReq": 1 if stopping or CS.softHoldActive > 0 else 0,
+    "StopReq": 1 if acc_control_enabled and (stopping or soft_hold_active) else 0,
     "aReqValue": a_val,
     "aReqRaw": a_raw,
     "VSetDis": set_speed,
@@ -438,10 +616,16 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
     #"SET_ME_3": 0x3,
     "ACC_ObjLatPos": 0x64,
     "DISTANCE_SETTING": hud_control.leadDistanceBars, # + 5,
-    "InfoDisplay": 4 if stopping and CS.out.cruiseState.standstill else 0,
+    "InfoDisplay": 0 if stop_controller is not None else (
+      4 if not interlock_active and stopping and CS.out.cruiseState.standstill else 0),
+    "ZEROS_7": 0,
   }
 
-  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+  # accel_last is the legacy raw target, not necessarily the previous SCC
+  # output. Keep ordinary packet limiting; anchor recovery to the returned value.
+  previous_value = accel_last if accel_value_last is None else accel_value_last
+  apply_canfd_stopping(values, CS, stop_controller, accel, previous_value, jerk_u, jerk_l)
+  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values), values["aReqValue"]
 
 
 def create_spas_messages(packer, CAN, frame, left_blink, right_blink):
@@ -485,7 +669,8 @@ def create_tcs_messages(packer, CAN, CS):
   ret = []
   if CS.tcs is not None:
     values = copy.copy(CS.tcs)
-    #rx_counter = values.pop("COUNTER", None)
+    # Keep an independent TX sequence even when the latest RX snapshot repeats or skips.
+    rx_counter = values.pop("COUNTER", None)
     values["DriverBraking"] = 0
     values["NEW_SIGNAL_20"] = 0
     values["NEW_SIGNAL_11"] = 0
@@ -493,8 +678,7 @@ def create_tcs_messages(packer, CAN, CS):
     #values["NEW_SIGNAL_1"] = 0 # accel과 관련..  옆두부 꺼지는것과 관련? 확인필요
     #values["ACC_REQ"] = 1 # 옆두부 꺼지는것과 관련? 확인필요.. 항상 켜지게함..
     values["NEW_SIGNAL_1"] = 0 if values["ACC_REQ"] == 1 else 1 # 옆두부..
-    #ret.append(packer.make_can_msg("TCS", CAN.CAM, values, rx_counter = rx_counter))
-    ret.append(packer.make_can_msg("TCS", CAN.CAM, values))
+    ret.append(packer.make_can_msg("TCS", CAN.CAM, values, rx_counter=rx_counter))
   return ret
 
 def forward_button_message(packer, CAN, frame, CS, cruise_button, MainMode_ACC_trigger, LFA_trigger):
@@ -588,11 +772,6 @@ def hkg_can_fd_checksum(address: int, sig, d: bytearray) -> int:
   return crc
 
 
-
-
-def _clip_int(x, lo, hi):
-  return lo if x < lo else hi if x > hi else int(x)
-
 def _get_desire_and_lane_changing(md):
   desire = 0
   lane_changing = 0
@@ -605,6 +784,56 @@ def _get_desire_and_lane_changing(md):
       if ds[3] > 0.9: lane_changing = 3
       if ds[4] > 0.9: lane_changing = 4
   return desire, lane_changing
+
+BLINK_HOLD_CROSS_NEAR_M = 1.0     # the target-side line came this close to the car centre ...
+BLINK_HOLD_CROSS_JUMP_M = 1.5     # ... then moved this far away again: the model relabelled it, the centre is across
+BLINK_HOLD_RELEASE_PROGRESS = 0.6  # release once the car centre has moved this fraction of a lane width into the new lane
+
+
+def _blink_hold_side(md, desire, state):
+  """Turn-signal hold for ADRV_0x1ea: 3 (left), 4 (right) or 0.
+
+  DesireHelper's request (modelV2.meta.laneChangeBlinkerHold) wins: it holds the lamp while a lever-requested
+  change waits (LaneChangeLeverWait) and while a next change asked for during this one is queued. Otherwise the
+  current change decides (_blink_hold_change).
+  """
+  change_hold = _blink_hold_change(md, desire, state)
+  meta = getattr(md, "meta", None) if md is not None else None
+  requested = str(getattr(meta, "laneChangeBlinkerHold", "none"))
+  return 3 if requested == "left" else 4 if requested == "right" else change_hold
+
+
+def _blink_hold_change(md, desire, state):
+  """Hold for the current lane change: 3 (left), 4 (right) or 0.
+
+  Held for the whole confirmed lane change (desire 3/4 = starting + finishing, same as the green
+  cluster lane) instead of the model's desireState > 0.9, which falls ~2 s before the change ends and
+  let the lamp stop mid-change (2026-09-19 drive: hold covered 49-65 % of the change). Released once the
+  model's lane lines show the car centre 60 % of a lane width over (the crossed line, now on the other
+  side, 0.1 lane width away), so the lamp does not keep flashing ~2 s after the car is already in the new
+  lane. Without a detectable crossing the hold lasts to the end of the desire.
+  """
+  if desire not in (3, 4):
+    state.update(crossed=False, released=False, y_min=None)
+    return 0
+  if state.get("released"):
+    return 0
+  lines = getattr(md, "laneLines", None) if md is not None else None
+  if lines is not None and len(lines) >= 3 and len(lines[1].y) and len(lines[2].y):
+    target, other = (1, 2) if desire == 3 else (2, 1)
+    y_target, y_other = float(lines[target].y[0]), float(lines[other].y[0])
+    # The relabel is spread over 2-3 model frames (e.g. -0.28 -> -1.36 -> -3.46 m), so compare with the
+    # closest approach instead of the previous frame.
+    y_min = abs(y_target) if state.get("y_min") is None else min(state["y_min"], abs(y_target))
+    state["y_min"] = y_min
+    if not state.get("crossed") and y_min < BLINK_HOLD_CROSS_NEAR_M and abs(y_target) - y_min > BLINK_HOLD_CROSS_JUMP_M:
+      state["crossed"] = True
+    lane_width = abs(y_target) + abs(y_other)
+    if state.get("crossed") and abs(y_other) >= (BLINK_HOLD_RELEASE_PROGRESS - 0.5) * lane_width:
+      state["released"] = True
+      return 0
+  return desire
+
 
 def _apply_lane_desire(values, desire):
   #values['LANE_CHANGING'] = 0
@@ -625,73 +854,143 @@ def _apply_lane_desire(values, desire):
   elif desire == 4:  # 우차선변경
     values['LANE_CHANGING'] = 4
 
-def _apply_radar_blink(values, radar_pairs, frame, *,
-                      disp_dist=30.0, min_dist=14.0,
-                      max_interval=100, t=1.0):
-  """
-  거리 > min_dist 일 때만 깜빡임.
-  거리 멀수록 interval 커짐(느리게).
-  """
-  for det_key, dist_key in radar_pairs:
-    dist = values[dist_key]
-    if dist <= min_dist:
-      continue
-
-    d = min(dist, disp_dist)
-    interval = int((1 + (max_interval - 1) * (d / disp_dist)) * t)
-    interval = _clip_int(interval, 1, max_interval)
-
-    blink = (frame // interval) & 1
-    values[det_key] = 2 - blink
-    values[dist_key] = min_dist
-
 def _suppress_trailer_mode_warning(values, CS):
   # Logs from IONIQ 9 show ALERTS_5=6 is the periodic
   # "driver assistance limited in trailer mode" popup.
   if CS.trailer_connected and values.get("ALERTS_5") == 6:
     values["ALERTS_5"] = 0
 
-def _make_ccnc_values(values, CS, lat_active, frame, hud_control,
-                     lane_line=True, corner_radar=True,
-                     desire=0,
-                     blink_pairs=None,
-                     blink_t=1.0):
-  if lane_line:
-    curvature = round(CS.out.steeringAngleDeg / 3)
-    mag = min(abs(curvature), 15)
-    curv = mag + (-1 if curvature < 0 else 0)
-    direction = 1 if curvature < 0 else 0
-    values["LANELINE_CURVATURE"] = curv if lat_active else 0
-    values["LANELINE_CURVATURE_DIRECTION"] = direction if lat_active else 0
-    if desire:
-      _apply_lane_desire(values, desire)
 
-  if corner_radar:
-    radar_all = [
-      ('LF_DETECT', 'LF_DETECT_DISTANCE'),
-      ('RF_DETECT', 'RF_DETECT_DISTANCE'),
-      ('LR_DETECT', 'LR_DETECT_DISTANCE'),
-      ('RR_DETECT', 'RR_DETECT_DISTANCE'),
-    ]
-    for det_key, dist_key in radar_all:
-      if values[det_key] >= 4 and values[dist_key] != 0:
-        values[det_key] = 1
+def _hide_replaced_adas_service_warning(values):
+  # Openpilot replaces the stock lane-change/highway-driving control path, so
+  # the camera can latch their service-required flags during low-speed turns.
+  # Preserve blocked-sensor warnings and unrelated DAS faults. The original
+  # camera-side message remains available in logcan for diagnosis.
+  service_warning_hidden = False
+  for fault in ("FAULT_LCA", "FAULT_HDA"):
+    if values.get(fault) == 1:
+      values[fault] = 0
+      service_warning_hidden = True
 
-    if blink_pairs:
-      _apply_radar_blink(values, blink_pairs, frame, t=blink_t)
+  if service_warning_hidden and values.get("FAULT_DAS") == 1:
+    values["FAULT_DAS"] = 0
+
+
+def _select_cluster_background(cruise_enabled, lat_active, paddle_pressed, paddle_mode, turning=False):
+  # Reuse the existing flashing-red background to identify an active model turn.
+  if (lat_active and turning) or (paddle_mode > 0 and paddle_pressed):
+    return 6
+  return 1 if cruise_enabled else 3 if lat_active else 7
+
+
+def _apply_cluster_lane_lines(values, CS, lat_active, desire):
+  curvature = round(CS.out.steeringAngleDeg / 3)
+  mag = min(abs(curvature), 15)
+  curv = mag + (-1 if curvature < 0 else 0)
+  direction = 1 if curvature < 0 else 0
+  values["LANELINE_CURVATURE"] = curv if lat_active else 0
+  values["LANELINE_CURVATURE_DIRECTION"] = direction if lat_active else 0
+  if desire:
+    _apply_lane_desire(values, desire)
+
+
+def _normalize_cluster_corner_objects(values, *, ccnc=False):
+  # EV5 can report 0x162 corner geometry with DETECT=0 while 0x1ea marks it visible.
+  # Use nonzero corner distance to show a gray car, including those hidden types.
+  # 0x1ea uses different enums; retain its legacy hidden-to-visible normalization.
+  # Neither message blinks or clamps the received distance.
+  for side in ("LF", "RF", "LR", "RR"):
+    key = f"{side}_DETECT"
+    if values[f"{side}_DETECT_DISTANCE"] != 0 and (ccnc or values[key] >= 4):
+      values[key] = 3 if ccnc else 1
+
+
+def _convert_ccnc_front_box_to_car(values):
+  # Preserve the current front-lead presentation independently of corner objects.
+  if values["FF_DETECT"] in (1, 2):
+    values["FF_DETECT"] += 2
+
+
+def _apply_ccnc_lead(values, radar_state, enabled, model_v2=None, hud_lateral=None):
+  lead = _display_lead(radar_state)
+  if lead is None:
+    values.update(FF_DETECT=0, FF_DISTANCE=204.6, FF_LATERAL=0.0)
+    return
+
+  # The DBC exposes FF_LATERAL as unsigned, but OEM negative positions are
+  # encoded in 7-bit two's complement (e.g. 11.6 represents -1.2 m).
+  stock_lateral = values["FF_LATERAL"]
+  if stock_lateral >= 6.4:
+    stock_lateral -= 12.8
+  lateral = _display_lead_lateral(lead, model_v2)
+  same_object = (values["FF_DETECT"] != 0
+                 and abs(values["FF_DISTANCE"] - lead.dRel) <= 3.0
+                 and abs(stock_lateral - lateral) <= 1.0)
+  # Radar leads have no object class. Retain the OEM class only for a matching
+  # target; otherwise use the existing generic gray/white car presentation.
+  if not same_object:
+    values["FF_DETECT"] = 4 if enabled else 3
+  values["FF_DISTANCE"] = clip_float(lead.dRel, 0.1, 204.5)
+  # Match the OEM object using current geometry, independently of display lag.
+  values["FF_LATERAL"] = clip_float(lateral if hud_lateral is None else hud_lateral, -6.4, 6.3)
+
+
+def create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping, *, keep_stock_scc_main=False):
+  # This is a button request for Panda, not a replacement vehicle frame.
+  # Panda overlays it on fresh 0x10B input, retaining all unknown fields,
+  # the received counter, and the vehicle's original transmission cadence.
+  source = CS.cruise_buttons_alt2
+  lfa_button = 0
+  cruise_button = 0
+  driver_pressed = source["LFA_BTN"] != 0 or source["CRUISE_BUTTONS"] != 0
+  if not driver_pressed:
+    lfa_off = CS.lfahda_cluster is not None and CS.lfahda_cluster["HDA_LFA_SymSta"] == 0
+    if lfa_off and 0 < frame % 200 < 12:
+      lfa_button = 1
+
+    if (CC.enabled or keep_stock_scc_main) and not longitudinal_interlock_active(CS) and not lfa_button:
+      # Leave a release interval after the LFA pulse before requesting SCC.
+      scc_pulse = 20 < frame % 200 <= 26 and CS.out.vEgo > 3.
+      if not CS.MainMode_ACC:
+        cruise_button = 8 if scc_pulse else 0
+      elif CC.enabled and CS.ACCMode in (0, 4):
+        cruise_button = 2 if scc_pulse else 0
+      elif CC.enabled and CS.scc_control is not None and CS.scc_control["InfoDisplay"] == 4 and not stopping:
+        cruise_button = 2 if 10 < frame % 30 <= 16 else 0
+      # Do not toggle MAIN merely because HDA is off: SCC is already active.
+
+  address, data, bus = packer.make_can_msg("CRUISE_BUTTONS_ALT2", CAN.CAM,
+                                          {"LFA_BTN": lfa_button, "CRUISE_BUTTONS": cruise_button})
+  # The sparse receive DBC intentionally leaves the integrity fields unnamed.
+  data = bytearray(data)
+  data[:2] = hkg_can_fd_checksum(address, None, data).to_bytes(2, "little")
+  return address, bytes(data), bus
+
 
 def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
                          disp_angle, left_lane_warning, right_lane_warning,
-                         enable_corner_radar, stopping, canfd_debug):
+                         enable_corner_radar, stopping, canfd_debug, paddle_mode, hud_lateral=None):
   ret = []
+  interlock_active = longitudinal_interlock_active(CS)
+  display_lead = _display_lead(getattr(CS, "radarState", None))
+  lead_visible = display_lead is not None
+  lead_distance = clip_float(display_lead.dRel, 0.1, 204.5) if lead_visible else 0.0
 
   md = CS.modelV2
   if not hasattr(create_ccnc_messages, '_lane_line_check') or frame % 100 == 0:
     create_ccnc_messages._lane_line_check = Params().get_int("LaneLineCheck")
   lane_line_check = create_ccnc_messages._lane_line_check
-  desire, lane_changing = _get_desire_and_lane_changing(md)
+  desire, _ = _get_desire_and_lane_changing(md)
 
   if CP.flags & HyundaiFlags.CAMERA_SCC.value:
+    # The camera's SCC output is replaced only with openpilot longitudinal control.
+    # Keep its MAIN available for OEM display objects independently of engagement.
+    keep_stock_scc_main = (
+      getattr(CP, "openpilotLongitudinalControl", False) and enable_corner_radar > 0
+      and CS.scc_control is not None and CS.lfahda_cluster is not None
+      and CS.out.canValid and CS.out.gearShifter == "drive"
+      and math.isfinite(CS.out.vEgo) and CS.out.vEgo > 3. and not CS.out.brakePressed and not interlock_active
+    )
     HDA_CntrlModSta = 0
     HDA_LFA_SymSta = 0
     if CS.lfahda_cluster is not None:
@@ -703,15 +1002,25 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
       #  values = copy.copy(CS.adrv_0x160)
       #  ret.append(packer.make_can_msg("ADRV_0x160", CAN.ECAN, values))
 
-      if CS.cruise_buttons_msg is not None:
+      if getattr(CS, "cruise_buttons_alt2", None) is not None:
+        ret.append(create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping,
+                                                  keep_stock_scc_main=keep_stock_scc_main))
+      elif CS.cruise_buttons_msg is not None:
         values = copy.copy(CS.cruise_buttons_msg)
         # Keep the physical long press on ECAN for CarState, but don't forward it to CAM.
         values["NORMAL_CRUISE_MAIN_BTN"] = 0
 
+        driver_pressed = (CS.cruise_buttons_msg["LFA_BTN"] != 0 or CS.cruise_buttons_msg["CRUISE_BUTTONS"] != 0
+                          or CS.cruise_buttons_msg.get("ADAPTIVE_CRUISE_MAIN_BTN", 0) != 0
+                          or CS.cruise_buttons_msg.get("NORMAL_CRUISE_MAIN_BTN", 0) != 0)
+        if (keep_stock_scc_main and not CC.enabled and not CS.MainMode_ACC and not driver_pressed
+            and 10 < frame % 200 <= 16):
+          values["ADAPTIVE_CRUISE_MAIN_BTN"] = 1
+
         if  HDA_LFA_SymSta == 0 and 0 < frame % 200 < 12:
           values["LFA_BTN"] = 1
 
-        if CC.enabled:
+        if CC.enabled and not interlock_active:
           if not CS.MainMode_ACC:
             if 10 < frame % 200 <= 16 and CS.out.vEgo > 3.:
               values["ADAPTIVE_CRUISE_MAIN_BTN"] = 1
@@ -737,6 +1046,8 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         cruise_enabled = CC.enabled
         lat_enabled = CS.out.latEnabled
         nav_active = hud_control.activeCarrot > 1
+        vehicle_navi_available = CS.out.vehicleNaviAvailable
+        nav_icon_available = nav_active or vehicle_navi_available
 
         # hdpuse carrot
         hdp_use = int(Params().get("HDPuse"))
@@ -756,18 +1067,20 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         values["vSetDis"] = int(set_speed_in_units + 0.5)
 
         values["DISTANCE"] = 4 if hdp_active else hud_control.leadDistanceBars
-        values["DISTANCE_LEAD"] = 2 if cruise_enabled and hud_control.leadVisible else 1 if main_enabled and hud_control.leadVisible else 0
+        values["DISTANCE_LEAD"] = 2 if cruise_enabled and lead_visible else 1 if main_enabled and lead_visible else 0
         values["DISTANCE_CAR"] = 3 if hdp_active else 2 if cruise_enabled else 1 if main_enabled else 0
         values["DISTANCE_SPACING"] = 5 if hdp_active else 1 if cruise_enabled else 0
 
-        values["TARGET"] = 1 if hud_control.leadVisible and cruise_enabled else 0
-        values["TARGET_DISTANCE"] = int(hud_control.leadDistance)
+        values["TARGET"] = 1 if lead_visible and cruise_enabled else 0
+        values["TARGET_DISTANCE"] = lead_distance
 
-        values["BACKGROUND"] = 6 if CS.paddle_button_prev > 0 else 1 if cruise_enabled else 3 if lat_active else 7
+        values["BACKGROUND"] = _select_cluster_background(
+          cruise_enabled, lat_active, CS.paddle_button_prev > 0, paddle_mode, turning=desire in (1, 2),
+        )
         values["CENTERLINE"] = 1 if HDA_CntrlModSta > 0 else 0
         values["CAR_CIRCLE"] = 2 if hdp_active else 1 if cruise_enabled else 0
 
-        values["NAV_ICON"] = 2 if nav_active and cruise_enabled else 1 if main_enabled and nav_active else 0
+        values["NAV_ICON"] = 2 if nav_icon_available and cruise_enabled else 1 if main_enabled and nav_icon_available else 0
         values["HDA_ICON"] = 5 if hdp_active else 2 if cruise_enabled else 1 if main_enabled else 0
         values["LFA_ICON"] = 5 if hdp_active else 2 if lat_active else 1 if lat_enabled else 0
         values["LKA_ICON"] = 4 if lat_active else 3 if lat_enabled else 0
@@ -839,6 +1152,7 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         values["LANE_LEFT"] = 0 if trailer_lane_change_blocked else 1 if desire in (1, 3) else 0
         values["LANE_RIGHT"] = 0 if trailer_lane_change_blocked else 1 if desire in (2, 4) else 0
 
+        _apply_driver_monitoring_alert(values, hud_control, CS.adrv_0x161)
         ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter = rx_counter))
 
       if CS.adrv_0x200 is not None:
@@ -850,50 +1164,40 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
       if CS.adrv_0x1ea is not None:
         values = copy.copy(CS.adrv_0x1ea)
         rx_counter = values.pop("COUNTER", None)
-        # blinker hold
-        values['LEFT_BLINK_HOLD'] = 1 if lane_changing == 3 else 0
-        values['RIGHT_BLINK_HOLD'] = 1 if lane_changing == 4 else 0
+        # blinker hold: the confirmed lane change until the body is across (see _blink_hold_side)
+        hold_desire = 0 if getattr(CS.out, "cruiseCancelState", False) else desire
+        hold = _blink_hold_side(md, hold_desire, create_ccnc_messages.__dict__.setdefault("_blink_hold", {}))
+        external_hold = getattr(hud_control, "physicalBlinkerHold", 0)
+        if external_hold in (1, 2, 3):
+          hold = {1:0, 2:3, 3:4}[external_hold]
+        values['LEFT_BLINK_HOLD'] = 1 if hold == 3 else 0
+        values['RIGHT_BLINK_HOLD'] = 1 if hold == 4 else 0
 
-        _make_ccnc_values(
-          values, CS, lat_active, frame, hud_control,
-          lane_line=True,
-          corner_radar=True,
-          desire=desire,
-          # 기존대로 LR/RR만 깜빡임
-          blink_pairs=[('LR_DETECT', 'LR_DETECT_DISTANCE'),
-                       ('RR_DETECT', 'RR_DETECT_DISTANCE')],
-          blink_t=1.0
-        )
+        _apply_cluster_lane_lines(values, CS, lat_active, desire)
+        _normalize_cluster_corner_objects(values)
 
         ret.append(packer.make_can_msg("ADRV_0x1ea", CAN.ECAN, values, rx_counter = rx_counter))
 
       if CS.ccnc_0x162 is not None:
         values = copy.copy(CS.ccnc_0x162)
+        # Seed once from RX; the packer owns the per-message TX counter after that.
+        # RX-paced Panda forwarding replaces it with the original RX counter.
+        rx_counter = values.pop("COUNTER", None)
 
-        if hud_control.leadDistance > 0:
-          values["FF_DISTANCE"] = hud_control.leadDistance
-          ff_type = 3 if hud_control.leadRadar == 1 else 13
-          values["FF_DETECT"] = ff_type if hud_control.leadRelSpeed > -0.1 else ff_type + 1
-
-        _make_ccnc_values(
-          values, CS, lat_active, frame, hud_control,
-          lane_line=False,
-          corner_radar=True,
-          desire=0,
-          # 필요하면 162도 깜빡임 적용(원래 코드처럼 LR/RR만)
-          blink_pairs=[('LR_DETECT', 'LR_DETECT_DISTANCE'),
-                       ('RR_DETECT', 'RR_DETECT_DISTANCE')],
-          blink_t=1.0
-        )
+        _normalize_cluster_corner_objects(values, ccnc=True)
+        _convert_ccnc_front_box_to_car(values)
+        _apply_ccnc_lead(values, getattr(CS, "radarState", None), CC.enabled, getattr(CS, "modelV2", None), hud_lateral)
 
         if (left_lane_warning and not CS.out.leftBlinker) or (right_lane_warning and not CS.out.rightBlinker):
           values["VIBRATE"] = 1
+
+        _hide_replaced_adas_service_warning(values)
 
         if canfd_debug > 0:
           values["FAULT_LSS"] = 0
           values["FAULT_DAS"] = 0
 
-        ret.append(packer.make_can_msg("CCNC_0x162", CAN.ECAN, values))
+        ret.append(packer.make_can_msg("CCNC_0x162", CAN.ECAN, values, rx_counter=rx_counter))
 
     # --- NEW_MSG_4B9 (corner radar keep-alive?) ---
     if enable_corner_radar > 0:

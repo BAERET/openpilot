@@ -4,11 +4,14 @@ import pyray as rl
 from openpilot.cereal import log, messaging
 from msgq.visionipc import VisionStreamType
 from openpilot.selfdrive.ui import UI_BORDER_SIZE
+from openpilot.selfdrive.ui.carrot_param_cache import BorderParamSnapshot, TimedSnapshotCache, read_border_params
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
-from openpilot.selfdrive.ui.onroad.driver_state import DriverStateRenderer
+from openpilot.selfdrive.ui.onroad.driver_preview import DriverPreview
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
+from openpilot.selfdrive.ui.render_diagnostics import RenderDiagnostics
+from openpilot.selfdrive.ui.overlay_state import OverlayState
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
@@ -44,27 +47,57 @@ class AugmentedRoadView(CameraView):
     self._matrix_cache_key = (0, 0.0, 0.0, stream_type)
     self._cached_matrix: np.ndarray | None = None
     self._content_rect = rl.Rectangle()
+    self._suppress_camera_for_cluster = False
 
     self.model_renderer = ModelRenderer()
+    self._render_diagnostics = RenderDiagnostics('ui')
     self._hud_renderer = HudRenderer()
+    self._overlay_state = OverlayState()
+    self.model_renderer._overlay_state = self._overlay_state
+    self._hud_renderer._overlay_state = self._overlay_state
     self.alert_renderer = AlertRenderer()
-    self.driver_state_renderer = DriverStateRenderer()
+    self.driver_state_renderer = DriverPreview()
 
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
+    # uiDebug.plotMode용 ShowPlotMode 캐시 — 파일 읽기라 매 프레임 금지, ~2초 스로틀
+    self._plot_mode = 0
+    self._plot_mode_next_t = 0.0
+    self._border_params = TimedSnapshotCache(
+      BorderParamSnapshot(),
+      lambda: read_border_params(ui_state.params, ui_state.params_memory),
+    )
 
+  def _refresh_plot_mode(self, now: float) -> None:
+    if now < self._plot_mode_next_t:
+      return
+    self._plot_mode_next_t = now + 2.0
+    try:
+      self._plot_mode = min(max(ui_state.params.get_int("ShowPlotMode"), 0), 255)
+    except Exception:
+      self._plot_mode = 0
 
+  def set_cluster_hud_connected(self, connected: bool, show_camera: bool = False) -> None:
+    self._suppress_camera_for_cluster = connected and not show_camera
 
   def _render(self, rect):
+    # plotMode 갱신(가끔 파일 읽기)은 drawTime 창 밖에서 — total을 오염시키지 않는다
+    self._refresh_plot_mode(time.monotonic())
     # Only render when system is started to avoid invalid data access
     start_draw = time.monotonic()
     if not ui_state.started:
       return
+    timing = self._render_diagnostics
+    timing.start()
+    # Preserve uiDebug wall timers and draw order; runtimeTiming also measures
+    # thread CPU work so scheduler/GPU waits are not mistaken for render work.
+    # scissor begin/end는 raylib 배치 flush 지점이라 특정 구간에 귀속시키지 않는다 —
+    # total과 구간 합의 차이(미귀속)로 남는다. extras = carrot 테두리(+텍스트)
+    cam_ms = model_ms = ds_ms = hud_ms = alert_ms = extras_ms = 0.0
 
-    self._switch_stream_if_needed(ui_state.sm)
-
-    # Update calibration before rendering
-    self._update_calibration()
+    if not self._suppress_camera_for_cluster:
+      self._switch_stream_if_needed(ui_state.sm)
+      self._update_calibration()
 
     # Create inner content area with border padding
     self._content_rect = rl.Rectangle(
@@ -83,14 +116,31 @@ class AugmentedRoadView(CameraView):
       int(self._content_rect.height)
     )
 
-    # Render the base camera view
-    super()._render(rect)
+    _t = time.monotonic()
+    if self._suppress_camera_for_cluster:
+      rl.draw_rectangle_rec(self._content_rect, rl.BLACK)
+    else:
+      # Render the base camera view
+      timing.call('camera', super()._render, rect)
+    cam_ms = (time.monotonic() - _t) * 1000.0
 
-    # Draw all UI overlays
-    self.model_renderer.render(self._content_rect)
-    self._hud_renderer.render(self._content_rect)
-    self.alert_renderer.render(self._content_rect)
-    self.driver_state_renderer.render(self._content_rect)
+    self._overlay_state.update(ui_state, self.client, self.stream_type, self._suppress_camera_for_cluster)
+
+    if not self._suppress_camera_for_cluster:
+      # Draw the model overlay only with the camera view
+      _t = time.monotonic()
+      timing.call('model', self.model_renderer.render, self._content_rect)
+      model_ms = (time.monotonic() - _t) * 1000.0
+    _t = time.monotonic()
+    timing.call('hud', self._hud_renderer.render, self._content_rect)  # includes plot when enabled
+    hud_ms = (time.monotonic() - _t) * 1000.0
+    _t = time.monotonic()
+    timing.call('alert', self.alert_renderer.render, self._content_rect)
+    alert_ms = (time.monotonic() - _t) * 1000.0
+    _t = time.monotonic()
+    timing.call('driver_state', self.driver_state_renderer.draw_onroad, self._content_rect,
+                self.alert_renderer.get_alert(ui_state.sm) is not None)
+    ds_ms = (time.monotonic() - _t) * 1000.0
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
@@ -99,16 +149,35 @@ class AugmentedRoadView(CameraView):
     rl.end_scissor_mode()
 
     # Draw colored border based on driving state
-    self._draw_border_carrot(rect)
+    _t = time.monotonic()
+    timing.call('border', self._draw_border_carrot, rect)
+    extras_ms = (time.monotonic() - _t) * 1000.0
 
     # publish uiDebug
-    msg = messaging.new_message('uiDebug')
-    msg.uiDebug.drawTimeMillis = (time.monotonic() - start_draw) * 1000
+    msg = messaging.new_message('uiDebug', valid=True)
+    ud = msg.uiDebug
+    ud.drawTimeMillis = (time.monotonic() - start_draw) * 1000
+    ud.cameraTimeMillis = cam_ms
+    ud.modelTimeMillis = model_ms
+    ud.driverStateTimeMillis = ds_ms
+    ud.hudTimeMillis = hud_ms
+    ud.alertTimeMillis = alert_ms
+    ud.extrasTimeMillis = extras_ms
+    ud.plotMode = self._plot_mode
+    ud.recording = gui_app.is_recording()
     self._pm.send('uiDebug', msg)
+    timing.finish()
 
   def _handle_mouse_press(self, _):
     if not self._hud_renderer.user_interacting() and self._click_callback is not None:
       self._click_callback()
+
+  def close(self):
+    self.model_renderer._overlay.close()
+    self._hud_renderer._overlay.close()
+    if preview := getattr(self, 'driver_state_renderer', None):
+      preview.close()
+    super().close()
 
   def _handle_mouse_release(self, _):
     # We only call click callback on press if not interacting with HUD
@@ -230,6 +299,7 @@ class AugmentedRoadView(CameraView):
       self._draw_border(rect)
       return
 
+    border_params = self._border_params.refresh(time.monotonic())
     car_state = sm["carState"]
 
     x = float(rect.x)
@@ -378,22 +448,12 @@ class AugmentedRoadView(CameraView):
     bottom_left = ""
     bottom_right = ""
 
-    car_name = ui_state.params.get("CarName") or ""
-
-    if ui_state.params.get_int("HyundaiCameraSCC") > 0:
-      car_name += "(CAMERA SCC)"
-    else:
-      try:
-        if sm.alive["carParams"] and sm["carParams"].openpilotLongitudinalControl:
-          car_name += " - OP Long"
-      except Exception:
-        pass
-
-    nnff_model_name = ui_state.params.get("NNFFModelName") or ""
-    if len(nnff_model_name) > 0:
-      car_name += ",NNFF"
-
-    top_left = car_name
+    top_left = border_params.top_left
+    try:
+      if sm.alive["carParams"] and sm["carParams"].openpilotLongitudinalControl:
+        top_left = border_params.top_left_op_long
+    except Exception:
+      pass
 
     try:
       top_right_parts = []
@@ -413,8 +473,7 @@ class AugmentedRoadView(CameraView):
 
       if sm.alive["liveParameters"]:
         lp = sm["liveParameters"]
-        custom_sr = ui_state.params.get_float("CustomSR") / 10.0
-        top_right_parts.append(f"SR({lp.steerRatio:.1f},{custom_sr:.1f})")
+        top_right_parts.append(f"SR({lp.steerRatio:.1f},{border_params.custom_sr:.1f})")
 
       top_right = ", ".join(top_right_parts)
     except Exception:
@@ -425,9 +484,8 @@ class AugmentedRoadView(CameraView):
       lat_plan = sm["lateralPlan"]
       bottom = str(lat_plan.latDebugText)
 
-    bottom_left = ui_state.params.get("GitBranch") or ""
-
-    bottom_right = ui_state.params_memory.get("NetworkAddress") or ""
+    bottom_left = border_params.bottom_left
+    bottom_right = border_params.bottom_right
 
     # text positions
     top_text_y = y + line_margin
