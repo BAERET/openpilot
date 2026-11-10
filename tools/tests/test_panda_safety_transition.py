@@ -57,6 +57,8 @@ def test_production_safety_transition(tmp_path, h7, hyundai_mode):
 #define FDCAN_RX_FIFO_0_EL_CNT 46U
 #define MIN(a,b) ((a)<(b)?(a):(b))
 #define REGISTER_INTERRUPT(...)
+#define can_startup_diag_init_before(core) ((void)0)
+#define can_startup_diag_init_after(core, result) ((void)0)
 enum { SAFETY_SILENT=0, SAFETY_ELM327=3, SAFETY_HYUNDAI=8, SAFETY_NOOUTPUT=19,
        SAFETY_HYUNDAI_LEGACY=23, SAFETY_HYUNDAI_CANFD=28,
        CAN_MODE_NORMAL=0, CAN_MODE_OBD_CAN2=1, ALL_CAN_LIVE=0, ALL_CAN_SILENT=255,

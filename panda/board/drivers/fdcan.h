@@ -2,6 +2,8 @@
 
 FDCAN_GlobalTypeDef *cans[CANS_ARRAY_SIZE] = {FDCAN1, FDCAN2, FDCAN3};
 
+#include "can_startup_diag.h"
+
 static bool can_set_speed(uint8_t can_number) {
   bool ret = true;
   FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
@@ -41,6 +43,7 @@ void update_can_health_pkt(uint8_t can_number, uint32_t ir_reg) {
   FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
   uint32_t psr_reg = FDCANx->PSR;
   uint32_t ecr_reg = FDCANx->ECR;
+  can_startup_diag_health(can_number, psr_reg, ecr_reg);
 
   can_health[can_number].bus_off = ((psr_reg & FDCAN_PSR_BO) >> FDCAN_PSR_BO_Pos);
   can_health[can_number].bus_off_cnt += can_health[can_number].bus_off;
@@ -160,6 +163,7 @@ void can_rx(uint8_t can_number) {
   FDCANx->IR |= FDCAN_IR_RF0N;
   while((FDCANx->RXF0S & FDCAN_RXF0S_F0FL) != 0U) {
     can_health[can_number].total_rx_cnt += 1U;
+    can_startup_diag_rx(can_number);
 
     // can is live
     pending_can_live = 1;
@@ -266,8 +270,10 @@ bool can_init(uint8_t can_number) {
 
   if (can_number != 0xffU) {
     FDCAN_GlobalTypeDef *FDCANx = CANIF_FROM_CAN_NUM(can_number);
+    can_startup_diag_init_before(can_number);
     ret = can_set_speed(can_number);
     ret &= llcan_init(FDCANx);
+    can_startup_diag_init_after(can_number, ret);
     // in case there are queued up messages
     process_can(can_number);
   }

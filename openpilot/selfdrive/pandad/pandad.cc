@@ -543,7 +543,7 @@ void log_panda_serial(size_t panda_index, const std::string &log) {
 
     if (!line.empty()) {
       const int level = has_register_fault ? CLOUDLOG_ERROR :
-                        has_spi_diag ? CLOUDLOG_WARNING : CLOUDLOG_DEBUG;
+                        (has_spi_diag || line.find("can_startup_diag:") == 0) ? CLOUDLOG_WARNING : CLOUDLOG_DEBUG;
       cloudlog_e(level, log_source.c_str(), __LINE__, __func__, "%s", line.c_str());
     }
 

@@ -23,6 +23,7 @@
 #endif
 
 #include "power_saving.h"
+#include "drivers/can_startup_diag.h"
 
 #include "obj/gitversion.h"
 
@@ -379,12 +380,14 @@ int main(void) {
 
   // LED should keep on blinking all the time
   while (true) {
+    can_startup_diag_tick();
     if (power_save_status == POWER_SAVE_STATUS_DISABLED) {
       #ifdef DEBUG_FAULTS
       if (fault_status == FAULT_STATUS_NONE) {
       #endif
         // useful for debugging, fade breaks = panda is overloaded
         for (uint32_t fade = 0U; fade < MAX_LED_FADE; fade += 1U) {
+          if ((fade & 0xFFU) == 0U) can_startup_diag_tick();
           led_set(LED_RED, true);
           delay(fade >> 4);
           led_set(LED_RED, false);
@@ -392,6 +395,7 @@ int main(void) {
         }
 
         for (uint32_t fade = MAX_LED_FADE; fade > 0U; fade -= 1U) {
+          if ((fade & 0xFFU) == 0U) can_startup_diag_tick();
           led_set(LED_RED, true);
           delay(fade >> 4);
           led_set(LED_RED, false);
