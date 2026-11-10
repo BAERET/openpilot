@@ -64,8 +64,6 @@ enum { SAFETY_SILENT=0, SAFETY_ELM327=3, SAFETY_HYUNDAI=8, SAFETY_NOOUTPUT=19,
 typedef struct { uint32_t CCCR, PSR, IR, TXBRP, RXF0S, RXF0A; } FDCAN_GlobalTypeDef;
 static FDCAN_GlobalTypeDef regs[3];
 #define CANIF_FROM_CAN_NUM(i) (&regs[i])
-typedef struct { bool initialized; uint8_t bus; uint32_t speed, data_speed; bool non_iso, loopback; int silent; } fdcan_config_t;
-static fdcan_config_t initialized_can_config[3];
 static struct { uint8_t bus_lookup; uint32_t can_speed, can_data_speed; bool canfd_non_iso; } bus_config[3];
 #define BUS_NUM_FROM_CAN_NUM(i) bus_config[i].bus_lookup
 static struct { uint8_t status; } harness;
@@ -98,10 +96,8 @@ static bool can_set_speed(uint8_t n) { (void)n; return speed_ok; }
 static bool llcan_init(FDCAN_GlobalTypeDef *can) { (void)can; init_calls++; return init_ok; }
 static void process_can(uint8_t n) { (void)n; process_calls++; }
 '''
-  functions = "\n".join([function(common, "void can_set_mode(")] + ([
-    function(fdcan, "static bool can_preserve_configuration("),
-    function(fdcan, "static void can_clear_safety_transition_queues("),
-  ] if h7 else []) + [
+  functions = "\n".join([
+    function(common, "void can_set_mode("),
     function(fdcan, "bool can_init("),
     function(common, "void can_init_all("),
     function("panda/board/main.c", "void set_safety_mode("),
@@ -122,18 +118,16 @@ static void setup(void) {
   init_calls=mux_calls=process_calls=clear_send_calls=0;
 }
 int main(void) {
-  const bool fast_supported = FAST_SUPPORTED;
   setup(); regs[0].RXF0S=3U | (5U<<8); regs[1].RXF0S=127U | (9U<<8);
   set_safety_mode(HYUNDAI_MODE,2077);
-  assert(init_calls==(fast_supported?0:3) && mux_calls==(fast_supported?0:1) && relay && critical==0);
+  assert(init_calls==3 && mux_calls==1 && relay && critical==0);
   assert(current_safety_mode==HYUNDAI_MODE && current_safety_param==2077);
   assert(queue[0]==0 && queue[1]==0 && queue[2]==0 && host_rx==7);
-  if (fast_supported) assert(regs[0].RXF0A==5 && regs[1].RXF0A==9);
-  // Every unhealthy/changed configuration must retain full reinitialization.
+  // Both healthy and unhealthy/changed configurations must fully reinitialize.
   for (int cause=0;cause<20;cause++) {
     setup();
     switch(cause) {
-      case 0: initialized_can_config[0].initialized=false; break;
+      case 0: init_ok=false; break;
       case 1: bus_config[1].can_speed++; break;
       case 2: bus_config[2].can_data_speed++; break;
       case 3: bus_config[0].canfd_non_iso=true; break;
@@ -165,15 +159,13 @@ int main(void) {
       setup(); current_safety_mode=modes[i];
       set_safety_mode(modes[j],1);
       assert(critical==0);
-      const bool hyundai = modes[j]==8 || modes[j]==23 || modes[j]==28;
-      assert(init_calls==((fast_supported && modes[i]==3 && hyundai)?0:3));
+      assert(init_calls==3);
       if(modes[j]==0 || modes[j]==65535) assert(can_silent==ALL_CAN_SILENT && !relay);
     }
   }
   for(int speed=0;speed<2;speed++) for(int init=0;init<2;init++) {
     setup(); speed_ok=speed; init_ok=init;
     assert(can_init(0)==(speed && init));
-    assert(initialized_can_config[0].initialized==(speed && init));
   }
   puts("transition/configuration/queue/failure tests passed");
   return 0;
@@ -183,7 +175,7 @@ int main(void) {
   executable = tmp_path / ("transition.exe" if os.name == "nt" else "transition")
   if not h7:
     prefix = prefix.replace("#define STM32H7", "")
-  source.write_text((prefix + functions + body.replace("FAST_SUPPORTED", "true" if h7 else "false"))
+  source.write_text((prefix + functions + body)
                     .replace("HYUNDAI_MODE", str(hyundai_mode)), encoding="utf-8")
   compiler = shlex.split(os.environ.get("CC", "cc"))
   subprocess.run([*compiler, "-std=gnu11", "-O2", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(executable)], check=True)
